@@ -285,3 +285,12 @@ class TestUnconditionalBlocksPrecedeTheGate:
         assert result["success"] is False
         assert "No command" in result["error"]
         assert not result.get("requires_confirmation")
+
+    async def test_a_path_escape_is_blocked_not_merely_unconfirmed(self):
+        """A sandbox refusal is categorically different from a risky request."""
+        result = await self._executor().execute(
+            "file_read", {"path": "../../../Windows/System32/drivers/etc/hosts"}
+        )
+        assert result["success"] is False
+        assert result.get("blocked") is True
+        assert not result.get("requires_confirmation")

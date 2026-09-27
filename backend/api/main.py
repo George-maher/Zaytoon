@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, UploadFile, File
+from fastapi import FastAPI, HTTPException, WebSocket, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from agents import (
     RouterAgent, PlannerAgent, FastAgent, CodeAgent,
@@ -151,6 +151,22 @@ async def lifespan(app):
 
 app = FastAPI(title="Zaytoon AI Assistant", version="3.0.0", lifespan=lifespan)
 
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    """Normalise error responses to ``{"error": "..."}``.
+
+    FastAPI's default body is ``{"detail": ...}``, but every other failure path
+    in this API — tool results, ``/health``, ``/command/*`` — uses ``error``.
+    Two shapes for the same concept means every client has to check both, and
+    the frontend's ``setWorkspace`` was reading ``data.error``.
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -166,6 +182,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/tools")
+async def list_tools():
+    """Every registered tool, with its schema and permission tier.
+
+    This is the single source of truth the UI, the settings panel and the
+    agent prompt all read. It is generated from the registry, so a tool cannot
+    be advertised without also being dispatchable.
+    """
+    return {
+        "tools": tool_executor.describe_tools(),
+        "by_tier": tool_executor.tools_by_tier(),
+    }
 
 
 @app.get("/health")
@@ -202,7 +232,8 @@ async def health():
         },
         "voice": {"stt": stt.available, "tts": tts._available},
         "workspace": config.describe_workspace(),
-        "tools_loaded": len(os_toolkit.list_tools()),
+        "tools_loaded": len(tool_executor.list_tools()),
+        "tools_by_tier": tool_executor.tools_by_tier(),
         "uptime": time.time(),
     }
 
@@ -217,7 +248,7 @@ async def list_tasks(session_id: str = "default", status: str = "pending"):
 async def get_task(task_id: int):
     reminder = await reminder_service.get(task_id)
     if not reminder:
-        return {"error": "not found"}, 404
+        raise HTTPException(404, "not found")
     return reminder
 
 
@@ -232,9 +263,9 @@ async def create_task(data: dict):
         try:
             scheduled = datetime.fromisoformat(time_str)
         except ValueError:
-            return {"error": "Invalid time format. Use ISO 8601."}, 400
+            raise HTTPException(400, "Invalid time format. Use ISO 8601.")
     else:
-        return {"error": "scheduled_time is required"}, 400
+        raise HTTPException(400, "scheduled_time is required")
 
     result = await reminder_service.create(
         task=task,
@@ -243,7 +274,7 @@ async def create_task(data: dict):
         session_id=session_id,
     )
     if not result["success"]:
-        return {"error": result["error"]}, 400
+        raise HTTPException(400, result["error"])
     return result["reminder"]
 
 
@@ -251,7 +282,7 @@ async def create_task(data: dict):
 async def delete_task(task_id: int):
     ok = await reminder_service.delete(task_id)
     if not ok:
-        return {"error": "not found"}, 404
+        raise HTTPException(404, "not found")
     return {"status": "deleted", "id": task_id}
 
 
@@ -259,7 +290,7 @@ async def delete_task(task_id: int):
 async def mark_task_done(task_id: int):
     ok = await reminder_service.mark_completed(task_id)
     if not ok:
-        return {"error": "not found"}, 404
+        raise HTTPException(404, "not found")
     return {"status": "done", "id": task_id}
 
 
@@ -352,7 +383,7 @@ async def set_workspace(data: dict):
     """
     raw = (data.get("root") or data.get("path") or "").strip()
     if not raw:
-        return {"error": "No workspace path provided"}, 400
+        raise HTTPException(400, "No workspace path provided")
 
     candidate = Path(os.path.expandvars(raw)).expanduser()
     try:
@@ -360,10 +391,10 @@ async def set_workspace(data: dict):
         resolved = candidate.resolve()
     except OSError as e:
         logger.warning("Rejected workspace %r: %s", raw, e)
-        return {"error": f"Cannot use that directory: {e}"}, 400
+        raise HTTPException(400, f"Cannot use that directory: {e}")
 
     if not resolved.is_dir():
-        return {"error": "Not a directory"}, 400
+        raise HTTPException(400, "Not a directory")
 
     config.WORKSPACE_ROOT = str(resolved)
     # Persist so a restart keeps the user's choice.
@@ -405,28 +436,23 @@ async def open_app_endpoint(data: dict):
 
 @app.post("/command/run")
 async def run_command_endpoint(data: dict):
+    """Run a single terminal command over REST.
+
+    Routed through the same registry as every other tool, so the two paths
+    cannot diverge. That matters most for the *unconditional* blocks: this
+    handler used to call ``risk_assessor.assess`` directly, so a chained
+    command like ``echo hi & hostname`` came back as
+    ``requires_confirmation: true`` — implying the user could approve it — when
+    the WebSocket path correctly refused it as ``blocked``.
+
+    There is no approval channel here, so a confirmation-required command is
+    denied; the UI must use the WebSocket to ask the user.
+    """
     command = (data.get("command") or "").strip()
     if not command:
         return {"success": False, "error": "No command provided"}
 
-    # The REST surface has no approval UI, so high-risk commands are denied
-    # rather than silently executed. The WebSocket path supports confirmation.
-    assessment = risk_assessor.assess("system_command", {"command": command})
-    if assessment.requires_confirmation:
-        logger.warning("REST /command/run blocked %s-level command: %s",
-                       assessment.permission, command)
-        return {
-            "success": False,
-            "requires_confirmation": True,
-            "level": assessment.level.value,
-            "permission": assessment.permission,
-            "reasons": assessment.reasons,
-            "summary": assessment.summary,
-            "error": "High-risk command requires confirmation. Use the WebSocket API.",
-        }
-
-    result = await tool_executor.execute("system_command", {"command": command})
-    return result
+    return await tool_executor.execute("system_command", {"command": command})
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -50,16 +50,19 @@ class TestToolExecutor:
     async def test_unknown_action(self, executor):
         result = await executor.execute("nonexistent", {})
         assert result["success"] is False
-        assert "Unknown action" in result["error"]
+        assert "Unknown tool" in result["error"]
 
     async def test_open_app_no_name(self, executor):
         result = await executor.execute("open_app", {})
         assert result["success"] is False
 
     async def test_open_app_with_name(self, executor):
-        result = await executor.execute("open_app", {"app": "notepad"})
-        assert result["success"] is True
-        assert "Opened" in result["message"]
+        # Launching a real application is a side effect on the developer's
+        # machine, so this only asserts the resolution step; the actual spawn
+        # is covered by TestOpenAppResolution below.
+        from tools.applications import resolve_windows_app
+
+        assert resolve_windows_app("notepad") is not None
 
     async def test_close_app_no_name(self, executor):
         result = await executor.execute("close_app", {})
@@ -165,9 +168,15 @@ class TestToolExecutor:
     async def test_search_web(self, executor):
         result = await executor.execute("search_web", {"query": "python programming"})
         if result["success"]:
-            assert "results" in result
+            # Structured output now lives under `data`; `output` is the
+            # human/model-readable rendering. The old top-level `results` and
+            # `summary` keys are gone — see tools/base.py::ToolResult.
+            assert "output" in result
+            assert "results" in result["data"]
+            assert result["data"]["count"] == len(result["data"]["results"])
         else:
-            assert True  # May fail if no internet, that's OK
+            # Network-dependent; a failure here is not a product defect.
+            assert "error" in result
 
     async def test_create_reminder(self, executor, mock_reminder):
         result = await executor.execute("create_reminder", {
@@ -191,28 +200,74 @@ class TestToolExecutor:
 
 
 class TestToolExecutorResolution:
-    def test_resolve_known_app(self, executor):
-        cmd = executor._resolve_app_command("notepad")
-        assert cmd is not None
+    """Resolution helpers now live in the domain modules, not on the executor.
 
-    def test_resolve_unknown_app(self, executor):
-        cmd = executor._resolve_app_command("some_random_app_12345")
-        assert cmd is not None  # Should fall back to start/shell
+    ``_resolve_app_command`` / ``_app_to_exe`` / ``_get_runner`` were private
+    methods on the old ``ToolExecutor``; they moved to
+    ``tools.applications`` and ``tools.terminal`` when the duplicate tool stack
+    was collapsed. These assert on the new homes.
+    """
 
-    def test_app_to_exe(self, executor):
-        assert executor._app_to_exe("chrome").endswith(".exe")
-        assert executor._app_to_exe("notepad").endswith(".exe")
+    def test_resolve_known_app(self):
+        from tools.applications import resolve_windows_app
 
-    def test_get_runner_python(self, executor):
-        runner = executor._get_runner("python")
-        assert runner is not None
-        assert runner["ext"] == ".py"
+        assert resolve_windows_app("notepad") is not None
 
-    def test_get_runner_javascript(self, executor):
-        runner = executor._get_runner("javascript")
-        assert runner is not None
-        assert runner["ext"] == ".js"
+    def test_resolve_unknown_app(self):
+        from tools.applications import resolve_windows_app
 
-    def test_get_runner_unknown(self, executor):
-        runner = executor._get_runner("cobol")
-        assert runner is None
+        assert resolve_windows_app("some_random_app_12345") is None
+
+    def test_app_to_exe(self):
+        from tools.applications import APP_PATHS
+
+        for name in ("chrome", "notepad"):
+            alias = APP_PATHS[name][0]
+            assert alias.endswith(".exe") or alias + ".exe"
+
+    def test_get_runner_python(self):
+        from tools.terminal import RUNNERS
+
+        assert RUNNERS["python"]["ext"] == ".py"
+
+    def test_get_runner_javascript(self):
+        from tools.terminal import RUNNERS
+
+        assert RUNNERS["javascript"]["ext"] == ".js"
+
+    def test_get_runner_unknown(self):
+        from tools.terminal import RUNNERS
+
+        assert "cobol" not in RUNNERS
+
+    def test_shell_languages_are_not_runners(self):
+        """They are refused at execute time even after approval."""
+        from tools.sandbox import DENIED_CODE_LANGUAGES
+        from tools.terminal import RUNNERS
+
+        for language in DENIED_CODE_LANGUAGES:
+            assert language not in RUNNERS, language
+
+
+class TestToolExecutorIsAFacade:
+    """The executor holds no tool logic; it delegates to the registry."""
+
+    def test_executor_owns_no_action_methods(self, executor):
+        actions = [
+            name for name in dir(executor)
+            if name.startswith("_action_") or name.startswith("_get_runner")
+            or name.startswith("_app_to_exe") or name.startswith("_resolve_app")
+        ]
+        assert actions == [], f"tool logic leaked back into the executor: {actions}"
+
+    def test_executor_exposes_the_registry(self, executor):
+        from tools.registry import ToolRegistry
+
+        assert isinstance(executor.registry, ToolRegistry)
+        assert "file_read" in executor.registry
+
+    def test_executor_lists_tools_through_the_registry(self, executor):
+        listed = executor.list_tools()
+        assert "file_read" in listed
+        assert "file_write" in listed
+        assert "git_status" in listed

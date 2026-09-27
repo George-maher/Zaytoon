@@ -2,12 +2,20 @@
 
 Verifies that a high-risk tool call pauses, emits a `require_confirmation`
 event, and only executes after the user approves.
+
+The "did the tool actually run?" spies used to monkeypatch
+``ToolAgent._toolkit_cmd`` and ``._run_code_tool``. Those were private
+duplicates of implementations that already existed in ``ToolExecutor``; they
+were deleted when the two stacks were collapsed into
+:class:`tools.registry.ToolRegistry`. The property being tested is unchanged —
+so the spy now replaces the *registered tool*, which is the real seam.
 """
 
 import pytest
 
 from agents.tool_agent import ToolAgent
 from config import config
+from tools.base import BaseTool, ToolResult
 from tools.safety import ConfirmationManager, RiskAssessor
 
 
@@ -16,14 +24,45 @@ def assessor():
     return RiskAssessor(always_confirm=[])
 
 
-def spy_cmd(calls):
-    """Async replacement for ToolAgent._toolkit_cmd that records invocations."""
+class _Spy(BaseTool):
+    """Records invocations instead of performing them."""
 
-    async def _cmd(command, shell="cmd"):
-        calls.append(command)
-        return "done"
+    permission = "safe"
 
-    return _cmd
+    def __init__(self, name: str, calls: list, result: str = "done") -> None:
+        self._name = name
+        self._calls = calls
+        self._result = result
+
+    def name(self) -> str:
+        return self._name
+
+    def description(self) -> str:
+        return "Test double."
+
+    def schema(self):
+        return {"type": "object", "properties": {}, "additionalProperties": True}
+
+    async def execute(self, **kwargs):
+        self._calls.append(kwargs)
+        return ToolResult.ok(self._result)
+
+
+def spy_tool(agent, calls, tool_name="system_command", result="done", tier="safe"):
+    """Swap a registered tool for a recording double.
+
+    Returns a callable that yields the recorded invocations, so a test can
+    assert the tool never ran.
+    """
+    # The spy's tier must match the real tool's, otherwise the gate would be
+    # exercised against the wrong classification and the test would prove
+    # nothing.
+    real = agent.registry.get(tool_name)
+    if real is not None:
+        tier = real.permission
+    agent.registry.register(_Spy(tool_name, calls, result), replace=True)
+    agent.registry.get(tool_name).permission = tier
+    return lambda: list(calls)
 
 
 class TestSafetyGate:
@@ -37,9 +76,8 @@ class TestSafetyGate:
         """A manager with no notifier cannot ask anyone, so nothing runs."""
         manager = ConfirmationManager(notify=None, timeout=1)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}
@@ -51,7 +89,7 @@ class TestSafetyGate:
     async def test_no_manager_at_all_is_reported(self, assessor):
         agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}
@@ -65,9 +103,8 @@ class TestSafetyGate:
 
         manager = ConfirmationManager(notify=deny, timeout=2)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}
@@ -82,9 +119,8 @@ class TestSafetyGate:
 
         manager = ConfirmationManager(notify=never_answers, timeout=0.05)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}
@@ -102,15 +138,15 @@ class TestSafetyGate:
 
         manager = ConfirmationManager(notify=notify, timeout=2)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}, language="en"
         )
 
-        assert executed == ["rm -rf /"]
+        # The spy records the kwargs the tool actually received.
+        assert [c["command"] for c in executed] == ["rm -rf /"]
         assert result == "done"
         assert len(requests) == 1
         assert requests[0].action == "system_command"
@@ -119,7 +155,7 @@ class TestSafetyGate:
         # Default assessor: run_code is in TOOL_ALWAYS_CONFIRM.
         agent = ToolAgent(confirmation_manager=None)
         executed = []
-        agent._run_code_tool = spy_cmd(executed)
+        spy_tool(agent, executed, "run_code")
 
         result = await agent._execute_single_tool(
             "run_code", {"code": "print(1)", "language": "python"}
@@ -133,7 +169,7 @@ class TestSafetyGate:
 
         manager = ConfirmationManager(notify=deny, timeout=2)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-        agent._toolkit_cmd = spy_cmd([])
+        spy_tool(agent, [], "system_command")
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}, language="ar"
         )
@@ -142,7 +178,7 @@ class TestSafetyGate:
     async def test_arabic_unavailable_message(self, assessor):
         manager = ConfirmationManager(notify=None, timeout=1)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-        agent._toolkit_cmd = spy_cmd([])
+        spy_tool(agent, [], "system_command")
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}, language="ar"
         )
@@ -151,9 +187,8 @@ class TestSafetyGate:
     async def test_cached_result_cannot_bypass_confirmation(self, assessor):
         manager = ConfirmationManager(notify=None, timeout=1)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
-
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         first = await agent._execute_single_tool("system_command", {"command": "rm -rf /x"})
         second = await agent._execute_single_tool("system_command", {"command": "rm -rf /x"})
@@ -171,12 +206,12 @@ class TestSafetyGate:
             risk_assessor=RiskAssessor(),
         )
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent._execute_single_tool(
             "system_command", {"command": "rm -rf /"}
         )
-        assert executed == ["rm -rf /"]
+        assert [c["command"] for c in executed] == ["rm -rf /"]
         assert result == "done"
 
 
@@ -185,7 +220,7 @@ class TestExecuteToolsIntegration:
         manager = ConfirmationManager(notify=None, timeout=1)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent.execute_tools(
             '{"action": "system_command", "command": "shutdown /s"}'
@@ -200,7 +235,7 @@ class TestExecuteToolsIntegration:
         manager = ConfirmationManager(notify=deny, timeout=2)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent.execute_tools(
             '{"action": "system_command", "command": "shutdown /s"}'
@@ -212,7 +247,7 @@ class TestExecuteToolsIntegration:
         manager = ConfirmationManager(notify=None, timeout=1)
         agent = ToolAgent(confirmation_manager=manager, risk_assessor=assessor)
         executed = []
-        agent._toolkit_cmd = spy_cmd(executed)
+        spy_tool(agent, executed, "system_command")
 
         result = await agent.execute_tools(
             '{"action": "system_command", "params": {"command": "format C:"}}'

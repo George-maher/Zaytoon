@@ -231,13 +231,26 @@ class TestFileToolContainment:
         assert "denied" in result.error.lower()
 
     async def test_tool_agent_file_write_rejects_sibling_prefix(self, monkeypatch, tmp_path):
+        """The LLM path must enforce containment too.
+
+        This used to call ``ToolAgent._toolkit_file_write``, one of ten private
+        duplicates of the executor's tools. It is now asserted through the
+        registry, which is what the agent actually uses.
+        """
         from agents.tool_agent import ToolAgent
 
         _root, evil = self._sibling_attack(monkeypatch, tmp_path)
         target = evil / "written.txt"
 
-        result = await ToolAgent()._toolkit_file_write(str(target), "data")
-        assert "Access denied" in result
+        class _Approve:
+            async def request(self, *a, **k):
+                return True
+
+        agent = ToolAgent(confirmation_manager=_Approve())
+        result = await agent._execute_single_tool(
+            "file_write", {"path": str(target), "content": "data"}
+        )
+        assert "Access denied" in result or "Blocked" in result
         assert not target.exists()
 
     async def test_tool_agent_file_write_allows_inside(self, monkeypatch, tmp_path):
@@ -245,8 +258,16 @@ class TestFileToolContainment:
 
         root, _evil = self._sibling_attack(monkeypatch, tmp_path)
         target = root / "sub" / "written.txt"
-        result = await ToolAgent()._toolkit_file_write(str(target), "data")
-        assert "Written to" in result
+
+        class _Approve:
+            async def request(self, *a, **k):
+                return True
+
+        agent = ToolAgent(confirmation_manager=_Approve())
+        result = await agent._execute_single_tool(
+            "file_write", {"path": str(target), "content": "data"}
+        )
+        assert "Wrote" in result
         assert target.read_text() == "data"
 
 
@@ -413,12 +434,22 @@ class TestDeniedCodeLanguages:
         assert lang not in DENIED_CODE_LANGUAGES
 
     async def test_tool_agent_refuses_shell_code(self):
+        """A shell interpreter is refused even when the user approves.
+
+        Asserted through the registry rather than the deleted
+        ``ToolAgent._run_code_tool``.
+        """
         from agents.tool_agent import ToolAgent
 
-        agent = ToolAgent()
-        assert "not permitted" in await agent._run_code_tool(
-            {"code": "rm -rf /", "language": "bash"}
+        class _Approve:
+            async def request(self, *a, **k):
+                return True
+
+        agent = ToolAgent(confirmation_manager=_Approve())
+        result = await agent._execute_single_tool(
+            "run_code", {"code": "rm -rf /", "language": "bash"}
         )
+        assert "not permitted" in result
 
     async def test_executor_refuses_shell_code_even_when_approved(self):
         from unittest.mock import AsyncMock, MagicMock

@@ -72,6 +72,59 @@ desktop/                    # Python/customTkinter floating orb + chat panel
 └── tests/                  # pytest suite for the shell
 ```
 
+## Tool layer
+
+One registry, one implementation per tool, one gate.
+
+```
+tools/
+├── base.py          # BaseTool ABC (name/description/schema/permission/
+│                    #   validate/execute), ToolResult, OSToolkit (legacy)
+├── registry.py      # ToolRegistry: validate -> gate -> execute. THE chokepoint
+├── filesystem.py    # read, write, list, create_folder, delete, move, search
+├── terminal.py      # system_command, run_code, type_text/key_press
+├── applications.py  # open_app, close_app, resolve_windows_app
+├── system.py        # get_time, system_info, calculator, get_volume, screenshot
+├── web.py           # search_web, open_url
+├── git.py           # status, log, diff, branch_list | add, commit, checkout, push
+├── coding.py        # create_project, run_npm, run_tests
+├── media.py         # play_media (media keys)
+├── safety.py        # RiskAssessor + ConfirmationManager
+├── sandbox.py       # containment + shell-injection primitives
+├── executor.py      # thin backwards-compatible facade over the registry
+├── windows.py       # legacy platform tools (covered by the sandbox suite)
+└── linux.py         # ditto
+```
+
+30 tools, listed in the agent prompt by generating them from the registry
+rather than hand-maintaining them — the old hard-coded list omitted every tool
+added since, which is how `file_read`/`file_write` came to pre-validate with no
+handler behind them and return `"Unknown action"`.
+
+**The ordering in `ToolRegistry.execute` is the design:**
+
+    validate()  ->  risk gate  ->  tool.execute()
+
+- **Validation first.** A malformed request gets a precise error instead of an
+  approval prompt for something that could not have run anyway. Unconditional
+  sandbox blocks (shell chaining, path escapes) are reported here as
+  `blocked: true`, *never* as `requires_confirmation` — approving them would
+  not help.
+- **The gate second.** The tier comes from the tool's own `permission`
+  attribute, reconciled with `RiskAssessor` by taking the **stricter** of the
+  two. Honouring only the stricter direction was a real bug: `play_media`
+  declares `confirm` but appears in no table, so the assessor returned `safe`
+  and the keystroke tool ran with no prompt.
+- **Execution last**, only after approval.
+
+`ToolAgent` and `ToolExecutor` hold no tool logic — `ToolAgent` went 548 → 270
+lines and `ToolExecutor` 626 → 157. `ToolAgent` runs the gate itself so its
+decline/timeout notices can be bilingual, then passes `approval=True` to the
+registry so the user is not asked twice.
+
+`GET /tools` returns every tool with its schema and tier; `GET /health` reports
+`tools_loaded` and `tools_by_tier`.
+
 ## Key quirks
 
 - **Python path**: `backend/api/__init__.py` does `sys.path.insert(0, ...)`. Always `cd backend` first; never run `uvicorn` from repo root.
@@ -80,7 +133,10 @@ desktop/                    # Python/customTkinter floating orb + chat panel
 - **Keyword router**: Fast intent matching via regex before LLM fallback (skips ~80% of LLM router calls).
 - **Rate limiter**: 60 req/min per IP (configurable via `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`). Stale entries cleaned every 5 min.
 - **Session management**: max 100 concurrent sessions; sessions older than 30 min cleaned. WebSocket `"interrupt"` message cancels active response + TTS.
-- **Tools whitelist** (Windows): `dir, echo, whoami, date, time, ver, systeminfo, ipconfig, tasklist, hostname` only.
+- **Tools whitelist**: `system_command` accepts any single command (argv, no
+  shell), but shell metacharacters and chaining are refused outright. The
+  legacy `OSToolkit` `cmd` tool still has a 10-command read-only allow-list and
+  is only reachable through `tools/windows.py`.
 - **Frontend WS proxy**: Vite proxies `/ws` → `ws://localhost:8000`. The hook uses `localhost:8000/ws` directly when on localhost, otherwise the serving port.
 
 ## LLM providers & fallback
@@ -318,6 +374,12 @@ npm run verify          # lint && test && build
   app-target validation, risk gate, denied code languages.
 - `tests/test_workspace_and_injection.py` — workspace-root resolution, the
   PowerShell `-EncodedCommand` fix, and the removed ungated WS command channel.
+- `tests/test_tool_registry.py` — the tool contract (self-describing, schema
+  declares what it requires, aliases resolve), the validate→gate→execute
+  ordering, and every new tool against a real temp workspace.
+- `tests/test_api_routes.py` — `/health`, `/tools`, `/settings/workspace`,
+  `/tasks`, `/command/*`. Added after a one-line edit to `health()` removed the
+  `get_llm_client()` call it depends on and nothing caught it.
 - `tests/test_summarization.py` — guards the abstract-`BaseAgent` silent failure.
 - `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
   the seam both the browser app and the desktop shell depend on.
@@ -422,11 +484,16 @@ RouterAgent.route() → AgentService.dispatch()
   ├── FastAgent       (chat / default)
   ├── PlannerAgent    (complex)
   ├── CodeAgent       (code)
-  ├── ToolAgent       (tools / action)
+  ├── ToolAgent       (tools / action)  → ToolRegistry
   ├── SchedulerAgent  (scheduling → TimeParser → ReminderService)
   └── MemoryAgent     (memory retrieval)
 ```
-Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Agents receive `language` kwarg (`"ar"` | `"en"`). `ToolAgent` additionally receives `confirmation_manager` and `session_id` kwargs from the WebSocket session.
+Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Agents receive `language` kwarg (`"ar"` | `"en"`). `ToolAgent` additionally receives `confirmation_manager`, `session_id` and a `ToolRegistry` from the WebSocket session.
+
+`ToolAgent` parses the model's JSON (`TOOL_CALL_RE`) and hands the call to the
+registry. There is **no agent loop yet** — it is one LLM call, N tool calls,
+one final answer, with no re-planning and no error recovery. That is the next
+increment.
 
 ## WebSocket protocol
 

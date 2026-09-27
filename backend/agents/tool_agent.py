@@ -2,33 +2,30 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 from typing import Dict, Any, List, Optional, Callable
 
 from .base_agent import BaseAgent
+from tools.registry import ToolRegistry, build_default_registry
 from tools.safety import ConfirmationManager, RiskAssessor, RiskLevel
-from tools.sandbox import (
-    DENIED_CODE_LANGUAGES,
-    SecurityError,
-    assert_sendkeys_keys,
-    assert_sendkeys_text,
-    encode_powershell_command,
-    powershell_sendkeys_script,
-    resolve_workspace,
-    sanitize_app_name,
-    validate_app_target,
-    workspace_root,
-)
 
 logger = logging.getLogger("Zaytoon.ToolAgent")
 
-TOOL_DESCRIPTION = (
-    '{"action":"tool_name","params":{"key":"value"}} '
-    "Tools: open_app, close_app, type_text, key_press, get_time, run_code, search_web, "
-    "system_command, calculator, file_read, file_write, system_info"
-)
+#: The tool catalogue is no longer hand-written here. It comes from the
+#: registry, so the prompt, the permission tier and the implementation can
+#: never disagree about what exists — the previous hard-coded list omitted
+#: every tool added since, which is how `file_read`/`file_write` kept
+#: pre-validating with no handler behind them.
+def _tool_catalogue() -> str:
+    names = [tool.name() for tool in build_default_registry().tools()]
+    return (
+        '{"action":"tool_name","params":{"key":"value"}}\n'
+        f"Available tools: {', '.join(names)}"
+    )
+
+
+TOOL_DESCRIPTION = _tool_catalogue()
 
 # Matches a tool call object and captures the action name plus the remaining
 # key/value pairs. Supports both {"action":..,"p":1} and {"action":..,"params":{..}}.
@@ -58,16 +55,26 @@ _ERROR = {
 
 
 class ToolAgent(BaseAgent):
+    """Turns a model's JSON tool call into a gated, executed tool result.
+
+    This agent owns *no* tool implementations. It asks the model what to do,
+    parses the JSON, and hands the call to :class:`ToolRegistry`, which owns
+    validation, the permission gate and every tool. It previously carried its
+    own weaker copy of ten of them.
+    """
+
     def __init__(
         self,
         confirmation_manager: Optional[ConfirmationManager] = None,
         risk_assessor: Optional[RiskAssessor] = None,
+        registry: Optional[ToolRegistry] = None,
     ):
         super().__init__("Tool Agent", max_tokens=256, temperature=0.1)
         self._cache: dict = {}
         self._CACHE_TTL = 300
         self.assessor = risk_assessor or RiskAssessor()
         self.confirmation_manager = confirmation_manager
+        self.registry = registry or build_default_registry(self.assessor)
 
     def _get_cache_key(self, tool: str, params: dict) -> str:
         raw = f"{tool}:{json.dumps(params, sort_keys=True)}"
@@ -236,11 +243,30 @@ class ToolAgent(BaseAgent):
         session_id: str = "",
         language: str = "en",
     ) -> str:
+        """Gate and run one tool, returning a model-readable string.
+
+        The whole implementation used to be an ``if/elif`` chain over
+        ``open_app``, ``type_text``, ``key_press``, ``get_time``, ``run_code``,
+        ``search_web``, ``system_command``, ``calculator``, ``file_read``,
+        ``file_write`` and ``system_info`` — each with its own private method
+        duplicating what ``ToolExecutor`` already did, less safely. Those copies
+        had already drifted: this one built a ``powershell -Command`` string
+        from user text (injectable) while the other used ``-EncodedCommand``,
+        and this one supported three ``run_code`` languages against the other's
+        five.
+
+        Now it delegates to the one registry, which owns validation, the
+        permission gate and every implementation. The cache is kept, but it is
+        consulted *after* the gate so a cached result can never bypass a
+        required confirmation.
+        """
         params = params or {}
         manager = confirmation_manager or self.confirmation_manager
 
-        # The safety gate runs BEFORE the cache so a cached result can never
-        # bypass a required confirmation.
+        # The gate runs first, and unconditionally: a cache hit must never be a
+        # way around asking the user. It happens *here* rather than in the
+        # registry so the decline / timeout / no-channel notices can be
+        # bilingual, which the registry's generic message is not.
         refusal = await self._request_approval(
             tool_name, params, manager, session_id, language
         )
@@ -252,308 +278,37 @@ class ToolAgent(BaseAgent):
         if cached:
             return f"[Cached] {cached}"
 
-        result = None
-        try:
-            if tool_name == "open_app" or tool_name == "close_app":
-                result = await self._app_control(tool_name, params)
-            elif tool_name == "type_text":
-                result = await self._type_text_tool(params)
-            elif tool_name == "key_press":
-                result = await self._key_press_tool(params)
-            elif tool_name == "get_time":
-                result = self._get_time_tool()
-            elif tool_name == "run_code":
-                result = await self._run_code_tool(params)
-            elif tool_name == "search_web":
-                result = await self._search_tool(params.get("query", ""))
-            elif tool_name == "system_command":
-                result = await self._toolkit_cmd(params.get("command", ""), "cmd")
-            elif tool_name == "calculator":
-                result = self._calculator_tool(params.get("expression", ""))
-            elif tool_name == "file_read":
-                result = await self._toolkit_file_op(params.get("path", ""), action="read")
-            elif tool_name == "file_write":
-                result = await self._toolkit_file_write(
-                    params.get("path", ""), params.get("content", "")
-                )
-            elif tool_name == "system_info":
-                result = await self._toolkit_system_info()
-            else:
-                result = f"Unknown tool: {tool_name}"
-        except Exception as e:
-            result = f"Tool error: {e}"
+        # Hand the decision to the registry. Passing `approval=True` is what
+        # stops the registry running a *second* gate and refusing the call we
+        # just had approved; passing `confirmation_manager` instead would make
+        # it ask the user twice.
+        result = await self.registry.execute(
+            tool_name, params, confirmation_manager=None, approval=True
+        )
+        rendered = _render_for_model(result)
 
-        if result and not result.startswith("Error"):
-            self._set_cached(cache_key, result)
-        return result
+        # Only successful, non-blocked results are cached. A denial or a
+        # sandbox refusal must be re-evaluated next time, and an "Error: ..."
+        # string is not a result.
+        if result.get("success") and not result.get("blocked"):
+            self._set_cached(cache_key, rendered)
+        return rendered
 
-    async def _app_control(self, action: str, params: dict) -> str:
-        raw_app = params.get("app", "").strip()
-        if not raw_app:
-            return "Error: No app name provided"
-        try:
-            # Rejects shell syntax, path traversal, and script targets.
-            app = sanitize_app_name(raw_app)
-        except SecurityError as e:
-            return f"Error: {e}"
 
-        try:
-            if action == "open_app":
-                if os.name == "nt":
-                    from tools.executor import resolve_windows_app
-                    target = resolve_windows_app(app)
-                    if not target:
-                        return f"Error: Could not find application '{app}' on this system."
-                    try:
-                        validate_app_target(target)
-                    except SecurityError as e:
-                        return f"Error: {e}"
-                    # `cmd /c start` avoids shell-string interpolation; the
-                    # target has already been checked and is passed as argv.
-                    proc = await asyncio.create_subprocess_exec(
-                        "cmd", "/c", "start", "", target,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await asyncio.sleep(0.2)
-                    if proc.returncode not in (0, None):
-                        return f"Error: could not launch '{app}'"
-                else:
-                    await asyncio.create_subprocess_exec(
-                        app,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                return f"Opened {app}"
-            elif action == "close_app":
-                if os.name == "nt":
-                    exe = app if app.lower().endswith(".exe") else f"{app}.exe"
-                    proc = await asyncio.create_subprocess_exec(
-                        "taskkill", "/IM", exe, "/F",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                else:
-                    proc = await asyncio.create_subprocess_exec(
-                        "pkill", "-f", app,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode == 0:
-                    return f"Closed {app}"
-                return f"Could not close {app}: {stderr.decode().strip() or 'no process found'}"
-        except SecurityError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            return f"Error {action} {app}: {e}"
+def _render_for_model(result: Dict[str, Any]) -> str:
+    """Flatten a registry result into the single string the model sees.
 
-    async def _run_code_tool(self, params: dict) -> str:
-        code = params.get("code", "").strip()
-        lang = params.get("language", "").strip().lower()
-        if not code or not lang:
-            return "Error: code and language are required"
+    The agent contract is one string in, one string out, because the tool call
+    is spliced into the assistant's reply.
+    """
+    if result.get("success"):
+        return str(result.get("output") or "(no output)")
 
-        import tempfile
-
-        # Shell interpreters exist to run arbitrary system commands, so they are
-        # refused even after the human-in-the-loop gate approves.
-        if lang in DENIED_CODE_LANGUAGES:
-            return f"Error: language '{lang}' is not permitted for code execution"
-
-        ext_map = {"python": ".py", "javascript": ".js", "js": ".js"}
-        cmd_map = {
-            "python": ["python", "{file}"],
-            "javascript": ["node", "{file}"],
-            "js": ["node", "{file}"],
-        }
-
-        ext = ext_map.get(lang, ".txt")
-        cmd_template = cmd_map.get(lang)
-        if not cmd_template:
-            return f"Error: Unsupported language '{lang}'"
-
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=ext, delete=False, encoding="utf-8")
-        try:
-            tmp.write(code)
-            tmp.close()
-            cmd = [p.replace("{file}", tmp.name) for p in cmd_template]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=tempfile.gettempdir(),
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return "Error: Execution timed out (15s)"
-            output = stdout.decode("utf-8", errors="replace").strip()
-            error = stderr.decode("utf-8", errors="replace").strip()
-            if error:
-                return f"Output: {output}\nError: {error}" if output else f"Error: {error}"
-            return output or "(no output)"
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except (OSError, NameError):
-                pass
-
-    async def _search_tool(self, query: str) -> str:
-        if not query.strip():
-            return "Error: No search query provided"
-        try:
-            from ddgs import DDGS
-            ddgs = DDGS()
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None, lambda: list(ddgs.text(query, max_results=3))
-            )
-            if not results:
-                return "No results found."
-            lines = []
-            for i, r in enumerate(results, 1):
-                lines.append(f"{i}. {r.get('title', 'No title')}\n{r.get('body', 'No description')}")
-            return "\n\n".join(lines)
-        except Exception as e:
-            return f"Search error: {e}"
-
-    def _calculator_tool(self, expression: str) -> str:
-        import ast
-        if not expression.strip():
-            return "Error: No expression provided"
-        cleaned = re.sub(r"[^0-9+\-*/().,%\s]", "", expression)
-        try:
-            tree = ast.parse(cleaned, mode="eval")
-            # `ast.Parens` does not exist (parens are not a node in the AST), so
-            # the allow-list deliberately covers operators/nodes only.
-            allowed = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
-                       ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
-                       ast.Mod, ast.Pow, ast.USub, ast.UAdd)
-            for node in ast.walk(tree):
-                if not isinstance(node, allowed):
-                    return f"Error: Disallowed expression"
-            result = eval(compile(tree, "<string>", "eval"), {"__builtins__": {}}, {})
-            return str(result)
-        except Exception as e:
-            return f"Error: {e}"
-
-    async def _toolkit_file_op(self, path: str, action: str = "read") -> str:
-        from tools.base import OSToolkit
-        tk = OSToolkit()
-        result = await tk.execute("file", path=path, action=action)
-        if result.success:
-            return result.output
-        return f"Error: {result.error}"
-
-    async def _toolkit_file_write(self, path: str, content: str) -> str:
-        if not path.strip():
-            return "Error: No path provided"
-        try:
-            # Validate containment and resolve in one step. Checking with
-            # `is_safe_path` and then writing to `os.path.abspath(path)` checked
-            # a relative path against the workspace but opened it against the
-            # process cwd — two different roots.
-            safe_path = resolve_workspace(path)
-            if not safe_path:
-                return (
-                    "Error: Access denied - path outside the workspace "
-                    f"({workspace_root()}): {path}"
-                )
-            parent = os.path.dirname(safe_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(safe_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return f"Written to {path}"
-        except SecurityError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            return f"Error: {e}"
-
-    async def _toolkit_cmd(self, command: str, shell: str = "cmd") -> str:
-        from tools.base import OSToolkit
-        tk = OSToolkit()
-        result = await tk.execute("cmd", command=command)
-        if result.success:
-            return result.output
-        return f"Error: {result.error}"
-
-    async def _toolkit_system_info(self) -> str:
-        from tools.base import OSToolkit
-        tk = OSToolkit()
-        result = await tk.execute("system_info")
-        if result.success:
-            return result.output
-        return f"Error: {result.error}"
-
-    async def _type_text_tool(self, params: dict) -> str:
-        text = (params.get("text") or "").strip()
-        if not text:
-            return "Error: No text provided"
-        try:
-            # Literal text: SendKeys metacharacters are data, so escape them.
-            payload = assert_sendkeys_text(text)
-        except SecurityError as e:
-            return f"Error: {e}"
-        return await self._send_keys(payload, f"Typed: {text[:80]}")
-
-    async def _key_press_tool(self, params: dict) -> str:
-        keys = (params.get("keys") or "").strip()
-        if not keys:
-            return "Error: No keys provided"
-        try:
-            # A key combination: `+`/`^`/`%` are the modifier syntax, so they
-            # must survive unescaped or `ctrl+c` would stop being ctrl+c.
-            payload = assert_sendkeys_keys(keys)
-        except SecurityError as e:
-            return f"Error: {e}"
-        return await self._send_keys(payload, f"Pressed: {keys}")
-
-    async def _send_keys(self, payload: str, ok_message: str) -> str:
-        """Deliver keystrokes to the focused window.
-
-        Windows uses ``powershell -EncodedCommand``, so the payload travels as
-        base64 UTF-16LE and is never placed on a command line. The previous
-        implementation interpolated it into ``-Command "…SendWait('<text>')"``
-        with only single-quote doubling, at a permission level that never
-        prompted — a crafted ``text`` could close the literal and append
-        statements. Encoding removes the escaping problem entirely.
-        """
-        if os.name == "nt":
-            try:
-                script = powershell_sendkeys_script(payload)
-                proc = await asyncio.create_subprocess_exec(
-                    "powershell", "-NoProfile", "-NonInteractive",
-                    "-EncodedCommand", encode_powershell_command(script),
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    err = stderr.decode("utf-8", errors="replace").strip()
-                    return f"Error: {err}"
-                return ok_message
-            except FileNotFoundError:
-                return "Error: powershell not found on this system"
-            except Exception as e:
-                return f"Error: {e}"
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "xdotool", "type", "--clearmodifiers", payload,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate()
-            return ok_message
-        except FileNotFoundError:
-            return "Error: xdotool not found. Install with: sudo apt install xdotool"
-        except Exception as e:
-            return f"Error: {e}"
-
-    def _get_time_tool(self) -> str:
-        from datetime import datetime
-        now = datetime.now()
-        return f"It's {now.strftime('%I:%M %p')} on {now.strftime('%A, %B %d, %Y')}"
+    error = result.get("error") or "Tool reported failure without a reason"
+    if result.get("blocked"):
+        return f"Blocked by the security sandbox: {error}"
+    if result.get("cancelled"):
+        return f"Cancelled: {error}"
+    if result.get("requires_confirmation"):
+        return f"Needs confirmation: {error}"
+    return f"Error: {error}"
