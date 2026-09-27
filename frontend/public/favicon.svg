@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <defs>
+    <linearGradient id="z-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00d4ff"/>
+      <stop offset="100%" stop-color="#00f0ff"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="2" y="2" width="44" height="44" rx="4" fill="none" stroke="url(#z-grad)" stroke-width="1.5" opacity="0.4"/>
+  <rect x="6" y="6" width="36" height="36" rx="2" fill="none" stroke="url(#z-grad)" stroke-width="1" opacity="0.2"/>
+  <text x="24" y="33" font-family="Orbitron,sans-serif" font-size="26" font-weight="700" fill="url(#z-grad)" text-anchor="middle" filter="url(#glow)">Z</text>
+</svg>

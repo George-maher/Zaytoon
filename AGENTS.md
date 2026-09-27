@@ -1,0 +1,510 @@
+# Zaytoon — Agent Guide
+
+## Startup
+
+```bash
+# Backend (must run from backend/ — sys.path depends on it)
+cd backend
+cp .env.example .env          # then edit OPENROUTER_API_KEY with your key
+.venv\Scripts\activate && pip install -r requirements.txt
+python main.py                # http://127.0.0.1:8000
+
+# Frontend (separate terminal)
+cd frontend && npm run dev    # http://localhost:5173
+```
+
+Prerequisites:
+- **OpenRouter API key** — get one at https://openrouter.ai/keys and set it in `.env` as `OPENROUTER_API_KEY`. It is **required**: local model execution has been removed, so with no key the assistant cannot answer.
+- Model chain: `OPENROUTER_PRIMARY_MODEL` (default `qwen/qwen3.8-27b:free`) → `OPENROUTER_FALLBACK_MODEL` (`openrouter/free`). Code/planning/scheduling use `OPENROUTER_REASONING_MODEL` (`thinkingmachines/inkling-small:free`) as the chain head. All three are hard-allow-listed.
+- See "LLM providers" below for the free-model policy and fallback behaviour.
+
+Desktop shell (optional, Python/customTkinter — spawns the backend itself):
+```bash
+cd desktop && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main.py            # or: python main.py --diagnose
+# Ctrl+Space toggles the floating orb; Alt+Z switches orb <-> panel.
+```
+
+Root scripts (via `concurrently`):
+- `npm run dev` — starts both backend + frontend
+- `npm run test` — runs backend tests
+- `npm run test:desktop` — runs the desktop shell tests
+
+## Repo layout
+
+```
+backend/
+├── main.py                 # Thin entry: sys.path.insert + uvicorn.run("main:app", ...)
+├── config.py               # Env-based config (python-dotenv)
+├── arabic.py               # Language detection, Egyptian markers, normalization
+├── api/main.py             # FastAPI app factory, REST routes, CORS, lifespan
+├── api/websocket.py        # WS handler, streaming TTS, session management
+├── agents/                 # 8 agents: RouterAgent, FastAgent, PlannerAgent,
+│                           #   CodeAgent, ToolAgent, MemoryAgent, SchedulerAgent, base
+├── services/agent_service.py  # Intent dispatch → agent orchestration
+├── services/llm_client.py  # OpenRouter client: free-model allow-list, request/
+│                           #   response validation, fallback chain, metrics
+├── domain/models.py        # Enums (Intent, Language, AgentType), dataclasses,
+│                           #   TokenBucketRateLimiter, SessionState, SpokenSentenceTracker
+├── common/exceptions.py    # ZaytoonError hierarchy
+├── scheduler/              # TimeParser, SchedulerManager
+├── reminder/               # ReminderService, NotificationManager, ReminderData models
+├── voice/                  # SpeechToText (faster-whisper), TextToSpeech (edge-tts)
+│   ├── routing.py          # Voice registry + dynamic language/voice selection
+│   ├── stt.py              # transcribe_detailed() → TranscriptionResult (language)
+│   └── tts.py              # edge-tts, auto-selects voice per text/language
+├── tools/                  # OSToolkit: WindowsCmdTool, WindowsFileTool, WindowsSystemTool
+│   ├── sandbox.py          # Unconditional blocks: shell metachars, path containment
+│   └── safety.py           # RiskAssessor + ConfirmationManager (human-in-the-loop)
+├── memory/                 # ShortTermMemory, UserPreferences
+├── tests/                  # 21 test files, pytest-asyncio
+├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
+├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
+└── data/zaytoon.db         # SQLite (auto-created by MemoryAgent)
+frontend/src/
+├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
+├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
+│                           #   StatusDot, SystemMonitor, ReminderPanel, ConfirmationDialog
+└── styles/index.css        # Tailwind + CSS vars + animations
+desktop/                    # Python/customTkinter floating orb + chat panel
+├── app/                    # Tk main thread; orb, panel, tray, hotkeys, WS client
+├── scripts/build_exe.py    # PyInstaller onefile build
+└── tests/                  # pytest suite for the shell
+```
+
+## Key quirks
+
+- **Python path**: `backend/api/__init__.py` does `sys.path.insert(0, ...)`. Always `cd backend` first; never run `uvicorn` from repo root.
+- **All agents** go through `services/llm_client.LLMClient`; they never build URLs or pick models themselves. OpenRouter is the only provider, so there is a single endpoint and one SSE parser.
+- **OpenRouter API key is required.** `LLMClient.build_chain()` raises a message telling you to set it when the key is absent — there is no local fallback to degrade to.
+- **Keyword router**: Fast intent matching via regex before LLM fallback (skips ~80% of LLM router calls).
+- **Rate limiter**: 60 req/min per IP (configurable via `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`). Stale entries cleaned every 5 min.
+- **Session management**: max 100 concurrent sessions; sessions older than 30 min cleaned. WebSocket `"interrupt"` message cancels active response + TTS.
+- **Tools whitelist** (Windows): `dir, echo, whoami, date, time, ver, systeminfo, ipconfig, tasklist, hostname` only.
+- **Frontend WS proxy**: Vite proxies `/ws` → `ws://localhost:8000`. The hook uses `localhost:8000/ws` directly when on localhost, otherwise the serving port.
+
+## LLM providers & fallback
+
+**OpenRouter is the only provider.** Local model execution (Ollama, llama.cpp,
+any on-device GGUF) has been removed: nothing is downloaded to or run on the
+user's machine. Every request goes to
+`https://openrouter.ai/api/v1/chat/completions`.
+
+`services/llm_client.py` owns model selection. `BaseAgent.tier` picks the head of
+the chain; `LLMClient.build_chain()` returns the ordered endpoints.
+
+| Tier | Chain |
+|------|-------|
+| `fast` (chat, tools, router) | `qwen/qwen3.8-27b:free` → `openrouter/free` |
+| `reasoning` (code, planner, scheduler) | `thinkingmachines/inkling-small:free` → `openrouter/free` |
+
+**There is no local fallback.** If OpenRouter is unreachable the assistant
+cannot answer, and says so — it never silently switches providers. With no
+`OPENROUTER_API_KEY` at all, `build_chain()` raises a message telling you to set
+one.
+
+### Zero-cost policy (two layers, both before any socket opens)
+
+1. **Allow-list** — `config.ALLOWED_FREE_MODELS` is a hard-coded frozenset of the
+   three models above. Being free is *necessary but not sufficient*: an
+   un-allow-listed `vendor/model:free` is still refused.
+2. **Free form** — the id must end in `:free` or be exactly `openrouter/free`.
+
+Checked in `ProviderEndpoint.__post_init__` and re-checked in `build_payload()`,
+so a typo such as `OPENROUTER_PRIMARY_MODEL=openai/gpt-4o` can never produce a
+charge. `GET /health` reports `rejected_models`.
+
+### Request / response validation
+
+- `ProviderEndpoint.validate_request()` runs before dispatch: URL host, the
+  `Authorization` / `HTTP-Referer` / `X-Title` headers, message shape and roles,
+  `max_tokens`, `temperature` range, `stream` type. Failures raise
+  `LLMRequestError` **without opening a socket**.
+- `ProviderEndpoint.validate_completion()` structurally verifies the 200 body:
+  content-type, JSON decode, `error` payloads returned with a 200, `choices`
+  present/typed/non-empty, `message` object, and `content` either a string,
+  `null` (tool calls) or a multimodal block list. Anything else raises
+  `LLMResponseError` and the chain moves on instead of crashing the agent.
+- SSE frames are parsed defensively; keep-alives, truncated JSON, and frames
+  with a missing/typed-wrong `delta` are skipped rather than raising.
+
+### Fallback, health, metrics
+
+- **Fatal** (401/402/403/404/422 …) → skip the model immediately, no retry.
+- **Rate limited** (429) and **server error** (5xx) → short backoff on the same
+  model, then advance to `openrouter/free`.
+- **Timeouts / connect errors** → advance immediately.
+- A failing model is benched for `LLM_PROVIDER_COOLDOWN` seconds. If *every*
+  model is benched the breaker is ignored rather than hard-failing.
+- **Streaming**: a failure *before* the first delta retries the next model, still
+  streaming, so early-TTS keeps working. A failure *after* deltas were emitted
+  switches to a non-streaming call; the WebSocket layer's final `message` event
+  overwrites the streamed bubble and `SpokenSentenceTracker` dedupes TTS overlap.
+  If that recovery also fails, the already-streamed partial text is returned
+  rather than an error replacing visible text.
+- `LLMClient.metrics` counts success / rate_limited / server_error / malformed /
+  timeouts plus average latency, per model. Exposed on `GET /health` under
+  `llm.metrics`.
+- Every outcome is logged with a stable prefix: `LLM OK`, `LLM RATE_LIMITED`,
+  `LLM SERVER_ERROR`, `LLM FATAL`, `LLM MALFORMED`, `LLM TIMEOUT`,
+  `LLM STREAM OK`, `LLM EXHAUSTED`.
+
+> Note: `thinkingmachines/inkling-small:free` currently returns HTTP 403 for
+> non-agentic clients ("only available on agentic harnesses"). 403 is fatal, so
+> the chain falls through to `openrouter/free` transparently — but it costs a
+> round-trip, so consider a different `OPENROUTER_REASONING_MODEL` if you have
+> one that is allow-listed.
+
+## Bilingual voice routing
+
+`voice/routing.py` is the single voice registry. `arabic.get_tts_voice()` and
+`TextToSpeech.resolve_voice()` both defer to it, so there is no second copy of
+the mapping.
+
+- **Arabic (Egyptian):** `ar-EG-ShakirNeural` → `ar-EG-SalmaNeural`
+- **English:** `en-GB-RyanNeural` → `en-GB-ThomasNeural` → `en-US-GuyNeural`
+  (cross-locale fallbacks are intentional, so speech survives a retired voice)
+
+`config.TTS_VOICE_AR` / `TTS_VOICE_EN` override the primary per language.
+`TextToSpeech.probe_voices()` asks edge-tts which voices it actually offers and
+`resolve_voice()` walks the chain to the first one that exists.
+
+**Dynamic switching.** Every TTS method takes an optional `language`; when it is
+omitted the voice is inferred from the text itself
+(`routing.detect_text_language`: Arabic-character ratio ≥0.15 **and** ≥3 Arabic
+chars, plus Egyptian-marker detection). So the same session can read an English
+reply in `en-GB` and an Egyptian reply in `ar-EG` with no state tracking.
+
+**STT → TTS handoff.** `SpeechToText.transcribe_detailed()` returns a
+`TranscriptionResult` carrying the language Whisper actually detected, and the
+WebSocket layer passes it as `language_hint` into `_handle_message` and emits an
+`stt_result` event. Whisper's verdict beats both the client's hint and
+re-sniffing the transcript, so a short Arabic utterance is not misread as
+English.
+
+`POST /tts` is verified live in both languages
+(`scripts/verify_final.py`).
+
+## Tool safety sandbox (human-in-the-loop)
+
+Two independent layers, because they enforce different things.
+
+### Layer 1 — unconditional blocks (`tools/sandbox.py`)
+
+These are refused outright; **no approval can override them**, because they are
+injection attempts rather than legitimate actions.
+
+- **Shell metacharacters / chaining.** `split_command()` rejects `&`, `|`, `;`,
+  `` ` ``, `$(...)`, `>`, `<`, newlines, and `%VAR%` / `!VAR!` expansion.
+  Every command path is now invoked with an argument vector and `shell=False`.
+  This closes a **confirmed, exploitable hole**: `WindowsCmdTool` used to run
+  `echo`/`dir`/`date`/`time` through `subprocess.run(command, shell=True)`, so
+  `echo pwned & hostname` passed the allow-list and ran the chained `hostname`
+  (verified — it returned the machine hostname before the fix).
+  Shell builtins are dispatched via `cmd /c` with the validated argument list.
+- **Path containment.** `is_safe_path()` uses `os.path.commonpath`, not
+  `str.startswith`. With root `.../app`, the sibling `.../app_evil` is correctly
+  rejected; `startswith` allowed it in all three file tools.
+- **App targets.** `sanitize_app_name()` / `validate_app_target()` strip path
+  traversal and reject script types (`.bat`, `.ps1`, `.vbs`, …). The target is
+  passed as argv to `cmd /c start` instead of being interpolated into
+  `start "<target>"`.
+- **Shell interpreters for `run_code`** (`bash`, `sh`, `cmd`, `powershell`, …)
+  are refused even after approval; `python` / `javascript` remain available.
+
+### Layer 2 — human-in-the-loop gate (`tools/safety.py`)
+
+`RiskAssessor` combines three things: a configurable `TOOL_ALWAYS_CONFIRM` list,
+content patterns (`rm -rf`, `shutdown`, `del /s`, `curl | sh`, `taskkill`,
+writes under `C:\Windows\System32`, killing `explorer.exe`, …), and a static
+**permission tier** per action.
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| `safe` | runs without asking | `get_time`, `system_info`, `file_read`, `search_web`, `open_app`, `git_status`/`git_log`/`git_diff` |
+| `confirm` | always asks, whatever the arguments | `file_write`, `create_folder`, `run_npm`, `system_command` (any command), `type_text`, `key_press`, `git_commit` |
+| `dangerous` | asks, and is often refused outright | `file_delete`, `delete_folder`, `registry_write`, `run_code`, plus argument-dependent escalation (killing a system-critical process) |
+
+**Two invariants are enforced structurally, and both are tested:**
+
+1. **The gate is never looser than the tier.** Every return path from
+   `assess()` goes through `RiskAssessor._finalise()`, which synthesises a
+   reason when a non-`safe` action classified no hazard. Without it, a branch
+   could label an action `dangerous` while `requires_confirmation` stayed
+   `False` — the UI would promise a prompt that never appeared. (The reverse,
+   gate stricter than tier via an extra pattern match, is intended layering.)
+2. **Unconditional blocks precede the gate.** `ToolExecutor._prevalidate` runs
+   `split_command` before the risk gate, so shell chaining is refused with
+   `blocked: true` and *never* as `requires_confirmation` — confirming it would
+   not help. Approving one command must not authorise what follows a separator.
+
+`system_command` is confirmation-required for **every** command. It used to be
+content-inspected only, so `echo hello` ran with no prompt, on the reasoning
+that a harmless command needs no approval — but any command reaches an
+interpreter, so the harmless case is exactly what an attacker would use to reach
+a harmful one. The pattern rules still run and still layer their reasons on top.
+
+### No ungated tool path
+
+The WebSocket `command` message and `AgentService.execute_command` were
+**removed**. They reached `OSToolkit` with neither `RiskAssessor` nor
+`ConfirmationManager`, and a WebSocket handshake is not subject to CORS, so any
+web page the user visited could open `ws://127.0.0.1:8000/ws` and drive them.
+Both removal points carry an explanatory comment, and
+`test_workspace_and_injection.py` parses the AST to assert they stay gone.
+
+### Keystroke injection
+
+Keystroke payloads are delivered with `powershell -EncodedCommand`, so the
+payload is base64 UTF-16LE and never appears on a command line. The previous
+`powershell -Command "...SendWait('<text>')"` form was injectable at a
+non-blocking tier. Note the deliberate asymmetry: `type_text` escapes SendKeys
+metacharacters (they are literal data) while `key_press` does not (`+`/`^`/`%`
+are the modifier syntax — escaping them would break `ctrl+c`).
+
+### Gate mechanics
+
+- High-risk calls are **not** executed. `ConfirmationManager` emits a
+  `require_confirmation` WebSocket event and blocks on a future; the client
+  replies with `tool_confirm {request_id, approved}`. Timeout, disconnect, or
+  an error all **deny** (fail closed).
+- The gate runs *before* the ToolAgent result cache, so a cached result can
+  never bypass an approval, and *after* argument validation, so a malformed
+  request gets a precise error rather than an approval prompt.
+- Applied at two chokepoints: `ToolExecutor.execute` and `ToolAgent` — plus
+  `POST /command/run`, which denies rather than executing because REST has no
+  approval channel. `AgentService._execute_tool_commands` is **test-only**; do
+  not wire it back into a request path.
+- Bilingual notices (`en` / `ar`) for decline, timeout, and no-channel cases.
+- Manual check: `python scripts/smoke_confirmation.py deny`.
+
+## Anti-hallucination / deliberation prompts
+
+`agents/prompts.py` holds a shared grounding block appended to every reasoning
+agent. It forbids inventing file paths, commands, APIs or values; mandates
+`NEEDS VERIFICATION` / `«محتاج أتحقق»` when uncertain; forbids claiming an
+action was performed; and states that execution happens through the gated tool
+layer.
+
+`PlannerAgent` and `CodeAgent` (both `TIER_REASONING`) add a mandated method —
+understand → audit → steps/code → **verify** → risks — and `PlannerAgent` is
+explicitly told it plans but does not act.
+
+## Tests
+
+```bash
+# backend (826 tests)
+cd backend
+.venv\Scripts\activate && python -m pytest tests/ -v
+
+# desktop shell (78 tests)
+cd desktop
+..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
+
+# frontend (51 tests + lint + build)
+cd frontend
+npm run verify          # lint && test && build
+```
+
+- All Python tests are async (pytest-asyncio). SQLite DB auto-created in `data/`.
+- Tests skip API-dependent tests when OpenRouter is unreachable.
+- `tests/test_llm_client.py` mocks all HTTP (including SSE) — no network needed.
+- `tests/test_websocket_confirmation.py` drives the real WS handler with a fake socket.
+- `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
+  and an exploding HTTP client proving no request is attempted for a billable model.
+- `tests/test_voice_routing.py` — locale normalisation, text-based language
+  detection, voice profiles, dynamic switching, STT language reporting.
+- `tests/test_security_sandbox.py` — shell-injection payloads, path containment,
+  app-target validation, risk gate, denied code languages.
+- `tests/test_workspace_and_injection.py` — workspace-root resolution, the
+  PowerShell `-EncodedCommand` fix, and the removed ungated WS command channel.
+- `tests/test_summarization.py` — guards the abstract-`BaseAgent` silent failure.
+- `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
+  the seam both the browser app and the desktop shell depend on.
+- `python scripts/verify_final.py` — live smoke check of all three areas. It is
+  a **policy** check, so it must be updated whenever a permission tier changes.
+- **No pre-existing failures.** The 50 failures previously in
+  `test_desktop_config.py` were tests for a Tauri/Rust shell that no longer
+  exists; they were replaced by `desktop/tests/test_desktop_shell.py`.
+
+## Workspace (file-tool containment)
+
+Every file tool is confined to `config.WORKSPACE_ROOT`, defaulting to
+`~/ZaytoonWorkspace` — **not** `os.getcwd()`. The backend must be launched from
+`backend/`, so a cwd-based root confined the assistant to its own source tree and
+made project creation, repository inspection and git operations impossible.
+
+- `GET /settings/workspace` — current root plus a directory listing.
+- `POST /settings/workspace {"root": "..."}` — repoint at runtime; persisted as a
+  preference. A path that cannot be created is rejected, never silently ignored.
+- `sandbox.resolve_workspace(path)` is the single definition of "resolve a path
+  and decide whether it is inside the root". `sandbox.is_safe_path()` delegates
+  to it. They previously disagreed — one used the cwd, the other the workspace —
+  so a relative path could be validated against one root and opened against
+  another. **Do not reintroduce a second resolution path.**
+
+## Arabic / Egyptian
+
+- `arabic.py`: >15% Arabic Unicode chars → detected `"ar"`; else ≥1 Egyptian marker → `"ar"`; else `"en"`.
+- `clean_and_detect()` detects language WITHOUT normalizing the text.
+- Agent prompts must include `رد بالعربي فقط. ممنوع الرد بالإنجليزية.` on Arabic paths.
+- TTS voices: `ar-EG-ShakirNeural` / `en-GB-RyanNeural` (configurable in `.env`).
+- Scheduling: `TimeParser.parse_time()` runs first (no LLM for simple reminders).
+- `TTS_STREAM_EARLY=true` (default): starts TTS as soon as first complete sentence (>15 chars) arrives.
+
+### Time parsing (`scheduler/parser.py`)
+
+`TimeParser.parse_time(text, now=None)` resolves in a single pass so a day
+offset and a time-of-day can never be counted twice:
+
+1. **Normalise** — Arabic-Indic digits, then `arabic.normalize_arabic`.
+2. **Self-contained relative** — `in 2 hours`, `بعد 3 ايام` (`_match_from_now*`).
+3. **Structured** — resolve the day once (`_parse_day`) and the time-of-day once
+   (`_extract_time_of_day`), then combine (`_resolve_day_and_time`).
+4. **`dateparser` last resort** — only when steps 1–3 understand nothing.
+
+Rules that matter when editing this file:
+
+- **Day keywords come in two spellings.** `normalize_arabic` folds `ة → ه`, so
+  `الجمعة` arrives as `الجمعه`. `_with_normalized_variants()` adds the folded
+  form to every table. Without it, ة-final Arabic day words silently miss and
+  the reminder is never created at all.
+- **`RELATIVE_DAYS` is separate from `ARABIC_DAYS`.** Relative keywords
+  (`بكرة` = +1 day) must be literal offsets; mixing them into the weekday map
+  made "tomorrow" resolve to the next Tuesday.
+- **Longest match first** so `بعد بكرة` beats `بكرة` and `after tomorrow` beats
+  `tomorrow`.
+- **`dateparser` must stay last.** It used to run first and win, resolving
+  `monday at 9` a year out and defeating the Arabic-aware matchers.
+- **A bare number is never a time.** `_extract_time_of_day` requires a colon, a
+  meridiem marker, or the `الساعة` / `at|by` prefix, so `in 3 days` cannot be
+  read as 03:00.
+- **Roll forward only when the date is implicit.** `friday at 9` must stay on
+  Friday; `today at 5pm` at 20:00 correctly becomes tomorrow.
+
+Regression coverage: `tests/test_scheduler_regression.py` (92 tests), including
+a test asserting `dateparser` is *not* consulted for any phrasing we understand.
+
+## Agent dispatch
+
+```
+RouterAgent.route() → AgentService.dispatch()
+  ├── FastAgent       (chat / default)
+  ├── PlannerAgent    (complex)
+  ├── CodeAgent       (code)
+  ├── ToolAgent       (tools / action)
+  ├── SchedulerAgent  (scheduling → TimeParser → ReminderService)
+  └── MemoryAgent     (memory retrieval)
+```
+Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Agents receive `language` kwarg (`"ar"` | `"en"`). `ToolAgent` additionally receives `confirmation_manager` and `session_id` kwargs from the WebSocket session.
+
+## WebSocket protocol
+
+| Type | Payload | Direction |
+|------|---------|-----------|
+| `message` | `{"type":"message","message":"..."}` | Client → Server |
+| `audio` | `{"type":"audio","audio":"<base64>","language":"en\|ar"}` | Client → Server |
+| `interrupt` | `{"type":"interrupt"}` | Client → Server |
+| `reminder_cmd` | `{"type":"reminder_cmd","action":"list\|delete\|done","id":N}` | Client → Server |
+| `tool_confirm` | `{"type":"tool_confirm","request_id":"cfm_…","approved":true\|false}` | Client → Server |
+| `token` | `{"type":"token","content":"...","response_id":"..."}` | Server → Client |
+| `audio_chunk` | `{"type":"audio_chunk","data":"<base64>","index":N}` | Server → Client |
+| `status` | `{"type":"status","content":"connected\|thinking\|speaking\|done"}` | Server → Client |
+| `stt_result` | `{"type":"stt_result","language","voice","duration"}` | Server → Client |
+| `audio_start` | `{"type":"audio_start","language","voice","format":"mpeg"}` | Server → Client |
+| `require_confirmation` | `{"type":"require_confirmation","request_id","action","params","level","reasons","summary","text","session_id"}` | Server → Client |
+| `confirmation_result` | `{"type":"confirmation_result","request_id","approved","resolved"}` | Server → Client |
+
+Audio chunks each have independent base64 padding. TTS cache: 50 entries, cleared on restart.
+A `ConfirmationManager` is created per WebSocket session and stored on
+`SessionState.confirmation_manager`; it is resolved by `tool_confirm` and
+cancelled on disconnect, timeout, or `interrupt`.
+
+## Desktop (Python / customTkinter)
+
+`desktop/` is a **Python** application — a floating always-on-top orb plus an
+expanded chat panel, built on customTkinter. It is *not* Tauri, *not* Rust, and
+it does *not* embed the React frontend. It is an independent WebSocket client of
+the same `ws://127.0.0.1:8000/ws` endpoint the browser app uses.
+
+> Historical note: this directory was migrated off a Tauri/Rust shell. The
+> `AGENTS.md` section and `.github/workflows/ci.yml` continued to describe the
+> Rust build for several revisions, which made the docs and CI actively wrong.
+> `desktop/tests/test_desktop_shell.py::TestNoRustResidue` now fails if that
+> drift is reintroduced.
+
+```
+desktop/
+├── main.py                # entry: --diagnose, --console, then ZaytoonApp
+├── start_desktop.bat      # launcher (prefers backend\.venv\Scripts\python.exe)
+├── requirements.txt       # customtkinter, sounddevice, numpy, websockets,
+│                          #   keyboard, pystray, pillow
+├── app/
+│   ├── app.py             # Tk main thread + queue.Queue pump (TICK_MS = 30)
+│   ├── orb.py             # floating orb: Tk Canvas, colour-key transparency
+│   ├── panel.py           # expanded chat panel
+│   ├── backend.py         # FastAPI child-process supervisor
+│   ├── client.py          # blocking websockets.sync client + backoff reconnect
+│   ├── protocol.py        # the 4 outbound builders + ServerEvent decoding
+│   ├── audio.py           # mic capture / TTS playback, ring buffers, VAD
+│   ├── hotkeys.py         # global hotkeys via `keyboard`
+│   ├── tray.py            # pystray menu
+│   ├── config.py          # every value env-overridable
+│   └── theme.py           # colours + bilingual status labels
+├── icons/source.png       # 1024px orb asset
+├── scripts/build_exe.py   # PyInstaller onefile build
+└── tests/                 # pytest suite for the shell
+```
+
+- **Window:** undecorated (`overrideredirect`), always-on-top, no taskbar
+  button. Transparency is a **colour key** (`#000001`), not an alpha channel —
+  Tk has no alpha on Windows, so soft edges are faked with canvas stipple.
+- **Global hotkeys** via the `keyboard` package (low-level OS hook): `Ctrl+Space`
+  toggles the orb, `Alt+Z` switches orb ⇄ panel. Both are env-overridable
+  (`ZAYTOON_TOGGLE_HOTKEY`, `ZAYTOON_EXPAND_HOTKEY`). A binding failure degrades
+  to the tray menu and reports `HotkeyManager.error` — it never crashes.
+- **Backend lifecycle** (`app/backend.py`): probes `127.0.0.1:8000` with a bare
+  `socket.connect_ex` (no HTTP client needed). If nothing answers it spawns
+  `ZAYTOON_BACKEND_{PYTHON,MAIN,CWD}` resolved in three tiers — explicit
+  override → `backend/.venv` → the running interpreter — with `shell=False`,
+  `PYTHONUNBUFFERED=1` and `CREATE_NO_WINDOW` on Windows. It polls for up to
+  `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout.
+- **The safety property that matters:** `BackendProcess.shutdown()` returns
+  immediately unless `self._spawned_by_us` is true, and `ensure_running()`
+  *releases* its handle if a foreign process took the port. A backend the user
+  started by hand is never killed. Covered by
+  `TestBackendNeverTouchesAForeignProcess`.
+- **Repository root** is resolved by `config.default_repo_root()`:
+  `ZAYTOON_REPO_ROOT` → source layout (`<repo>/desktop/app/config.py`) →
+  `sys._MEIPASS` for a frozen build. `scripts/build_exe.py` tells the user to
+  set `ZAYTOON_REPO_ROOT`; that variable is read by the code and asserted by
+  `TestRepoRootDiscovery::test_build_exe_documents_the_env_var_that_exists`.
+- **Protocol** is centralised in `app/protocol.py` so the shell and the backend
+  cannot drift. The shell generates its **own** `response_id` per turn, which
+  is what makes `client.py`'s stale-stream guard able to drop tokens from a turn
+  the user already interrupted.
+- **Known gaps:** the shell handles no `reminder*` events and never sends
+  `reminder_cmd`, so a fired reminder is silently dropped (`TrayIcon.notify()`
+  exists but is unwired). Panel chrome beyond `theme.status_text` is English
+  only.
+- **Build:** `python desktop/scripts/build_exe.py` → `desktop/dist/Zaytoon.exe`
+  (PyInstaller onefile, portable, no installer). The backend is deliberately
+  **not** frozen in — `faster-whisper` + `edge-tts` push a bundle past 500 MB.
+  Ship `backend/` as files and point `ZAYTOON_REPO_ROOT` at the install dir.
+- **Diagnose:** `python desktop/main.py --diagnose` checks the TCP probe,
+  interpreter resolution, optional imports, audio devices, display
+  `windowingsystem`, and actually binds then unbinds both hotkeys.
+
+## Notes
+
+- CI is GitHub Actions (`.github/workflows/ci.yml`): three jobs — `backend`
+  (Windows, py3.11, policy guards + pytest + live smoke check), `frontend`
+  (Node 20, lint/typecheck/build/test), and `desktop` (Python shell tests).
+- No formatter or typechecker is configured for Python. The frontend is
+  **JavaScript/JSX, not TypeScript** — there is no `tsconfig.json`.
+- Dockerfiles exist for both services and `docker-compose.yml` wires them
+  (backend + nginx frontend), so the earlier "both are empty" claim is stale.
+- `.env` is gitignored; never commit it.
+- **The repo was not a git repository** when this analysis was performed.
+  Initialise one before starting any of the refactors below, so each increment
+  is reviewable.

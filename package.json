@@ -1,0 +1,19 @@
+{
+  "name": "zaytoon-ai",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Zaytoon AI Assistant — CPU-Optimized Multi-Agent System",
+  "scripts": {
+    "dev": "concurrently -n API,UI -c cyan,magenta \"cd backend && .venv\\Scripts\\activate && python main.py\" \"cd frontend && npm run dev\"",
+    "dev:web": "cd frontend && npm run dev",
+    "dev:api": "cd backend && .venv\\Scripts\\activate && python main.py",
+    "install:all": "cd frontend && npm install && cd ../backend && .venv\\Scripts\\activate && pip install -r requirements.txt",
+    "test": "cd backend && .venv\\Scripts\\activate && python -m pytest tests/ -v",
+    "test:desktop": "backend\\.venv\\Scripts\\python.exe -m pytest desktop/tests -q",
+    "test:all": "npm run test && npm run test:desktop",
+    "build:frontend": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

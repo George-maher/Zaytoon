@@ -1,0 +1,19 @@
+# Build output
+dist/
+.vite/
+
+# Dependencies
+node_modules/
+
+# Test output
+coverage/
+
+# Local env
+.env
+.env.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

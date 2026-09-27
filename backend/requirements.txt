@@ -1,0 +1,22 @@
+# Zaytoon AI — runtime dependencies.
+#
+# Only what the server needs to import and serve. Development-only tooling
+# (pytest and friends) lives in requirements-dev.txt so production images
+# stay small.
+#
+# NOTE: pip only understands "#" comments in this file. A Python-style
+# triple-quoted block is parsed as a requirement and breaks the Docker build.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+httpx>=0.26.0
+# Runtime: the WebSocket endpoint at /ws needs a WS implementation. Already
+# pulled in by uvicorn[standard], listed explicitly so swapping in plain
+# uvicorn does not silently break the voice pipeline.
+websockets>=13.0
+faster-whisper>=1.0.0
+edge-tts>=6.1.9
+aiosqlite>=0.19.0
+ddgs>=9.0.0

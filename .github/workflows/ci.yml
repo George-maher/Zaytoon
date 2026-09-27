@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests (py${{ matrix.python-version }})
+    runs-on: windows-latest   # the OS tools are Windows-specific
+    defaults:
+      run:
+        working-directory: backend
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        # faster-whisper/edge-tts pull large wheels; the suite mocks STT/TTS,
+        # so a CPU-only install is enough and much faster in CI.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Guard: the free-only policy must never be relaxed
+        run: |
+          python -c "
+          from config import config, ALLOWED_FREE_MODELS
+          offenders = config.validate_free_models()
+          assert not offenders, f'non-free/unlisted models configured: {offenders}'
+          print('allow-list:', sorted(ALLOWED_FREE_MODELS))
+          "
+
+      - name: Guard: local model execution must stay removed
+        run: |
+          python -c "
+          from config import config
+          banned = [a for a in ('OLLAMA_BASE_URL','OLLAMA_MODEL','OLLAMA_FALLBACK_MODEL','PRIMARY_PROVIDER') if hasattr(config, a)]
+          assert not banned, f'local-model config reintroduced: {banned}'
+          print('no local-model configuration present')
+          "
+
+      # A malformed requirements.txt does not fail locally (the venv already
+      # has everything installed) but breaks `docker compose build`. Validate it
+      # against a clean resolver.
+      - name: Guard: requirements files are pip-parseable
+        run: |
+          python -m pytest tests/test_packaging.py -q
+
+      - name: Build the backend image
+        working-directory: .
+        run: docker compose build backend
+
+      - name: Run tests
+        run: python -m pytest tests/ -q --maxfail=1
+
+      - name: Live smoke check (free-only, voice routing, sandbox)
+        run: python scripts/verify_final.py
+
+  frontend:
+    name: Frontend lint / test / build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # The ESLint config previously imported four packages that were in
+      # neither package.json nor node_modules, and there was no `lint` script,
+      # so nothing ever linted. It also read a plugin config shape that v5 no
+      # longer exposes, so it could not have run even if invoked.
+      - name: Lint
+        run: npm run lint
+
+      # Vitest covers the WebSocket protocol reducer in useWebSocket, which is
+      # the seam two clients (this app and the desktop shell) depend on.
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+  desktop:
+    name: Desktop shell
+    runs-on: windows-latest   # the shell is a Windows desktop application
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: desktop/requirements-dev.txt
+
+      # Only pytest is needed. `keyboard`, `pystray` and `sounddevice` are
+      # imported behind try/except in app/, and Tk needs no display for the
+      # tests here, which cover config, protocol, hotkeys and the backend
+      # supervisor rather than any widget.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run desktop shell tests
+        run: python -m pytest tests/ -q
+
+      # The PyInstaller build is deliberately not run here: it takes several
+      # minutes and needs the GUI dependencies. `check_prerequisites()` is the
+      # part that catches packaging regressions cheaply, so assert it is
+      # callable and reports rather than raises.
+      - name: Packaging entry point is importable
+        run: |
+          python -c "
+          import importlib.util, sys
+          spec = importlib.util.spec_from_file_location('build_exe', 'scripts/build_exe.py')
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          problems = mod.check_prerequisites()
+          print('prerequisites OK' if not problems else 'reported:')
+          for p in problems: print(' -', p)
+          "

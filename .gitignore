@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Rust
+# The desktop shell is Python/customTkinter, not Tauri, so there is no
+# src-tauri/target. `target/` is kept for anyone experimenting with a Rust
+# sidecar without polluting the root.
+target/
+
+# PyInstaller output from desktop/scripts/build_exe.py
+desktop/dist/
+desktop/build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/*.db
+data/chroma/

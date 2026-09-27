@@ -1,0 +1,38 @@
+services:
+  backend:
+    build: ./backend
+    container_name: zaytoon-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+    volumes:
+      - backend-data:/app/data
+      # Persist the Whisper weights (~75 MB for "tiny"), which faster-whisper
+      # downloads into the container filesystem on first STT use. Without this
+      # they are re-downloaded on every rebuild.
+      - model-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build: ./frontend
+    container_name: zaytoon-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  backend-data:
+  model-cache:

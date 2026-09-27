@@ -1,0 +1,6 @@
+# Zaytoon desktop shell — development / test-only dependencies.
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0.0
