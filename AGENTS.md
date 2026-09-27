@@ -327,6 +327,36 @@ npm run verify          # lint && test && build
   `test_desktop_config.py` were tests for a Tauri/Rust shell that no longer
   exists; they were replaced by `desktop/tests/test_desktop_shell.py`.
 
+## Frontend
+
+React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
+`tsconfig.json`; this was a deliberate decision (see "Increment 1.5" below).
+
+- `src/hooks/useWebSocket.js` — the whole client state machine and the single
+  place the WebSocket protocol is implemented. `isSocketOpen()` is the one
+  place that decides whether a write is safe; do not re-inline
+  `wsRef.current?.readyState === WebSocket.OPEN` (reading a ref twice like that
+  is a TOCTOU hazard — see the note on the helper).
+- `src/hooks/useWebSocket.test.js` — the protocol reducer. Two clients depend on
+  this contract, so it is the highest-value frontend test.
+- `src/lib/api.js` — REST client (`/health`, `/chat`, `/stt`, `/tts`,
+  `/command/*`, `/settings/workspace`).
+- `src/components/SettingsPanel.jsx` — workspace root, API-key presence, the
+  model actually in use, the fallback chain, LLM metrics, voice + safety status.
+- `src/components/ConfirmationDialog.jsx` — renders the `permission` tier and
+  the exact parameters. The `<pre>` block is `dir="ltr"` so an RTL UI cannot
+  reorder a command the user is approving.
+
+### Orphaned components (resolved in Increment 1.5)
+
+Eight root-level components existed but were imported nowhere, which is why the
+app had **no text input at all** and no reminders UI. `InputBar`,
+`ReminderPanel` and `SystemMonitor` are now wired. Still orphaned, pending
+deletion or adoption: `ChatInterface.jsx` and `VoiceControls.jsx` (both 0
+bytes), `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
+`useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css`.
+These are the remaining ESLint warnings.
+
 ## Workspace (file-tool containment)
 
 Every file tool is confined to `config.WORKSPACE_ROOT`, defaulting to

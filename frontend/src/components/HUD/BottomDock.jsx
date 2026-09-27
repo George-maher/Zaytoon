@@ -39,23 +39,42 @@ const ICONS = [
   },
 ];
 
-export default function BottomDock({ onMicToggle, onLanguageToggle, onStop, voiceMode, language, status }) {
-  const handleClick = useCallback((id) => {
-    switch (id) {
-      case "mic":
-        onMicToggle?.();
-        break;
-      case "lang":
-        onLanguageToggle?.();
-        break;
-      case "stop":
-        onStop?.();
-        break;
-    }
-  }, [onMicToggle, onLanguageToggle, onStop]);
+export default function BottomDock({
+  onMicToggle,
+  onLanguageToggle,
+  onSettingsToggle,
+  onStop,
+  voiceMode,
+  language,
+  status,
+  settingsOpen,
+}) {
+  const handleClick = useCallback(
+    (id) => {
+      switch (id) {
+        case "mic":
+          onMicToggle?.();
+          break;
+        case "lang":
+          onLanguageToggle?.();
+          break;
+        case "settings":
+          // This case did not exist, so the CONF button was a no-op.
+          onSettingsToggle?.();
+          break;
+        case "stop":
+          onStop?.();
+          break;
+        default:
+          break;
+      }
+    },
+    [onMicToggle, onLanguageToggle, onSettingsToggle, onStop],
+  );
 
   const getActiveColor = (id) => {
     if (id === "mic" && voiceMode) return "#00ff88";
+    if (id === "settings" && settingsOpen) return "#00ff88";
     if (id === "stop" && status === "speaking") return "#ff3355";
     return "#00d4ff";
   };
@@ -64,11 +83,16 @@ export default function BottomDock({ onMicToggle, onLanguageToggle, onStop, voic
     <div className="flex items-center gap-3">
       {ICONS.map((icon) => {
         const color = getActiveColor(icon.id);
-        const isActive = (icon.id === "mic" && voiceMode) || (icon.id === "stop" && status === "speaking");
+        const isActive =
+          (icon.id === "mic" && voiceMode) ||
+          (icon.id === "settings" && settingsOpen) ||
+          (icon.id === "stop" && status === "speaking");
         return (
           <button
             key={icon.id}
             onClick={() => handleClick(icon.id)}
+            type="button"
+            aria-pressed={isActive}
             className="group relative w-11 h-11 rounded-full flex items-center justify-center transition-all duration-300"
             style={{
               background: isActive ? `${color}15` : "rgba(0,212,255,0.04)",

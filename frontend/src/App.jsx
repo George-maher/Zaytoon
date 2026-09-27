@@ -1,4 +1,4 @@
-import { memo, useRef, useEffect } from "react";
+import { memo, useRef, useEffect, useState } from "react";
 import gsap from "gsap";
 import useWebSocket from "./hooks/useWebSocket";
 import ArcReactorCore from "./components/HUD/ArcReactorCore";
@@ -10,20 +10,38 @@ import SidePanelRight from "./components/HUD/SidePanelRight";
 import BottomDock from "./components/HUD/BottomDock";
 import ChatTranscript from "./components/Chat/ChatTranscript";
 import ConfirmationDialog from "./components/ConfirmationDialog";
+// These were fully implemented but never imported anywhere, so the shipped app
+// had no text input, no reminders UI, and a settings button that did nothing.
+import InputBar from "./components/InputBar";
+import ReminderPanel from "./components/ReminderPanel";
+import SettingsPanel from "./components/SettingsPanel";
 
 export default memo(function App() {
   const {
-    messages, isConnected, isTyping, status, intent, language, setLanguage,
+    messages, isConnected, isTyping, status, language, setLanguage,
     subtitle, voiceMode, awaitingCommand, isListening, isSpeaking, reminders,
     sendMessage, sendReminderCmd, refreshReminders, stopAudio, clearChat,
     startVoiceMode, stopVoiceMode, pendingConfirmation, respondToConfirmation,
     speakingVoice,
   } = useWebSocket();
 
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const containerRef = useRef(null);
 
+  // Global text direction. Previously `dir` was set per-element on seven leaf
+  // text nodes, so the app chrome (header, side panels, dock) never mirrored in
+  // Arabic. Message content is still detected per-message, because one session
+  // can contain both scripts.
   useEffect(() => {
-    if (!containerRef.current) return;
+    const root = document.documentElement;
+    root.setAttribute("lang", language);
+    root.setAttribute("dir", language === "ar" ? "rtl" : "ltr");
+  }, [language]);
+
+  // Re-keyed on language so the panels animate in from the correct side after
+  // a direction flip.
+  useEffect(() => {
+    if (!containerRef.current) return undefined;
     const ctx = gsap.context(() => {
       gsap.fromTo(".hud-panel-left",
         { opacity: 0, x: -30 },
@@ -43,7 +61,7 @@ export default memo(function App() {
       );
     }, containerRef);
     return () => ctx.revert();
-  }, []);
+  }, [language]);
 
   const getStatusText = () => {
     if (!isConnected) return "OFFLINE";
@@ -109,6 +127,17 @@ export default memo(function App() {
         </div>
 
         <div className="flex items-center gap-3">
+          {/* Reminders. Previously unreachable: the panel was implemented but
+              never imported, so there was no way to view, complete or delete a
+              reminder in the web app at all. */}
+          <ReminderPanel
+            reminders={reminders}
+            onRefresh={refreshReminders}
+            onDelete={(id) => sendReminderCmd("delete", id)}
+            onDone={(id) => sendReminderCmd("done", id)}
+            language={language}
+          />
+
           <button onClick={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}
             className="text-[9px] px-2 py-1 rounded-sm font-display font-bold tracking-wider transition-all"
             style={{
@@ -209,6 +238,19 @@ export default memo(function App() {
               language={language}
             />
           </div>
+
+          {/* Text input. The app was previously voice-only: `InputBar` existed
+              but was never imported, and a full `sendMessage` implementation sat
+              unreachable in the hook. */}
+          <div className="relative z-20 w-full max-w-2xl px-4">
+            <InputBar
+              onSend={sendMessage}
+              isConnected={isConnected}
+              language={language}
+              onVoiceStart={voiceMode ? undefined : startVoiceMode}
+              voiceMode={voiceMode}
+            />
+          </div>
         </div>
 
         {/* Right panel */}
@@ -236,9 +278,17 @@ export default memo(function App() {
           status={status}
           onMicToggle={() => voiceMode ? stopVoiceMode() : startVoiceMode()}
           onLanguageToggle={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}
+          onSettingsToggle={() => setSettingsOpen((v) => !v)}
+          settingsOpen={settingsOpen}
           onStop={stopAudio}
         />
       </footer>
+
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        language={language}
+      />
     </div>
   );
 });

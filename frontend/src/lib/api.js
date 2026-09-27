@@ -62,3 +62,36 @@ export async function runCommand(command, params = {}) {
   if (!res.ok) throw new Error(`Command failed: ${res.status}`);
   return res.json();
 }
+
+/**
+ * The directory every file tool is confined to.
+ *
+ * This matters more than it looks: containment is `commonpath`-based against
+ * this root, so anything outside it is refused. It is NOT the process working
+ * directory — the backend runs from `backend/`, so a cwd-based root confined
+ * the assistant to its own source tree.
+ */
+export async function getWorkspace() {
+  const res = await fetch(`${API_BASE}/settings/workspace`);
+  if (!res.ok) throw new Error(`Workspace fetch failed: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Repoint the assistant at a different working directory.
+ *
+ * The backend rejects a path it cannot create rather than silently accepting
+ * it, so the UI never shows a workspace the tools are not actually using.
+ * Returns `{ error }` on rejection instead of throwing, because a bad path is
+ * expected user input rather than an exceptional condition.
+ */
+export async function setWorkspace(root) {
+  const res = await fetch(`${API_BASE}/settings/workspace`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}

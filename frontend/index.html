@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -8,7 +8,13 @@
     <title>ZAYTOON · JARVIS-class AI</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet" />
+    <!--
+      Orbitron / Rajdhani / JetBrains Mono contain no Arabic glyphs, so Arabic
+      text fell back to whatever the OS substituted, inside a monospace stack.
+      Cairo and Noto Kufi Arabic are requested in the same call so the CSS
+      `font-family` list can resolve a real Arabic face.
+    -->
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&family=Cairo:wght@400;600;700&family=Noto+Kufi+Arabic:wght@400;600&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="root"></div>

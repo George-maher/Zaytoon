@@ -16,9 +16,17 @@ export default {
         "neon-amber": "#F0B000",
       },
       fontFamily: {
-        display: ["Orbitron", "monospace"],
-        body: ["Rajdhani", "sans-serif"],
-        mono: ["JetBrains Mono", "Fira Code", "monospace"],
+        // Arabic faces are listed *before* the Latin display faces on the
+        // `font-sans`/`font-body` stacks. Orbitron, Rajdhani and JetBrains Mono
+        // contain no Arabic glyphs, so without Cairo / Noto Kufi Arabic first
+        // in the list, Arabic text fell through to an OS-substituted face and
+        // lost the HUD typography entirely.
+        display: ["Orbitron", "Cairo", "Noto Kufi Arabic", "monospace"],
+        body: ["Rajdhani", "Cairo", "Noto Kufi Arabic", "sans-serif"],
+        mono: ["JetBrains Mono", "Cairo", "Fira Code", "monospace"],
+        // Explicit Arabic stack for content that must never fall back to a
+        // Latin face, e.g. the confirmation dialog's `dir="rtl"` block.
+        arabic: ["Cairo", "Noto Kufi Arabic", "Tahoma", "sans-serif"],
       },
       keyframes: {
         "pulse-ring": {
