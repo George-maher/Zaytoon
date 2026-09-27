@@ -58,6 +58,11 @@ export default function useWebSocket() {
   const [reminders, setReminders] = useState([]);
   const [pendingConfirmation, setPendingConfirmation] = useState(null);
   const [speakingVoice, setSpeakingVoice] = useState(null);
+  // Agent progress. `plan` is the steps the engine announced, `activeTool` is
+  // what is running right now, and `activity` is the running log.
+  const [plan, setPlan] = useState([]);
+  const [activeTool, setActiveTool] = useState(null);
+  const [activity, setActivity] = useState([]);
 
   const wsRef = useRef(null);
   const activeVoiceRef = useRef(null);
@@ -146,6 +151,42 @@ export default function useWebSocket() {
           break;
         case "intent":
           setIntent(data.intent);
+          break;
+        // -- agent progress (Increment 3) -------------------------------
+        // The engine emits semantic events; the backend relays them as these
+        // frames. They drive the activity feed and the status ring, so a
+        // multi-step tool turn shows "Creating the project" rather than an
+        // undifferentiated spinner.
+        case "plan":
+          setPlan(Array.isArray(data.steps) ? data.steps : []);
+          setStatus("planning");
+          break;
+        case "tool_started":
+          setActiveTool({ name: data.name, label: data.label || data.name });
+          setStatus("executing");
+          setActivity((prev) => [
+            ...prev,
+            { id: `${data.name}-${prev.length}`, kind: "started", name: data.name, label: data.label || data.name },
+          ]);
+          break;
+        case "tool_progress":
+          setActivity((prev) => [
+            ...prev,
+            { id: `${data.name}-${prev.length}`, kind: "progress", name: data.name, message: data.message || "" },
+          ]);
+          break;
+        case "tool_finished":
+          setActiveTool(null);
+          setActivity((prev) => [
+            ...prev,
+            {
+              id: `${data.name}-${prev.length}`,
+              kind: "finished",
+              name: data.name,
+              success: Boolean(data.success),
+              summary: (data.summary || "").slice(0, 200),
+            },
+          ]);
           break;
         case "stt_result":
           // Whisper's verdict on the input language. Adopt it so the agent
@@ -710,6 +751,10 @@ if (rms > threshold) {
   const clearChat = useCallback(() => {
     setMessages([]);
     renderedResponseIds.current.clear();
+    // Progress is per-turn, so clearing the transcript clears it too.
+    setPlan([]);
+    setActiveTool(null);
+    setActivity([]);
   }, []);
 
   return {
@@ -729,6 +774,9 @@ if (rms > threshold) {
     reminders,
     pendingConfirmation,
     speakingVoice,
+    plan,
+    activeTool,
+    activity,
     sendMessage,
     sendReminderCmd,
     refreshReminders,

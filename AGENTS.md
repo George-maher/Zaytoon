@@ -41,6 +41,8 @@ backend/
 ├── api/websocket.py        # WS handler, streaming TTS, session management
 ├── agents/                 # 8 agents: RouterAgent, FastAgent, PlannerAgent,
 │                           #   CodeAgent, ToolAgent, MemoryAgent, SchedulerAgent, base
+│   ├── engine.py           # AgentEngine: the bounded ReAct tool loop
+│   ├── events.py           # AgentEventType + EventBus (the progress channel)
 ├── services/agent_service.py  # Intent dispatch → agent orchestration
 ├── services/llm_client.py  # OpenRouter client: free-model allow-list, request/
 │                           #   response validation, fallback chain, metrics
@@ -65,6 +67,8 @@ frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
 ├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
 │                           #   StatusDot, SystemMonitor, ReminderPanel, ConfirmationDialog
+│   ├── Chat/ActivityFeed.jsx  # Agent progress: plan + tool_started/finished log
+│   └── SettingsPanel.jsx   # workspace root, API key, model chain, LLM metrics
 └── styles/index.css        # Tailwind + CSS vars + animations
 desktop/                    # Python/customTkinter floating orb + chat panel
 ├── app/                    # Tk main thread; orb, panel, tray, hotkeys, WS client
@@ -349,7 +353,7 @@ explicitly told it plans but does not act.
 ## Tests
 
 ```bash
-# backend (826 tests)
+# backend (1011 tests)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
@@ -357,7 +361,7 @@ cd backend
 cd desktop
 ..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# frontend (51 tests + lint + build)
+# frontend (102 tests + lint + build)
 cd frontend
 npm run verify          # lint && test && build
 ```
@@ -366,6 +370,10 @@ npm run verify          # lint && test && build
 - Tests skip API-dependent tests when OpenRouter is unreachable.
 - `tests/test_llm_client.py` mocks all HTTP (including SSE) — no network needed.
 - `tests/test_websocket_confirmation.py` drives the real WS handler with a fake socket.
+- `tests/test_agent_engine.py` — the loop: nested-JSON extraction, observations,
+  the iteration budget, provider/tool failure recovery, declined confirmations,
+  and the guarantee that intermediate model output is never a response chunk.
+  `frontend/src/hooks/useAgentEvents.test.jsx` covers the same events client-side.
 - `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
   and an exploding HTTP client proving no request is attempted for a billable model.
 - `tests/test_voice_routing.py` — locale normalisation, text-based language
@@ -490,10 +498,67 @@ RouterAgent.route() → AgentService.dispatch()
 ```
 Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Agents receive `language` kwarg (`"ar"` | `"en"`). `ToolAgent` additionally receives `confirmation_manager`, `session_id` and a `ToolRegistry` from the WebSocket session.
 
-`ToolAgent` parses the model's JSON (`TOOL_CALL_RE`) and hands the call to the
-registry. There is **no agent loop yet** — it is one LLM call, N tool calls,
-one final answer, with no re-planning and no error recovery. That is the next
-increment.
+`ToolAgent` delegates to **`agents/engine.AgentEngine`**, a bounded ReAct loop.
+
+```
+ask the model (catalogue + observations so far)
+  ├─ no tool call ────────────────────► final answer, streamed as prose
+  └─ tool call
+       ├─ validate → gate → execute    (tools/registry.py)
+       ├─ record the result as an observation
+       └─ loop                         (≤ DEFAULT_MAX_ITERATIONS = 8)
+budget exhausted ──► one forced summary call, so the user still gets an answer
+```
+
+Three properties are load-bearing, and each has a test in
+`tests/test_agent_engine.py`:
+
+- **Bounded.** `max_iterations` is a hard ceiling, and hitting it is a *reported*
+  outcome (`stopped_reason == "max_iterations"`), not an error.
+- **Observations are fed back.** Failures, sandbox refusals and declined
+  confirmations are all rendered into the next prompt, so the model can correct
+  itself. This is what turns "create a React project" from one guess into
+  observe-and-retry.
+- **Tool calls are not prose.** Only a no-tool-call answer is emitted as
+  `RESPONSE_CHUNK`. The previous code passed `stream_callback` straight into the
+  LLM call while asking for JSON, so `{"action":"open_app","app":"spotify"}` was
+  typed out on the user's screen and then overwritten. Keeping private reasoning
+  off the wire is now structural rather than a matter of prompt wording.
+
+`ToolAgent` also owns the bilingual gate via `_make_approval()`, which returns a
+*refusal string* rather than a bool so the engine can feed "the user declined"
+back to the model. The engine consults that callback **only** when
+`registry.assess()` reports `RiskLevel.HIGH`, so `get_time` never needs a
+confirmation channel plumbed through it.
+
+Tool selection is JSON-in-text, not native function calling. The three
+allow-listed free models are a hard-coded set and one of them currently 403s;
+betting the product on a free endpoint advertising function-calling support is a
+worse trade than parsing text reliably. `ToolRegistry.openai_tools()` already
+emits the spec, so switching is a provider change rather than a rewrite. Note
+that a plain `{...}` regex cannot do the extraction — the documented call form
+*nests* `params`, so `agents/engine.py` uses a brace-matching scanner that is
+also string-aware.
+
+## Agent events
+
+`agents/events.py` defines the vocabulary the agent reports in, and an
+`EventBus` to carry it. The agent emits events and never raw deltas, so:
+
+- a caller that does not care about progress subscribes to nothing;
+- only `AgentEventType.RESPONSE_CHUNK` is user-facing prose — everything else
+  is status, which is why no redaction logic is needed anywhere downstream;
+- the transport owns the wire format, so the desktop shell, the browser app and
+  a test can all drive the engine equally.
+
+A subscriber that raises is logged and skipped: a progress display must never be
+able to abort the turn that produced it.
+
+`api/websocket._ProgressRelay` is the only place that maps events to frames.
+`THINKING`/`PLANNING` become `status`, `TOOL_STARTED`/`TOOL_FINISHED` become
+their own frames, and `COMPLETED` is deliberately **not** relayed — the
+transport owns the terminal `done`, because only it knows about TTS drain and
+the `message` frame that has to land first.
 
 ## WebSocket protocol
 
@@ -506,11 +571,20 @@ increment.
 | `tool_confirm` | `{"type":"tool_confirm","request_id":"cfm_…","approved":true\|false}` | Client → Server |
 | `token` | `{"type":"token","content":"...","response_id":"..."}` | Server → Client |
 | `audio_chunk` | `{"type":"audio_chunk","data":"<base64>","index":N}` | Server → Client |
-| `status` | `{"type":"status","content":"connected\|thinking\|speaking\|done"}` | Server → Client |
+| `status` | `{"type":"status","content":"connected\|thinking\|planning\|executing\|speaking\|done"}` | Server → Client |
+| `plan` | `{"type":"plan","steps":["Creating the project",…],"response_id":"…"}` | Server → Client |
+| `tool_started` | `{"type":"tool_started","name","label","response_id"}` | Server → Client |
+| `tool_progress` | `{"type":"tool_progress","name","message"}` | Server → Client |
+| `tool_finished` | `{"type":"tool_finished","name","success","summary"}` | Server → Client |
+| `error` | `{"type":"error","content":"..."}` | Server → Client |
 | `stt_result` | `{"type":"stt_result","language","voice","duration"}` | Server → Client |
 | `audio_start` | `{"type":"audio_start","language","voice","format":"mpeg"}` | Server → Client |
 | `require_confirmation` | `{"type":"require_confirmation","request_id","action","params","level","reasons","summary","text","session_id"}` | Server → Client |
 | `confirmation_result` | `{"type":"confirmation_result","request_id","approved","resolved"}` | Server → Client |
+
+Every label crossing the wire is a fixed, human-written string from
+`_LABELS_EN` / `_LABELS_AR` in `agents/engine.py` — never the model's own
+reasoning.
 
 Audio chunks each have independent base64 padding. TTS cache: 50 entries, cleared on restart.
 A `ConfirmationManager` is created per WebSocket session and stored on

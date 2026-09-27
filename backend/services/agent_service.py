@@ -59,14 +59,24 @@ class AgentService:
         session_id: str,
         stream_callback: Optional[Callable] = None,
         confirmation_manager=None,
+        event_bus=None,
+        response_id: str = "",
     ) -> str:
+        """Route to an agent and return its reply.
+
+        ``event_bus`` is the agent's progress channel. Passing it through is
+        what lets the UI show "Creating the project" / "Running tests" while a
+        multi-step tool turn is in flight, instead of a single spinner.
+        """
         if intent == Intent.ACTION.value or intent == Intent.TOOLS.value:
             return await self.tool.process(
-                message, [],
+                message, context[-4:],
                 stream_callback=stream_callback,
                 language=language,
                 confirmation_manager=confirmation_manager,
                 session_id=session_id,
+                event_bus=event_bus,
+                response_id=response_id,
             ) or ""
 
         if intent == Intent.SCHEDULING.value:

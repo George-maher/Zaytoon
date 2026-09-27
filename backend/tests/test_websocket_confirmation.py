@@ -86,10 +86,16 @@ def handler_deps():
     agent_service = MagicMock()
 
     async def dispatch(intent, message, context, language, session_id,
-                       stream_callback=None, confirmation_manager=None):
+                       stream_callback=None, confirmation_manager=None,
+                       event_bus=None, response_id=""):
+        # `event_bus` / `response_id` are forwarded so the handler's real
+        # progress relay is wired up. The stub deliberately does not emit
+        # anything on the bus: these tests are about the confirmation round
+        # trip, and `test_websocket_events.py` covers the event mapping.
         return await tool_agent.process(
             message, [], stream_callback=stream_callback, language=language,
             confirmation_manager=confirmation_manager, session_id=session_id,
+            event_bus=event_bus, response_id=response_id,
         )
 
     agent_service.dispatch = dispatch

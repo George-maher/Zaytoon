@@ -9,6 +9,7 @@ import SidePanelLeft from "./components/HUD/SidePanelLeft";
 import SidePanelRight from "./components/HUD/SidePanelRight";
 import BottomDock from "./components/HUD/BottomDock";
 import ChatTranscript from "./components/Chat/ChatTranscript";
+import ActivityFeed from "./components/Chat/ActivityFeed";
 import ConfirmationDialog from "./components/ConfirmationDialog";
 // These were fully implemented but never imported anywhere, so the shipped app
 // had no text input, no reminders UI, and a settings button that did nothing.
@@ -22,7 +23,7 @@ export default memo(function App() {
     subtitle, voiceMode, awaitingCommand, isListening, isSpeaking, reminders,
     sendMessage, sendReminderCmd, refreshReminders, stopAudio, clearChat,
     startVoiceMode, stopVoiceMode, pendingConfirmation, respondToConfirmation,
-    speakingVoice,
+    speakingVoice, plan, activeTool, activity,
   } = useWebSocket();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -68,6 +69,8 @@ export default memo(function App() {
     if (pendingConfirmation) return "AWAIT CONFIRM";
     if (awaitingCommand) return "SAY COMMAND";
     if (isListening) return "LISTENING";
+    if (status === "executing") return "RUNNING TOOL";
+    if (status === "planning") return "PLANNING";
     if (isTyping || status === "thinking") return "PROCESSING";
     if (isSpeaking) return "SPEAKING";
     if (status === "transcribing") return "TRANSCRIBING";
@@ -79,6 +82,8 @@ export default memo(function App() {
     if (pendingConfirmation) return "#ff3355";
     if (awaitingCommand) return "#f0b000";
     if (isListening) return "#00ff88";
+    if (status === "executing") return "#f0b000";
+    if (status === "planning") return "#00d4ff";
     if (isTyping || status === "thinking") return "#00d4ff";
     if (isSpeaking) return "#00f0ff";
     return "var(--neon-blue)";
@@ -231,6 +236,12 @@ export default memo(function App() {
 
           {/* Chat transcript overlay */}
           <div className="relative z-10 w-full max-w-2xl mt-2">
+            <ActivityFeed
+              plan={plan}
+              activeTool={activeTool}
+              activity={activity}
+              language={language}
+            />
             <ChatTranscript
               messages={messages}
               isTyping={isTyping}

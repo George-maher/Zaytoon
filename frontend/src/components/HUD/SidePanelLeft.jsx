@@ -13,7 +13,7 @@ const STATUS_COLORS = {
   transcribing: "#00ff88",
   thinking: "#00d4ff",
   planning: "#00d4ff",
-  executing: "#ffb400",
+  executing: "#f0b000",
   awaiting_confirmation: "#ff3355",
   awaiting_command: "#ffb400",
   speaking: "#00f0ff",

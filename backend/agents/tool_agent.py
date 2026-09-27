@@ -7,6 +7,8 @@ import time
 from typing import Dict, Any, List, Optional, Callable
 
 from .base_agent import BaseAgent
+from .engine import AgentEngine
+from .events import AgentEventType, NullBus
 from tools.registry import ToolRegistry, build_default_registry
 from tools.safety import ConfirmationManager, RiskAssessor, RiskLevel
 
@@ -96,39 +98,77 @@ class ToolAgent(BaseAgent):
         stream_callback: Optional[Callable] = None,
         **kwargs,
     ) -> str:
-        lang = kwargs.get("language", "en")
+        """Run the agent loop for one turn.
 
-        # A per-request manager (scoped to this websocket session) takes priority
-        # over the agent-level default.
+        Used to be a single LLM call whose JSON was regex-scanned, executed,
+        and joined with " | ". It now drives :class:`AgentEngine`, which loops:
+        ask, act, observe, repeat, until the model answers in prose or the
+        iteration budget runs out.
+
+        The signature is unchanged, so :class:`AgentService` needs no edit.
+        """
+        lang = kwargs.get("language", "en")
+        bus = kwargs.get("event_bus") or NullBus()
         manager = kwargs.get("confirmation_manager", self.confirmation_manager)
         session_id = kwargs.get("session_id", "")
 
-        if lang == "ar":
-            sp = (
-                f"اختر أداة من: {TOOL_DESCRIPTION}. "
-                "أمثلة: 'افتح سبوتيفاي' -> {{\"action\":\"open_app\",\"app\":\"spotify\"}} "
-                "اكتب نص -> {{\"action\":\"type_text\",\"text\":\"...\"}} "
-                "اضغط زر -> {{\"action\":\"key_press\",\"keys\":\"enter\"}} "
-                "الوقت -> {{\"action\":\"get_time\"}} "
-                "رد بالعامية المصرية. لخص النتيجة في سطر."
-            )
-        else:
-            sp = (
-                f"Choose a tool: {TOOL_DESCRIPTION}. "
-                "Examples: 'open spotify' -> {\"action\":\"open_app\",\"app\":\"spotify\"} "
-                "type text -> {\"action\":\"type_text\",\"text\":\"...\"} "
-                "press key -> {\"action\":\"key_press\",\"keys\":\"enter\"} "
-                "what time -> {\"action\":\"get_time\"} "
-                "Output JSON only. Summarize result in 1 line."
-            )
+        # A caller that only wants text still gets it, streamed. Subscribing the
+        # legacy callback to RESPONSE_CHUNK is what stops the tool-call JSON
+        # from reaching the user: only final prose is a response chunk. The
+        # previous code passed `stream_callback` straight into the LLM call, so
+        # {"action":"open_app","app":"spotify"} was typed out on screen before
+        # being overwritten by the real reply.
+        if stream_callback is not None and bus.subscriber_count == 0:
 
-        messages = [
-            {"role": "system", "content": sp},
-            {"role": "user", "content": user_message},
-        ]
+            async def _forward(event):
+                if event.type is AgentEventType.RESPONSE_CHUNK:
+                    result = stream_callback(event.data.get("content", ""))
+                    if hasattr(result, "__await__"):
+                        await result
 
-        ai_response = await self.get_ai_response(messages, stream_callback=stream_callback)
-        return await self.execute_tools(ai_response, manager, session_id, lang)
+            bus.subscribe(_forward)
+
+        engine = AgentEngine(self.llm, self.registry)
+        result = await engine.run(
+            user_message=user_message,
+            context=context,
+            language=lang,
+            bus=bus,
+            approval=self._make_approval(manager, session_id, lang),
+            response_id=kwargs.get("response_id", ""),
+        )
+        return result.text
+
+    def _make_approval(self, manager, session_id: str, language: str):
+        """Adapt the agent's bilingual gate to the engine's callback shape.
+
+        Returning the refusal *string* rather than a bool is deliberate: the
+        engine feeds it back to the model as an observation, so the model learns
+        the user declined instead of the tool failing for no stated reason.
+        """
+
+        async def approve(tool_name: str, params: dict):
+            if manager is None:
+                return self._DECLINED.get(language, self._DECLINED["en"])
+            try:
+                if await manager.request(tool_name, params, session_id):
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Confirmation channel failed for %s: %s", tool_name, e)
+                return self._ERROR.get(language, self._ERROR["en"])
+
+            outcome = getattr(manager, "last_outcome", None)
+            if outcome == ConfirmationManager.OUTCOME_TIMEOUT:
+                return self._TIMEOUT.get(language, self._TIMEOUT["en"])
+            if outcome == ConfirmationManager.OUTCOME_UNAVAILABLE:
+                return self._UNAVAILABLE.get(language, self._UNAVAILABLE["en"])
+            if outcome == ConfirmationManager.OUTCOME_ERROR:
+                return self._ERROR.get(language, self._ERROR["en"])
+            return self._DECLINED.get(language, self._DECLINED["en"])
+
+        return approve
 
     async def execute_tools(
         self,

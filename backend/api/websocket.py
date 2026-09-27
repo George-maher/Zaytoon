@@ -11,6 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from domain.models import SessionState, TokenBucketRateLimiter, SpokenSentenceTracker
 from arabic import clean_and_detect, detect_language, get_tts_voice
+from agents.events import AgentEvent, AgentEventType, EventBus
 from services.wake_word_service import apply_wake_gate
 from tools.safety import ConfirmationManager, PendingConfirmation
 
@@ -394,6 +395,98 @@ async def _stream_tts_chunks(
             await connection_manager.send(websocket, {"type": "audio_end"})
 
 
+class _ProgressRelay:
+    """Translate agent events into WebSocket frames.
+
+    This is the seam that keeps the agent independent of its transport. Each
+    agent event maps to at most one frame:
+
+    ==================  ==================================================
+    thinking            ``status: thinking``  (no separate frame needed)
+    planning            ``status: planning`` + ``plan`` with user-facing steps
+    tool_started        ``tool_started``    {name, label}
+    tool_progress       ``tool_progress``   {name, message}
+    tool_finished       ``tool_finished``   {name, success, summary}
+    response_chunk      handled by the existing ``token`` stream
+    error               ``error``           {content}
+    completed           ``status: done``
+    ==================  ==================================================
+
+    Only ``label``/``summary`` cross the wire — the fixed, human-written strings
+    from ``agents/engine.py``. The model's own reasoning is never emitted, which
+    is why this class needs no redaction logic.
+    """
+
+    def __init__(self, websocket, connection_manager: ConnectionManager, response_id: str):
+        self._ws = websocket
+        self._cm = connection_manager
+        self._response_id = response_id
+
+    async def __call__(self, event: AgentEvent) -> None:
+        kind = event.type
+        data = event.data or {}
+
+        if kind is AgentEventType.THINKING:
+            await self._cm.send(self._ws, {"type": "status", "content": "thinking"})
+
+        elif kind is AgentEventType.PLANNING:
+            steps = [s for s in (data.get("steps") or []) if s]
+            await self._cm.send(self._ws, {"type": "status", "content": "planning"})
+            if steps:
+                await self._cm.send(
+                    self._ws,
+                    {"type": "plan", "steps": steps, "response_id": self._response_id},
+                )
+
+        elif kind is AgentEventType.TOOL_STARTED:
+            await self._cm.send(
+                self._ws,
+                {
+                    "type": "tool_started",
+                    "name": data.get("name", ""),
+                    "label": data.get("label", ""),
+                    "response_id": self._response_id,
+                },
+            )
+
+        elif kind is AgentEventType.TOOL_PROGRESS:
+            await self._cm.send(
+                self._ws,
+                {
+                    "type": "tool_progress",
+                    "name": data.get("name", ""),
+                    "message": data.get("message", ""),
+                },
+            )
+
+        elif kind is AgentEventType.TOOL_FINISHED:
+            await self._cm.send(
+                self._ws,
+                {
+                    "type": "tool_finished",
+                    "name": data.get("name", ""),
+                    "success": bool(data.get("success")),
+                    "summary": str(data.get("summary", ""))[:200],
+                },
+            )
+
+        elif kind is AgentEventType.RESPONSE_CHUNK:
+            # Already delivered by the `token` stream via stream_callback.
+            return
+
+        elif kind is AgentEventType.ERROR:
+            await self._cm.send(
+                self._ws,
+                {"type": "error", "content": str(data.get("content", ""))[:500]},
+            )
+
+        elif kind is AgentEventType.COMPLETED:
+            # The transport owns the terminal `done`; the engine only says the
+            # turn is over, because only this layer knows about TTS drain and
+            # the message frame that must land first.
+            return
+
+
 async def _handle_message(
     websocket: WebSocket,
     user_message: str,
@@ -502,11 +595,21 @@ async def _handle_message(
                 if state:
                     state.tts_task = tts_task
 
+    # The agent's progress channel. The engine emits semantic events; this
+    # subscriber is the only place that knows the wire format, so the agent
+    # stays transport-agnostic and can be driven by the desktop shell or a test
+    # with equal ease.
+    progress = _ProgressRelay(websocket, connection_manager, response_id)
+    bus = EventBus()
+    bus.subscribe(progress)
+
     try:
         agent_output = await agent_service.dispatch(
             intent, cleaned_message, context, language, session_id,
             stream_callback=stream_callback,
             confirmation_manager=confirmation_manager,
+            event_bus=bus,
+            response_id=response_id,
         )
         if agent_output:
             final_content = agent_output
