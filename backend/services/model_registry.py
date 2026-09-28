@@ -211,6 +211,82 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
             rank=99,
             deprioritise=True,
         ),
+        # --- Additional verified free models (2026-09-28) ---
+        ModelSpec(
+            id="google/gemma-4-26b-a4b-it:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Different vendor "
+                "family (Google), so NVIDIA/Qwen rate limits don't affect it. "
+                "Mixture-of-experts, 262k context."
+            ),
+            rank=60,
+        ),
+        ModelSpec(
+            id="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Smaller NVIDIA "
+                "model (30B), reasoning-tuned. May survive when super/ultra "
+                "are rate-limited. 256k context."
+            ),
+            rank=65,
+        ),
+        ModelSpec(
+            id="nvidia/nemotron-3-ultra-550b-a55b:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Largest NVIDIA "
+                "model (550B). Different rate-limit bucket from super/lightning. "
+                "1M context."
+            ),
+            rank=70,
+        ),
+        ModelSpec(
+            id="poolside/laguna-xs-2.1:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Poolside's smaller "
+                "model, different vendor family from NVIDIA/Google/Qwen. "
+                "262k context."
+            ),
+            rank=75,
+        ),
+        ModelSpec(
+            id="dots-studio/dots-3-note-preview:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Dots Studio model, "
+                "new vendor family. 512k context."
+            ),
+            rank=80,
+        ),
+        ModelSpec(
+            id="inclusionai/ling-3.0-flash-sante:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Inclusion AI model, "
+                "new vendor family. 262k context."
+            ),
+            rank=85,
+        ),
+        ModelSpec(
+            id="thinkingmachines/inkling:free",
+            supports_tools=True,
+            supports_structured_output=True,
+            notes=(
+                "Verified 2026-09-28: clean JSON tool call. Larger version of "
+                "inkling-small, may have different rate-limit behavior. "
+                "1M context."
+            ),
+            rank=95,
+        ),
     )
 }
 
