@@ -305,21 +305,27 @@ describe('SettingsPanel', () => {
     )
   })
 
-  it('closes on the close button', () => {
+  it('closes on the close button', async () => {
     const onClose = vi.fn()
     render(<SettingsPanel open onClose={onClose} language="en" />)
-    fireEvent.click(screen.getByText('CLOSE'))
+    await act(async () => {
+      fireEvent.click(screen.getByText('CLOSE'))
+    })
     expect(onClose).toHaveBeenCalled()
   })
 
   it('renders bilingual labels in Arabic', async () => {
-    render(<SettingsPanel open onClose={vi.fn()} language="ar" />)
+    await act(async () => {
+      render(<SettingsPanel open onClose={vi.fn()} language="ar" />)
+    })
     expect(screen.getByText('الإعدادات')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('مجلد العمل')).toBeInTheDocument())
   })
 
-  it('is announced as a dialog', () => {
-    render(<SettingsPanel open onClose={vi.fn()} language="en" />)
+  it('is announced as a dialog', async () => {
+    await act(async () => {
+      render(<SettingsPanel open onClose={vi.fn()} language="en" />)
+    })
     expect(screen.getByRole('dialog')).toBeInTheDocument()
   })
 })

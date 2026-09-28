@@ -12,9 +12,6 @@ services:
       - BACKEND_PORT=8000
     volumes:
       - backend-data:/app/data
-      # Persist the Whisper weights (~75 MB for "tiny"), which faster-whisper
-      # downloads into the container filesystem on first STT use. Without this
-      # they are re-downloaded on every rebuild.
       - model-cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -30,9 +27,12 @@ services:
     restart: unless-stopped
     ports:
       - "3000:8080"
+      - "3443:8443"
     depends_on:
       backend:
         condition: service_healthy
+    volumes:
+      - ./frontend/certs:/etc/nginx/certs:ro
     stop_grace_period: 10s
 
 volumes:

@@ -24,6 +24,7 @@ from tools.executor import ToolExecutor
 from config import config
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
+from services.auth import get_device_auth, PermissionScope, require_device_auth
 from services.llm_client import get_llm_client
 from tools.safety import ConfirmationManager, RiskAssessor
 
@@ -422,6 +423,84 @@ async def set_workspace(data: dict):
 
     logger.info("Workspace root set to %s", resolved)
     return {"status": "saved", **config.describe_workspace()}
+
+
+# ---------------------------------------------------------------------------
+# Device pairing & authorization (for remote Web/Mobile clients)
+# ---------------------------------------------------------------------------
+
+@app.post("/devices/pair")
+async def pair_device(data: dict):
+    """Pair a new remote device. Returns a one-time token."""
+    device_id = (data.get("device_id") or "").strip()
+    device_name = (data.get("device_name") or "").strip()
+    scope_str = (data.get("scope") or "chat").strip()
+
+    if not device_id:
+        raise HTTPException(400, "device_id is required")
+    if not device_name:
+        raise HTTPException(400, "device_name is required")
+
+    try:
+        scope = PermissionScope(scope_str)
+    except ValueError:
+        valid = [s.value for s in PermissionScope]
+        raise HTTPException(400, f"Invalid scope. Valid: {valid}")
+
+    auth = get_device_auth()
+    token, permission = auth.pair_device(device_id, device_name, scope)
+
+    return {
+        "token": token,  # Only returned once - client must store it
+        "device": permission.to_dict(),
+    }
+
+
+@app.get("/devices")
+async def list_devices():
+    """List all paired devices."""
+    auth = get_device_auth()
+    return {"devices": auth.list_devices()}
+
+
+@app.get("/devices/{device_id}")
+async def get_device(device_id: str):
+    """Get a specific device's info."""
+    auth = get_device_auth()
+    perm = auth.get_device(device_id)
+    if not perm:
+        raise HTTPException(404, "Device not found")
+    return perm.to_dict()
+
+
+@app.delete("/devices/{device_id}")
+async def revoke_device(device_id: str):
+    """Revoke a device's access."""
+    auth = get_device_auth()
+    ok = auth.revoke_device(device_id)
+    if not ok:
+        raise HTTPException(404, "Device not found")
+    return {"status": "revoked", "device_id": device_id}
+
+
+@app.patch("/devices/{device_id}/scope")
+async def update_device_scope(device_id: str, data: dict):
+    """Update a device's permission scope."""
+    scope_str = (data.get("scope") or "").strip()
+    if not scope_str:
+        raise HTTPException(400, "scope is required")
+
+    try:
+        scope = PermissionScope(scope_str)
+    except ValueError:
+        valid = [s.value for s in PermissionScope]
+        raise HTTPException(400, f"Invalid scope. Valid: {valid}")
+
+    auth = get_device_auth()
+    perm = auth.update_scope(device_id, scope)
+    if not perm:
+        raise HTTPException(404, "Device not found or revoked")
+    return perm.to_dict()
 
 
 APP_WHITELIST = [

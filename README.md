@@ -28,14 +28,14 @@ cd frontend && npm run dev                                   # Terminal 2
 ## Features
 
 - **Multi-Agent Architecture** — Router → FastAgent (chat), PlannerAgent (complex), CodeAgent (code), ToolAgent (system), SchedulerAgent (reminders), MemoryAgent (history)
-- **Zero-Cost LLM Stack** — OpenRouter `:free` models only, with an automatic fallback chain (primary → `openrouter/free`); the allow-list and free-form checks both run before any request
+- **Zero-Cost LLM Stack** — OpenRouter `:free` models only, with an explicit fallback chain (primary → configured free pool); the allow-list and free-form checks both run before any request. `openrouter/free` is explicitly excluded as an uncontrolled auto-router.
 - **Tool Safety Sandbox** — high-risk OS actions pause and require explicit human approval over the WebSocket; shell injection is blocked outright
 - **Voice Interface** — Speech-to-text (faster-whisper) + streaming text-to-speech (edge-tts) with voice activity detection
 - **Dynamic Bilingual TTS** — voice is chosen per message from the detected language: `ar-EG-ShakirNeural` for Egyptian Arabic, `en-GB-RyanNeural` for English, with automatic fallbacks
 - **Arabic / English** — Full bilingual support with Egyptian Arabic dialect detection
 - **Scheduling** — Parse natural time expressions in Arabic/English, persistent reminders across sessions
 - **Streaming Responses** — Real-time token streaming + early TTS trigger for immediate audio feedback
-- **Desktop App** — Tauri floating holographic orb with global hotkeys (`Ctrl+Space` to summon from any app) and `.msi` / `.exe` installers
+- **Desktop App** — Python/customTkinter floating orb with global hotkeys (`Ctrl+Space` to summon, `Alt+Z` to expand panel) and PyInstaller `.exe` builds
 
 ## Architecture
 
@@ -48,9 +48,9 @@ root/
 │   ├── voice/      # STT (whisper) + TTS (edge-tts) + language routing
 │   ├── scheduler/  # Time parser + reminder manager
 │   ├── tools/      # OS toolkit (cmd, file, system) + safety sandbox
-│   └── tests/      # 587 pytest tests
+│   └── tests/      # 1165 pytest tests
 ├── frontend/       # React + Vite web client
-└── desktop/        # Tauri native desktop client (orb + global hotkeys)
+└── desktop/        # Python/customTkinter desktop client (orb + global hotkeys)
 ```
 
 ## Setup
@@ -69,8 +69,9 @@ cp .env.example .env
 cd frontend
 npm install
 
-# 3. (Optional) Desktop orb -- needs a Rust toolchain
-cd desktop && npm install && npm run icons && npm run tauri:dev
+# 3. (Optional) Desktop orb
+cd desktop && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main.py            # or: python main.py --diagnose
 ```
 
 ### Model configuration
@@ -82,8 +83,9 @@ refused, so a typo or an injected model id can never reach the network.
 | Setting | Default | Role |
 |---------|---------|------|
 | `OPENROUTER_PRIMARY_MODEL` | `qwen/qwen3.8-27b:free` | chat, tools, routing |
-| `OPENROUTER_REASONING_MODEL` | `thinkingmachines/inkling-small:free` | code, planning, scheduling |
-| `OPENROUTER_FALLBACK_MODEL` | `openrouter/free` | when the primary is rate-limited |
+| `OPENROUTER_REASONING_MODEL` | `cohere/north-mini-code:free` | code, planning, scheduling |
+| `OPENROUTER_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | explicit fallback (not auto-router) |
+| `OPENROUTER_FREE_FALLBACK_MODELS` | `nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,poolside/laguna-s-2.1:free` | ordered fallback pool |
 
 Anything else raises `NonFreeModelError` before any network call. There is no
 local fallback — if OpenRouter is unreachable the assistant says so rather than
@@ -99,19 +101,19 @@ request/response metrics.
 | STT | faster-whisper (tiny model, int8) |
 | TTS | edge-tts — auto-selected: `ar-EG-ShakirNeural` / `en-GB-RyanNeural` |
 | Database | SQLite via aiosqlite |
-| Frontend | React 18, Vite, Tailwind CSS, GSAP |
-| Desktop | Tauri 1.x (Rust + React) |
+| Frontend | React 18, Vite, Tailwind CSS, GSAP (JavaScript/JSX, not TypeScript) |
+| Desktop | Python 3.10+, customTkinter, pystray, keyboard, PyInstaller |
 
 ## Development
 
 ```bash
-cd backend && python -m pytest tests/ -q      # 587 tests
+cd backend && python -m pytest tests/ -q      # 1165 tests
 cd backend && python scripts/verify_final.py  # live smoke check
-cd desktop && npm run tauri:build             # .msi + .exe installers
+cd desktop && python scripts/build_exe.py     # PyInstaller onefile build
 ```
 
 CI runs the backend suite, the free-only guard, the frontend build, and the
-Tauri bundle-config check on every push. See `AGENTS.md` for full architecture
+desktop shell tests on every push. See `AGENTS.md` for full architecture
 notes and `desktop/README.md` for packaging.
 
 ## Security model

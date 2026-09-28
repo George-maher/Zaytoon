@@ -472,8 +472,13 @@ class Config:
     # ------------------------------------------------------------------
     # Rate limiting / misc
     # ------------------------------------------------------------------
-    RATE_LIMIT_MAX: int = _env_int("RATE_LIMIT_MAX", 60)
+    # REST API rate limit (per IP)
+    RATE_LIMIT_MAX: int = _env_int("RATE_LIMIT_MAX", 120)
     RATE_LIMIT_WINDOW: int = _env_int("RATE_LIMIT_WINDOW", 60)
+
+    # WebSocket rate limit (per session) - more generous for interactive use
+    WS_RATE_LIMIT_MAX: int = _env_int("WS_RATE_LIMIT_MAX", 60)
+    WS_RATE_LIMIT_WINDOW: int = _env_int("WS_RATE_LIMIT_WINDOW", 60)
 
     MAX_MESSAGE_LENGTH: int = 8000
     MAX_CONTEXT_MESSAGES: int = 50
