@@ -44,8 +44,12 @@ backend/
 │   ├── engine.py           # AgentEngine: the bounded ReAct tool loop
 │   ├── events.py           # AgentEventType + EventBus (the progress channel)
 ├── services/agent_service.py  # Intent dispatch → agent orchestration
-├── services/llm_client.py  # OpenRouter client: free-model allow-list, request/
-│                           #   response validation, fallback chain, metrics
+├── services/llm_client.py  # OpenRouter client: free-only pool, capability
+│                           #   routing, contract validation, attempt budget
+├── services/model_registry.py  # FREE pool + per-model capabilities + selection
+├── services/completion_validator.py  # Deterministic contract check (no LLM)
+├── scripts/check_free_models.py      # Verify the pool against the live catalogue
+├── scripts/verify_tool_capability.py # Re-probe the supports_tools claim
 ├── domain/models.py        # Enums (Intent, Language, AgentType), dataclasses,
 │                           #   TokenBucketRateLimiter, SessionState, SpokenSentenceTracker
 ├── common/exceptions.py    # ZaytoonError hierarchy
@@ -145,75 +149,163 @@ registry so the user is not asked twice.
 
 ## LLM providers & fallback
 
-**OpenRouter is the only provider.** Local model execution (Ollama, llama.cpp,
-any on-device GGUF) has been removed: nothing is downloaded to or run on the
-user's machine. Every request goes to
+**OpenRouter is the only provider, and FREE models are the only models.**
+Local model execution (Ollama, llama.cpp, any on-device GGUF) has been removed:
+nothing is downloaded to or run on the user's machine. Every request goes to
 `https://openrouter.ai/api/v1/chat/completions`.
 
-`services/llm_client.py` owns model selection. `BaseAgent.tier` picks the head of
-the chain; `LLMClient.build_chain()` returns the ordered endpoints.
+`services/model_registry.py` owns the free pool and its capabilities.
+`services/completion_validator.py` owns the contract a completion must satisfy.
+`services/llm_client.py` wires them to the transport.
 
-| Tier | Chain |
-|------|-------|
-| `fast` (chat, tools, router) | `qwen/qwen3.8-27b:free` → `openrouter/free` |
-| `reasoning` (code, planner, scheduler) | `thinkingmachines/inkling-small:free` → `openrouter/free` |
+### The invariant
 
-**There is no local fallback.** If OpenRouter is unreachable the assistant
-cannot answer, and says so — it never silently switches providers. With no
-`OPENROUTER_API_KEY` at all, `build_chain()` raises a message telling you to set
-one.
+> Only a validated completion that satisfies the contract of the current request
+> may become the final answer.
 
-### Zero-cost policy (two layers, both before any socket opens)
+This is the whole design. An HTTP 200 is a successful *request*, not a
+successful *answer*, and the difference is not theoretical — see below.
 
-1. **Allow-list** — `config.ALLOWED_FREE_MODELS` is a hard-coded frozenset of the
-   three models above. Being free is *necessary but not sufficient*: an
-   un-allow-listed `vendor/model:free` is still refused.
-2. **Free form** — the id must end in `:free` or be exactly `openrouter/free`.
+### `openrouter/free` is excluded, on purpose
 
-Checked in `ProviderEndpoint.__post_init__` and re-checked in `build_payload()`,
-so a typo such as `OPENROUTER_PRIMARY_MODEL=openai/gpt-4o` can never produce a
-charge. `GET /health` reports `rejected_models`.
+It is free, but it is an **uncontrolled auto-router**: it resolves to a
+different arbitrary free model on every call depending on upstream load. That
+makes a routing bug unreproducible and a fix unverifiable. It also answered a
+`get_time` request with the literal string `User Safety: safe`, which the loop
+presented to the user as the assistant's answer.
 
-### Request / response validation
+`is_free_router()` recognises it **in order to refuse it**. It is not in
+`MODEL_REGISTRY`, and `ProviderEndpoint` cannot even be constructed for it.
 
-- `ProviderEndpoint.validate_request()` runs before dispatch: URL host, the
-  `Authorization` / `HTTP-Referer` / `X-Title` headers, message shape and roles,
-  `max_tokens`, `temperature` range, `stream` type. Failures raise
-  `LLMRequestError` **without opening a socket**.
-- `ProviderEndpoint.validate_completion()` structurally verifies the 200 body:
-  content-type, JSON decode, `error` payloads returned with a 200, `choices`
-  present/typed/non-empty, `message` object, and `content` either a string,
-  `null` (tool calls) or a multimodal block list. Anything else raises
-  `LLMResponseError` and the chain moves on instead of crashing the agent.
-- SSE frames are parsed defensively; keep-alives, truncated JSON, and frames
-  with a missing/typed-wrong `delta` are skipped rather than raising.
+### Two separate policies, deliberately not merged
 
-### Fallback, health, metrics
+**Cost** — a model must carry the `:free` suffix. Non-negotiable, and enforced
+again on the request path.
 
-- **Fatal** (401/402/403/404/422 …) → skip the model immediately, no retry.
-- **Rate limited** (429) and **server error** (5xx) → short backoff on the same
-  model, then advance to `openrouter/free`.
-- **Timeouts / connect errors** → advance immediately.
-- A failing model is benched for `LLM_PROVIDER_COOLDOWN` seconds. If *every*
-  model is benched the breaker is ignored rather than hard-failing.
-- **Streaming**: a failure *before* the first delta retries the next model, still
-  streaming, so early-TTS keeps working. A failure *after* deltas were emitted
-  switches to a non-streaming call; the WebSocket layer's final `message` event
-  overwrites the streamed bubble and `SpokenSentenceTracker` dedupes TTS overlap.
-  If that recovery also fails, the already-streamed partial text is returned
-  rather than an error replacing visible text.
-- `LLMClient.metrics` counts success / rate_limited / server_error / malformed /
-  timeouts plus average latency, per model. Exposed on `GET /health` under
-  `llm.metrics`.
-- Every outcome is logged with a stable prefix: `LLM OK`, `LLM RATE_LIMITED`,
-  `LLM SERVER_ERROR`, `LLM FATAL`, `LLM MALFORMED`, `LLM TIMEOUT`,
-  `LLM STREAM OK`, `LLM EXHAUSTED`.
+**Fitness** — a model must be allow-listed *and* declare the capabilities the
+request needs. "Free" is not the same as "can be trusted to emit a valid tool
+call".
 
-> Note: `thinkingmachines/inkling-small:free` currently returns HTTP 403 for
-> non-agentic clients ("only available on agentic harnesses"). 403 is fatal, so
-> the chain falls through to `openrouter/free` transparently — but it costs a
-> round-trip, so consider a different `OPENROUTER_REASONING_MODEL` if you have
-> one that is allow-listed.
+`supports_tools` means *observed to emit a well-formed tool call in this
+application*, not "the endpoint accepts a `tools` parameter" — OpenRouter lists
+`tools` under `supported_parameters` for models that will happily answer a tool
+request with prose.
+
+| Tier | Head |
+|------|------|
+| `fast` (chat, tools, router) | `qwen/qwen3.8-27b:free` |
+| `reasoning` (code, planner, scheduler) | `cohere/north-mini-code:free` |
+| fallback pool, in order | `nvidia/nemotron-3-super-120b-a12b:free`, `nvidia/nemotron-3.5-lightning:free`, `cohere/north-mini-code:free`, `poolside/laguna-s-2.1:free` |
+
+> **The roster is verified, not remembered.** An earlier draft was written from
+> memory and four of its six ids returned HTTP 404 at request time — which reads
+> like an outage rather than a config error. Run
+> `python scripts/check_free_models.py` (availability against the live
+> catalogue) and `python scripts/verify_tool_capability.py` (drives each
+> candidate through the real tool contract) after editing `MODEL_REGISTRY`.
+> OpenRouter's free roster rotates, so this is a recurring chore, not a one-off.
+
+`google/gemma-4-31b-it:free` is allow-listed but **not** claimed tool-capable: it
+was 429 on every probe, so the claim is unverified. Re-probe before promoting it.
+
+`thinkingmachines/inkling-small:free` returns HTTP 403 for non-agentic clients
+(re-confirmed 2026-09-28). Still allow-listed because that may change, but
+`deprioritise`d so it is reached last — a 403 costs a wasted round-trip.
+
+### Selection is deterministic, and configuration order wins
+
+`Config.model_pool(tier)` is the tier head, then the configured fallback list,
+then the legacy fallback variable, de-duplicated. `select_models()` filters by
+free form, allow-list and required capabilities, and **preserves that order**.
+
+An earlier version re-sorted by the registry's `rank`, which quietly overrode an
+operator's configured order — a configured reasoning head could be pushed behind
+a chat model with a better rank. Configuration is intent; `rank` is a default,
+not an override. `ranked_pool()` exists for callers that want the registry's own
+order and is used for nothing else.
+
+The old chain ended in an auto-router, so the same request resolved to a
+different model per call. Now the pool and its order are a pure function of the
+configuration, which is what makes a routing bug reproducible.
+
+`GET /health` reports `llm.routing` — the plan per tier and, for each skipped
+candidate, **why** (`"lacks required capabilities: tools"`, `"uncontrolled
+auto-router; excluded by policy"`, …). "Why did it pick that model?" is now
+answerable.
+
+### Fallback happens on transport *and* contract failure
+
+```
+primary 429
+  → free model #2 200 but returns "User Safety: safe"   → rejected, benned
+  → free model #3 200, valid                            → accepted
+```
+
+- **Transport**: 408/425/429/5xx/529, timeouts, connect errors. Fatal
+  (400/401/402/403/404/405/413/422) skips the model immediately. A 429 moves
+  straight to the next free model rather than retrying a contended one, and
+  benches it for `LLM_RATE_LIMIT_COOLDOWN` (90s, longer than a 5xx's 60s).
+  `Retry-After` is honoured, capped at 5s.
+- **Contract** (`services/completion_validator.py`, no LLM in the path):
+  `EMPTY_COMPLETION`, `INVALID_TOOL_UNKNOWN`, `INVALID_TOOL_ARGS`,
+  `MISSING_TOOL_CALL`, `PROVIDER_METADATA_LEAK`, `AGENT_PROTOCOL_VIOLATION`.
+  A model that answers wrongly is benned: a second identical request usually
+  gets a second identical non-answer.
+
+`_AttemptBudget` caps model calls across the **whole** chain
+(`OPENROUTER_MAX_ATTEMPTS`, default 3), so `LLM_MAX_RETRIES` cannot multiply it
+back out. This is what makes an infinite fallback loop impossible.
+
+`CompletionContract` is built **per iteration**: iteration 1 may legitimately be
+answered in prose ("you don't need a tool for that"), so prose is always
+allowed. `require_tool` is set only when the model's own output showed it was
+going to act and must be told about. A single global rule would either reject
+every answer or accept every non-answer.
+
+When the budget is spent, `AllModelsUnavailableError` (a `LLMError`, so existing
+callers keep working) carries the `AttemptRecord` list, and the engine replies
+with a controlled bilingual message. It never fabricates an answer and never
+returns the last invalid completion.
+
+### The validator's honest limit
+
+**A fluent, confident, wrong paragraph of prose cannot be detected here.** "It's
+half past three in Cairo" is structurally indistinguishable from "half past
+three in London". This layer catches protocol violations and the observed
+metadata-leak class. It is a real improvement, not a proof of correctness, and
+claiming otherwise would be the more dangerous statement.
+
+### Observability
+
+`configure_logging()` installs a root handler at `LOG_LEVEL` (default INFO) from
+`main.py`. Without it Python's root logger is WARNING-only and **every
+successful model call was silently dropped** — failures looked fine and the happy
+path was invisible.
+
+One structured line per attempt:
+
+```
+LLM_ATTEMPT request=7fed7be92950 attempt=1/3 model=qwen/qwen3.8-27b:free
+           status=200 validation=OK tool=create_folder caps=- latency=2936ms
+```
+
+`AttemptRecord` carries request_id, attempt, model, status, latency,
+required_capabilities, validation verdict, tool_called and fallback_reason.
+`LLMMetrics` counts `invalid` per verdict — the metric that would have caught
+the `openrouter/free` problem, because a model that answers every request with
+valid-looking garbage shows up there and not in `success`. Neither the API key
+nor any Authorization material is ever logged; there is a test asserting it.
+
+### Live verification
+
+Against real OpenRouter, driving the real WebSocket:
+
+- `get_time`: **6/6** served a real tool call.
+- three-step *create folder → write file → read back*: correct confirmation
+  prompts, real files, `file_read` (tier `safe`) correctly not prompted.
+- when every free model was rate-limited, the user got *"All available free AI
+  models are temporarily unavailable…"* — **not** a fabricated answer. This is
+  the specific bug, fixed.
 
 ## Bilingual voice routing
 
@@ -353,7 +445,7 @@ explicitly told it plans but does not act.
 ## Tests
 
 ```bash
-# backend (1090 tests)
+# backend (1165 tests)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
@@ -388,6 +480,11 @@ npm run verify          # lint && test && build
 > worse than no double. Run the app.
 - `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
   and an exploding HTTP client proving no request is attempted for a billable model.
+- `tests/test_free_routing.py` — the FREE routing contract: primary succeeds;
+  429 → next configured model; **200-but-invalid → rejected and retried on
+  another model**; tool-required turns; invalid arguments; unknown tools;
+  all-fail → controlled error; paid-model protection; and the attempt ceiling
+  not being multiplied by `LLM_MAX_RETRIES`.
 - `tests/test_voice_routing.py` — locale normalisation, text-based language
   detection, voice profiles, dynamic switching, STT language reporting.
 - `tests/test_security_sandbox.py` — shell-injection payloads, path containment,

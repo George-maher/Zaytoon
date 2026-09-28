@@ -201,9 +201,10 @@ async def list_tools():
 @app.get("/health")
 async def health():
     client = get_llm_client()
-    # build_chain() raises when the key is missing or a model is not
-    # allow-listed. /health must stay answerable in exactly those situations,
-    # so report the error instead of propagating it.
+    # build_chain() raises when the key is missing, when the pool contains no
+    # allow-listed free model, or when nothing satisfies a capability
+    # requirement. /health must stay answerable in exactly those situations, so
+    # report the error instead of propagating it.
     try:
         chain = [
             {"model": e.model, "provider": e.provider, "url": e.url}
@@ -214,6 +215,20 @@ async def health():
         chain = []
         chain_error = str(e)
 
+    # The routing decision, and why each candidate was or was not usable. This
+    # is the answer to "why did it pick that model?", which used to be
+    # unanswerable because the chain ended in an auto-router.
+    routing = {}
+    for tier in ("fast", "reasoning"):
+        try:
+            routing[tier] = client.plan(tier, ()).to_dict()
+        except Exception as e:  # pragma: no cover - defensive
+            routing[tier] = {"models": [], "error": str(e)}
+    try:
+        routing["tools"] = client.plan("fast", ("tools",)).to_dict()
+    except Exception as e:  # pragma: no cover - defensive
+        routing["tools"] = {"models": [], "error": str(e)}
+
     return {
         "status": "ok" if config.llm_configured else "degraded",
         "version": "3.0.0",
@@ -221,6 +236,8 @@ async def health():
             **config.describe_llm(),
             "chain": chain,
             "chain_error": chain_error,
+            "routing": routing,
+            "max_attempts": client.max_attempts,
             "model_health": client.health_snapshot(),
             "metrics": client.metrics.to_dict(),
         },

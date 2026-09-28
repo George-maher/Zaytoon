@@ -46,10 +46,14 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agents.events import AgentEventType, EventBus, NullBus
+from services.completion_validator import (
+    CompletionContract,
+    contract_from_registry,
+)
 from tools.registry import ToolRegistry
 
 logger = logging.getLogger("Zaytoon.AgentEngine")
@@ -518,6 +522,17 @@ _MALFORMED_REPLY = {
     "ar": "مقدرتش أجيب رد مفهوم من الموديل المرة دي. جرّب تطلب تاني.",
 }
 
+#: Shown when every compatible FREE model was rate-limited or produced a
+#: completion that failed validation. The user must never be shown the last
+#: invalid completion instead of this.
+_ALL_MODELS_FAILED = {
+    "en": (
+        "All available free AI models are temporarily unavailable or unable to "
+        "complete this operation. Please try again in a moment."
+    ),
+    "ar": "كل الموديلات المجانية دلوقتي مشغولة أو مقدرش تكمّل العملية. جرّب تاني بعد شوية.",
+}
+
 
 # ---------------------------------------------------------------------------
 # User-facing labels
@@ -637,6 +652,23 @@ class AgentEngine:
         self.llm = llm
         self.registry = registry
         self.max_iterations = max(1, int(max_iterations))
+        # Built once per turn from the registry's real schemas, so the
+        # validator checks tool names and argument types against what actually
+        # exists rather than against a hand-written list.
+        self._tool_contract = contract_from_registry(
+            registry, allow_prose=True, label="agent_turn"
+        )
+
+    def _contract(self, require_tool: bool) -> CompletionContract:
+        """The contract for one iteration.
+
+        Iteration 1 legitimately may be answered in prose ("you don't need a
+        tool for that"), so prose is always allowed. ``require_tool`` is set only
+        when the *model's own output showed* that it was going to act — a
+        malformed tool call it has to be told about — which is the one case where
+        insisting on a real call is unambiguously right.
+        """
+        return replace(self._tool_contract, require_tool=require_tool)
 
     # ------------------------------------------------------------------
     async def run(
@@ -678,13 +710,20 @@ class AgentEngine:
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
             if raw is None:
-                # The provider failed. Nothing can be recovered; say so.
-                message = errors[-1] if errors else "The language model is unavailable."
+                # Every compatible free model was rate-limited or produced a
+                # completion that failed validation. Report that, and nothing
+                # else -- never the last invalid text.
+                message = _ALL_MODELS_FAILED.get(
+                    language, _ALL_MODELS_FAILED["en"]
+                )
+                errors.append("every compatible free model failed")
                 await bus.error(message)
-                await bus.completed(reason="llm_unavailable")
+                await bus.response_chunk(message, response_id=response_id)
+                await bus.completed(reason="llm_unavailable", iterations=iteration)
                 return LoopResult(
-                    text=message, iterations=iteration, stopped_reason="llm_unavailable",
-                    errors=errors or [message],
+                    text=message, iterations=iteration,
+                    stopped_reason="llm_unavailable",
+                    errors=errors,
                 )
 
             calls, prose = extract_tool_calls(raw)
@@ -833,13 +872,22 @@ class AgentEngine:
         return "\n".join(lines)
 
     async def _ask(
-        self, messages: List[Dict[str, str]], force_prose: bool = False
+        self,
+        messages: List[Dict[str, str]],
+        force_prose: bool = False,
+        require_tool: bool = False,
     ) -> Optional[str]:
-        """One LLM call. Returns ``None`` if the provider failed.
+        """One LLM call, validated. Returns ``None`` if no free model could answer.
 
         Never streams: the intermediate output is a tool call, and streaming it
         would put raw JSON on the user's screen. The final prose is streamed by
         the caller, from the parsed result.
+
+        The contract is what makes this safe. The client will walk the
+        capability-filtered free pool and only return a completion that passes
+        it; a 200 that fails is recorded, benned and skipped. If every model in
+        the budget is exhausted we get ``None`` and the loop reports that
+        honestly rather than passing along the last invalid text.
         """
         try:
             return await self.llm.complete(
@@ -847,6 +895,8 @@ class AgentEngine:
                 tier=self.llm.tier if hasattr(self.llm, "tier") else None,
                 max_tokens=2048,
                 temperature=0.1,
+                contract=self._contract(require_tool),
+                extract=extract_tool_calls,
             )
         except asyncio.CancelledError:
             raise

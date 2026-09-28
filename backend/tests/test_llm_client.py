@@ -131,6 +131,32 @@ class _FakeStream:
         return getattr(self._result, "text", "")
 
 
+# ---------------------------------------------------------------------------
+# Pinned free pool
+# ---------------------------------------------------------------------------
+#: Fallback *behaviour* is what this module tests, not how many free models
+#: happen to be allow-listed this month. `config.model_pool()` unions the tier
+#: head, the configured fallback list and the legacy fallback variable, so
+#: without pinning, every chain-length assertion would silently depend on the
+#: contents of the allow-list. Two models, deterministic order.
+POOL_HEAD = "qwen/qwen3.8-27b:free"
+POOL_TAIL = "nvidia/nemotron-3-super-120b-a12b:free"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_pool(monkeypatch):
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
+    monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", POOL_HEAD, raising=False)
+    monkeypatch.setattr(config, "OPENROUTER_REASONING_MODEL", POOL_HEAD, raising=False)
+    monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", POOL_TAIL, raising=False)
+    monkeypatch.setattr(
+        config, "OPENROUTER_FREE_FALLBACK_MODELS", POOL_TAIL, raising=False
+    )
+    # Four, not the default three: enough that "every model failed" tests get a
+    # genuine exhaustion rather than running out of budget mid-chain.
+    monkeypatch.setattr(config, "OPENROUTER_MAX_ATTEMPTS", 4, raising=False)
+
+
 def make_client(handler, **kwargs):
     client = LLMClient(max_retries=1, provider_cooldown=30, **kwargs)
     client._client = RecordingClient(handler)
@@ -145,13 +171,13 @@ class TestChainConstruction:
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         client = LLMClient()
         chain = client.build_chain(TIER_FAST)
         assert [e.model for e in chain] == [
             "qwen/qwen3.8-27b:free",
-            "openrouter/free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
         ]
         # Every hop is OpenRouter; local model execution was removed.
         assert all(e.provider == PROVIDER_OPENROUTER for e in chain)
@@ -160,11 +186,11 @@ class TestChainConstruction:
     def test_reasoning_tier_uses_reasoning_model(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         chain = LLMClient().build_chain(TIER_REASONING)
         assert chain[0].model == "thinkingmachines/inkling-small:free"
-        assert chain[1].model == "openrouter/free"
+        assert chain[1].model == "nvidia/nemotron-3-super-120b-a12b:free"
 
     def test_missing_key_raises_a_clear_error(self, monkeypatch):
         """No key and no local fallback means we must fail loudly, not silently."""
@@ -176,16 +202,16 @@ class TestChainConstruction:
 
     def test_chain_dedupes_when_fallback_equals_primary(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "openrouter/free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         chain = LLMClient().build_chain(TIER_FAST)
-        assert [e.model for e in chain] == ["openrouter/free"]
+        assert [e.model for e in chain] == ["nvidia/nemotron-3-super-120b-a12b:free"]
 
     def test_benched_model_is_dropped(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         client = LLMClient(provider_cooldown=999)
         client.health["qwen/qwen3.8-27b:free"] = type(
@@ -194,13 +220,13 @@ class TestChainConstruction:
                       "record_failure": lambda self, *a: None}
         )()
         chain = client.build_chain(TIER_FAST)
-        assert [e.model for e in chain] == ["openrouter/free"]
+        assert [e.model for e in chain] == ["nvidia/nemotron-3-super-120b-a12b:free"]
 
     def test_breaker_is_advisory_when_all_models_benched(self, monkeypatch):
         """A full cooldown must not hard-fail; it just gets retried anyway."""
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         client = LLMClient(provider_cooldown=999)
-        for model in ("qwen/qwen3.8-27b:free", "openrouter/free"):
+        for model in ("qwen/qwen3.8-27b:free", "nvidia/nemotron-3-super-120b-a12b:free"):
             client.health[model] = HealthState(blocked_until=time.monotonic() + 999)
         chain = client.build_chain(TIER_FAST)
         assert chain, "chain must never be empty"
@@ -259,7 +285,7 @@ class TestCompleteFallback:
     async def test_rate_limit_429_falls_through_chain(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -270,14 +296,14 @@ class TestCompleteFallback:
         result = await client.complete([{"role": "user", "content": "x"}])
         assert result == "from fallback"
         assert [r["json"]["model"] for r in client._client.requests] == [
-            "qwen/qwen3.8-27b:free", "openrouter/free",
+            "qwen/qwen3.8-27b:free", "nvidia/nemotron-3-super-120b-a12b:free",
         ]
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
     async def test_server_errors_fall_through_chain(self, status, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -290,7 +316,7 @@ class TestCompleteFallback:
     async def test_401_skips_to_next_provider(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -301,7 +327,7 @@ class TestCompleteFallback:
         assert await client.complete([{"role": "user", "content": "x"}]) == "fallback answer"
         # 401 is fatal, so the same model is not retried.
         assert [r["json"]["model"] for r in client._client.requests] == [
-            "qwen/qwen3.8-27b:free", "openrouter/free",
+            "qwen/qwen3.8-27b:free", "nvidia/nemotron-3-super-120b-a12b:free",
         ]
 
     async def test_all_providers_failing_raises(self, monkeypatch):
@@ -314,7 +340,7 @@ class TestCompleteFallback:
     async def test_timeout_moves_to_next_provider(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -325,12 +351,12 @@ class TestCompleteFallback:
         assert await client.complete([{"role": "user", "content": "x"}]) == (
             "recovered from timeout"
         )
-        assert client._client.requests[1]["json"]["model"] == "openrouter/free"
+        assert client._client.requests[1]["json"]["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
 
     async def test_connect_error_moves_to_next_provider(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -350,7 +376,7 @@ class TestHealthBreaker:
     async def test_failure_records_health_and_cooldown(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         client = make_client(lambda url, payload, headers: error_response(429))
         with pytest.raises(LLMError):
@@ -358,12 +384,12 @@ class TestHealthBreaker:
         # Health is keyed per model, not per provider.
         assert client.health["qwen/qwen3.8-27b:free"].failures >= 1
         assert client.health["qwen/qwen3.8-27b:free"].is_open() is True
-        assert client.health["openrouter/free"].failures >= 1
+        assert client.health["nvidia/nemotron-3-super-120b-a12b:free"].failures >= 1
 
     async def test_success_resets_health(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         client = make_client(lambda url, payload, headers: completion("ok"))
         await client.complete([{"role": "user", "content": "x"}])
@@ -418,7 +444,7 @@ class TestStreaming:
     ):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         body = sse_lines(["from ", "fallback"])
 
@@ -438,7 +464,7 @@ class TestStreaming:
         assert deltas == ["from ", "fallback"]
         assert result == "from fallback"
         assert [r["json"]["model"] for r in client._client.requests] == [
-            "qwen/qwen3.8-27b:free", "openrouter/free",
+            "qwen/qwen3.8-27b:free", "nvidia/nemotron-3-super-120b-a12b:free",
         ]
 
     async def test_stream_failure_after_first_delta_completes_blocking(
@@ -446,7 +472,7 @@ class TestStreaming:
     ):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload.get("stream"):
@@ -574,7 +600,7 @@ class TestPayload:
     async def test_empty_choices_raises_then_falls_back(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":

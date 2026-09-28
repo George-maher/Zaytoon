@@ -22,7 +22,7 @@ from services.llm_client import (
 GOOD_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def endpoint(model: str = "openrouter/free") -> ProviderEndpoint:
+def endpoint(model: str = "nvidia/nemotron-3-super-120b-a12b:free") -> ProviderEndpoint:
     return ProviderEndpoint(
         provider="openrouter",
         model=model,
@@ -75,7 +75,7 @@ class TestRequestValidation:
         headers = dict(ep.headers)
         headers.pop(header)
         bad = ProviderEndpoint(
-            provider="openrouter", model="openrouter/free",
+            provider="openrouter", model="nvidia/nemotron-3-super-120b-a12b:free",
             url=GOOD_URL, headers=headers,
         )
         with pytest.raises(LLMRequestError) as exc:
@@ -86,7 +86,7 @@ class TestRequestValidation:
         headers = dict(config.LLM_HEADERS)
         headers["Authorization"] = "token abc"
         bad = ProviderEndpoint(
-            provider="openrouter", model="openrouter/free",
+            provider="openrouter", model="nvidia/nemotron-3-super-120b-a12b:free",
             url=GOOD_URL, headers=headers,
         )
         with pytest.raises(LLMRequestError):
@@ -94,7 +94,7 @@ class TestRequestValidation:
 
     def test_non_openrouter_host_rejected(self):
         ep = ProviderEndpoint(
-            provider="openrouter", model="openrouter/free",
+            provider="openrouter", model="nvidia/nemotron-3-super-120b-a12b:free",
             url="https://evil.example.com/chat", headers=dict(config.LLM_HEADERS),
         )
         with pytest.raises(LLMRequestError):
@@ -275,7 +275,7 @@ class TestMalformedFallsBack:
         monkeypatch.setattr(
             config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False
         )
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
 
         def handler(url, payload, headers):
             if payload["model"] == "qwen/qwen3.8-27b:free":
@@ -286,7 +286,7 @@ class TestMalformedFallsBack:
 
         c = client_with(handler)
         assert await c.complete([{"role": "user", "content": "x"}]) == "recovered"
-        assert c._client.requests[-1]["json"]["model"] == "openrouter/free"
+        assert c._client.requests[-1]["json"]["model"] == "nvidia/nemotron-3-super-120b-a12b:free"
         assert c.metrics.to_dict()["malformed_response"] >= 1
 
     async def test_all_malformed_raises_clean_llm_error(self, monkeypatch):

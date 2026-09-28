@@ -15,6 +15,7 @@ from config import (
     is_allowed_model,
     is_free_model,
 )
+from services.model_registry import MODEL_REGISTRY
 
 
 class TestProviderIsOpenRouterOnly:
@@ -48,15 +49,27 @@ class TestProviderIsOpenRouterOnly:
 
 
 class TestHardcodedModelSet:
-    def test_exactly_three_allowed_models(self):
-        assert len(ALLOWED_FREE_MODELS) == 3
+    def test_the_pool_is_derived_from_the_registry(self):
+        """The allow-list cannot drift from the capability registry.
 
-    def test_the_expected_models_are_allowed(self):
-        assert ALLOWED_FREE_MODELS == frozenset({
-            "qwen/qwen3.8-27b:free",
-            "thinkingmachines/inkling-small:free",
-            "openrouter/free",
-        })
+        `ALLOWED_FREE_MODELS` is computed from `MODEL_REGISTRY`, so a model with
+        no capability record is not callable and a registry entry is always
+        allow-listed. Asserting the exact size would just be a change detector;
+        asserting the derivation is the invariant that matters.
+        """
+        assert ALLOWED_FREE_MODELS == frozenset(
+            spec.id for spec in MODEL_REGISTRY.values() if spec.free
+        )
+        assert len(ALLOWED_FREE_MODELS) >= 3
+
+    def test_every_allowed_model_carries_a_capability_record(self):
+        for model in ALLOWED_FREE_MODELS:
+            spec = MODEL_REGISTRY.get(model)
+            assert spec is not None, f"{model} has no capability record"
+            assert spec.free is True
+
+    def test_the_auto_router_is_not_in_the_pool(self):
+        assert FREE_ROUTER_ENDPOINT not in ALLOWED_FREE_MODELS
 
     def test_defaults_use_allowed_models(self):
         assert config.OPENROUTER_PRIMARY_MODEL in ALLOWED_FREE_MODELS
@@ -69,8 +82,17 @@ class TestHardcodedModelSet:
         assert is_free_model(model) is True
         assert is_allowed_model(model) is True
 
-    def test_fallback_is_the_free_router(self):
-        assert config.OPENROUTER_FALLBACK_MODEL == FREE_ROUTER_ENDPOINT
+    def test_every_configured_pool_entry_is_allowed(self):
+        for model in config.model_pool("fast") + config.model_pool("reasoning"):
+            assert is_allowed_model(model), model
+
+    def test_the_fallback_is_an_explicit_free_model(self):
+        """Not the auto-router, and not a paid model."""
+        assert config.OPENROUTER_FALLBACK_MODEL != FREE_ROUTER_ENDPOINT
+        assert is_allowed_model(config.OPENROUTER_FALLBACK_MODEL)
+        assert config.free_fallback_models
+        for model in config.free_fallback_models:
+            assert is_allowed_model(model), model
 
 
 class TestAllowListIsStricterThanFreeSuffix:
@@ -121,7 +143,27 @@ class TestTierResolution:
         assert fast == config.OPENROUTER_PRIMARY_MODEL
         assert reasoning == config.OPENROUTER_REASONING_MODEL
         assert fallback == config.OPENROUTER_FALLBACK_MODEL
-        assert reasoning == "thinkingmachines/inkling-small:free"
+        # Not a hard-coded id: the default reasoning head changed because
+        # `thinkingmachines/inkling-small:free` returns HTTP 403 for
+        # non-agentic clients, which cost a wasted round-trip on every
+        # code/planning turn. The property that matters is that the reasoning
+        # tier is a *different* model from the chat tier, so a model that just
+        # misbehaved on a tool turn is not immediately reused.
+        assert reasoning != fast, (
+            "the reasoning tier should not be the same model as the chat tier"
+        )
+        assert is_allowed_model(reasoning)
+
+    def test_the_reasoning_head_is_a_working_model(self):
+        """It must be a model that is not known to fail outright.
+
+        `inkling-small:free` is still allow-listed, because a model that 403s
+        today may work tomorrow, but it must not be the default head.
+        """
+        assert config.OPENROUTER_REASONING_MODEL != "thinkingmachines/inkling-small:free"
+        spec = MODEL_REGISTRY.get(config.OPENROUTER_REASONING_MODEL)
+        assert spec is not None
+        assert spec.deprioritise is False
 
     def test_unknown_tier_falls_back_to_primary(self):
         assert config.model_for_tier("nonsense") == config.OPENROUTER_PRIMARY_MODEL

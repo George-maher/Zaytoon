@@ -37,44 +37,51 @@ def _env_str(name: str, default: str) -> str:
 # ---------------------------------------------------------------------------
 # Free-tier model policy (zero-cost guard)
 # ---------------------------------------------------------------------------
-#: OpenRouter's auto-router that only ever selects free models.
-FREE_ROUTER_ENDPOINT = "openrouter/free"
+# The pool, the capability registry and the selection rules all live in
+# ``services/model_registry.py`` so they can be reasoned about — and tested —
+# without importing the environment. Only the wiring is here.
+#
+# ``openrouter/free`` is recognised *in order to refuse it*. It is an
+# uncontrolled auto-router: it resolves to a different arbitrary free model
+# depending on upstream load, which makes a bug unreproducible and a fix
+# unverifiable, and it answered a ``get_time`` request with the literal string
+# "User Safety: safe" which the loop presented to the user as the answer. It is
+# no longer in the pool.
+from services.model_registry import (  # noqa: F401
+    ALL_CAPABILITIES,
+    CAP_STRUCTURED_OUTPUT,
+    CAP_TOOLS,
+    FREE_MODEL_SUFFIX,
+    FREE_ROUTER_ENDPOINT,
+    MODEL_REGISTRY,
+    ModelSpec,
+    is_allowlisted,
+    is_free_form,
+    is_free_router,
+    missing_capabilities,
+    select_models,
+    spec_for,
+)
 
-#: Suffix OpenRouter uses to mark zero-cost variants.
-FREE_MODEL_SUFFIX = ":free"
-
-#: The ONLY models this application will ever call. Hard-coded by design: the
-#: allow-list is the primary guard, the ``:free`` shape check is the second.
-#: To adopt a different free model, edit this set and the ``.env`` together.
-ALLOWED_FREE_MODELS = frozenset({
-    # Primary: chat, tools, routing.
-    "qwen/qwen3.8-27b:free",
-    # Reasoning: code, planning, scheduling.
-    "thinkingmachines/inkling-small:free",
-    # Fallback: OpenRouter's free-only auto-router.
-    "openrouter/free",
-})
+#: The ONLY models this application will ever call, derived from the registry so
+#: the two cannot drift. Hard-coded by design: a free model is still a model
+#: that can fail to follow the tool protocol, and adding one is a decision.
+ALLOWED_FREE_MODELS = frozenset(
+    spec.id for spec in MODEL_REGISTRY.values() if spec.free
+)
 
 
 def is_free_model(model: str) -> bool:
     """True when ``model`` is in a guaranteed zero-cost form.
 
-    Two forms qualify:
-
-    * the free router endpoint, e.g. ``openrouter/free``
-    * any model id whose variant tag is ``:free``, e.g. ``qwen/qwen3.8-27b:free``
+    Only ``<vendor>/<model>:free`` qualifies. ``openrouter/free`` no longer
+    does: it is free, but it is not *controlled*, and a system that promises a
+    FREE-only router is more useful if it never delegates the choice.
 
     Anything else (including an untagged model such as ``openai/gpt-4o``) is
     treated as billable and is rejected before a request is ever sent.
     """
-    if not model or not isinstance(model, str):
-        return False
-    candidate = model.strip()
-    if not candidate:
-        return False
-    if candidate.lower() == FREE_ROUTER_ENDPOINT:
-        return True
-    return candidate.lower().endswith(FREE_MODEL_SUFFIX)
+    return is_free_form(model)
 
 
 def is_allowed_model(model: str) -> bool:
@@ -84,14 +91,41 @@ def is_allowed_model(model: str) -> bool:
     sufficient — an un-allow-listed ``:free`` model is still refused, so a
     typo or an injected model id cannot reach the network.
     """
-    if not is_free_model(model):
-        return False
-    return model.strip() in ALLOWED_FREE_MODELS
+    return is_allowlisted(model)
 
 
 # The single supported provider. Local model execution has been removed.
 PROVIDER_OPENROUTER = "openrouter"
 VALID_PROVIDERS = (PROVIDER_OPENROUTER,)
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def configure_logging() -> None:
+    """Install a root handler at the configured level. Idempotent.
+
+    Without this, Python's "last resort" handler is WARNING-only, which means
+    every *successful* model call went unrecorded. Failures looked fine and the
+    happy path was invisible — the opposite of what observability is for.
+    """
+    import logging
+
+    level = getattr(logging, config.LOG_LEVEL, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)-7s %(name)-22s %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    else:
+        root.setLevel(level)
+
+    # httpx logs every request at INFO, which is noise next to our own records.
+    if config.LOG_QUIET_THIRD_PARTY:
+        for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "websockets"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 class NonFreeModelError(ValueError):
@@ -108,6 +142,11 @@ class NonFreeModelError(ValueError):
             f"Refusing model {model!r}: Zaytoon may only call allow-listed "
             f"free models ({allowed})."
         )
+
+
+#: A control failure, raised when no configured model can do the job.
+class NoCapableModelError(RuntimeError):
+    """No allow-listed free model satisfies the request's capabilities."""
 
 # Model tiers used to build the fallback chain.
 TIER_FAST = "fast"
@@ -131,10 +170,41 @@ class Config:
         _env_str("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free"),
     )
     OPENROUTER_REASONING_MODEL: str = _env_str(
-        "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free"
+        "OPENROUTER_REASONING_MODEL", "cohere/north-mini-code:free"
     )
+    #: Retained for compatibility with existing .env files and with
+    #: ``model_for_tier(TIER_FALLBACK)``, but it is now just another *named*
+    #: member of the explicit free pool. It is no longer an auto-router.
     OPENROUTER_FALLBACK_MODEL: str = _env_str(
-        "OPENROUTER_FALLBACK_MODEL", "openrouter/free"
+        "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free"
+    )
+
+    #: The explicit fallback pool, tried in order after the primary. Every entry
+    #: is subject to the same two gates as the primary: it must be in a free
+    #: form *and* allow-listed. ``openrouter/free`` is refused even here.
+    #:
+    #: Every id below was verified against OpenRouter's live catalogue. Run
+    #: ``python scripts/check_free_models.py`` after editing: a stale id here
+    #: fails as a 404, which reads like an outage rather than a config error.
+    OPENROUTER_FREE_FALLBACK_MODELS: str = _env_str(
+        "OPENROUTER_FREE_FALLBACK_MODELS",
+        "nvidia/nemotron-3-super-120b-a12b:free,"
+        "nvidia/nemotron-3.5-lightning:free,"
+        "cohere/north-mini-code:free,"
+        "poolside/laguna-s-2.1:free",
+    )
+
+    #: Hard ceiling on how many model calls one logical request may make, across
+    #: the whole chain. This is what makes an infinite fallback loop impossible.
+    #: Note the distinction from ``LLM_MAX_RETRIES``: that is per-model
+    #: transport retries, this is the total across every model.
+    OPENROUTER_MAX_ATTEMPTS: int = _env_int("OPENROUTER_MAX_ATTEMPTS", 3)
+
+    #: Minimum seconds to wait on a 429 that advertises no ``Retry-After``.
+    #: Deliberately short: with a contended free tier the goal is to *move to a
+    #: different free model*, not to sit on one and retry it.
+    OPENROUTER_RATE_LIMIT_BACKOFF: float = _env_float(
+        "OPENROUTER_RATE_LIMIT_BACKOFF", 0.75
     )
 
     # OpenRouter attribution headers (required for their dashboard/ranking).
@@ -149,10 +219,15 @@ class Config:
     PROVIDER: str = PROVIDER_OPENROUTER
 
     LLM_TIMEOUT: float = _env_float("LLM_TIMEOUT", 120.0)
-    LLM_MAX_RETRIES: int = _env_int("LLM_MAX_RETRIES", 2)
+    #: Per-model transport retries. ``OPENROUTER_MAX_ATTEMPTS`` is the separate,
+    #: global budget across all models.
+    LLM_MAX_RETRIES: int = _env_int("LLM_MAX_RETRIES", 1)
     # A model that just rate-limited or 5xx'd is benched for this long instead
     # of being retried on every single request.
     LLM_PROVIDER_COOLDOWN: float = _env_float("LLM_PROVIDER_COOLDOWN", 60.0)
+    #: How much longer a 429 benches a model than a 5xx does. 429 is a signal
+    #: about *this model right now*, so it deserves a longer rest.
+    LLM_RATE_LIMIT_COOLDOWN: float = _env_float("LLM_RATE_LIMIT_COOLDOWN", 90.0)
     LLM_MAX_TOKENS_CAP: int = _env_int("LLM_MAX_TOKENS_CAP", 8192)
 
     # Second line of defence; the allow-list below is the primary one.
@@ -190,22 +265,57 @@ class Config:
             return self.OPENROUTER_FALLBACK_MODEL
         return self.OPENROUTER_PRIMARY_MODEL
 
+    @property
+    def free_fallback_models(self) -> list[str]:
+        """The configured fallback pool, in declaration order, de-duplicated."""
+        raw = self.OPENROUTER_FREE_FALLBACK_MODELS or ""
+        seen: list[str] = []
+        for chunk in raw.split(","):
+            name = chunk.strip()
+            if name and name not in seen:
+                seen.append(name)
+        return seen
+
+    def model_pool(self, tier: str = TIER_FAST) -> list[str]:
+        """Every model this tier may use, most-preferred first.
+
+        The tier's head comes first because it is the deliberate choice, then the
+        explicit fallback pool, then whatever the pool still has. The explicit
+        list is honoured over the registry's own ordering: an operator who
+        wrote down a fallback order meant it.
+
+        No member of this list is ever returned without passing the free-form and
+        allow-list gates downstream in ``select_models``.
+        """
+        ordered: list[str] = []
+        for name in (
+            self.model_for_tier(tier),
+            *self.free_fallback_models,
+            self.OPENROUTER_FALLBACK_MODEL,
+        ):
+            cleaned = (name or "").strip()
+            if cleaned and cleaned not in ordered:
+                ordered.append(cleaned)
+        return ordered
+
     def validate_free_models(self) -> list[str]:
         """Configured models that violate the free-model policy.
 
         A model is acceptable only if it is BOTH in the hard-coded allow-list
-        AND in a free form (``<vendor>/<model>:free`` or ``openrouter/free``).
-        An empty list means the configuration honours the zero-cost policy.
+        AND in a free form (``<vendor>/<model>:free``). An empty list means the
+        configuration honours the zero-cost policy.
+
+        The whole pool is checked, not just the three named models, because the
+        fallback list is the easiest place for a paid id to be introduced by
+        accident.
         """
-        return [
-            name
-            for name in (
-                self.OPENROUTER_PRIMARY_MODEL,
-                self.OPENROUTER_REASONING_MODEL,
-                self.OPENROUTER_FALLBACK_MODEL,
-            )
-            if not is_allowed_model(name)
-        ]
+        checked = {
+            self.OPENROUTER_PRIMARY_MODEL,
+            self.OPENROUTER_REASONING_MODEL,
+            self.OPENROUTER_FALLBACK_MODEL,
+            *self.free_fallback_models,
+        }
+        return sorted(name for name in checked if not is_allowed_model(name))
 
     @property
     def free_models_enforced(self) -> bool:
@@ -213,6 +323,12 @@ class Config:
 
     def assert_free_model(self, model: str) -> str:
         """Guard used on the request path. Returns ``model`` if acceptable."""
+        if is_free_router(model):
+            raise NonFreeModelError(
+                f"{model!r} is an uncontrolled auto-router and is not used as a "
+                "fallback: it can resolve to a different arbitrary free model on "
+                "every call. Configure explicit free models instead."
+            )
         if not self.LLM_REQUIRE_FREE_MODELS:
             return model
         if not is_allowed_model(model):
@@ -220,7 +336,10 @@ class Config:
         return model
 
     def describe_llm(self) -> dict:
-        """Small dict for /health and startup logs."""
+        """Small dict for /health and startup logs.
+
+        Never includes the API key, in whole or in part.
+        """
         return {
             "provider": self.PROVIDER,
             "free_only": self.LLM_REQUIRE_FREE_MODELS,
@@ -229,8 +348,16 @@ class Config:
             "primary_model": self.OPENROUTER_PRIMARY_MODEL,
             "reasoning_model": self.OPENROUTER_REASONING_MODEL,
             "fallback_model": self.OPENROUTER_FALLBACK_MODEL,
+            "fallback_pool": self.free_fallback_models,
+            "max_attempts": self.OPENROUTER_MAX_ATTEMPTS,
             "allowed_models": sorted(ALLOWED_FREE_MODELS),
             "rejected_models": self.validate_free_models(),
+            "excluded_by_policy": [FREE_ROUTER_ENDPOINT],
+            "capabilities": {
+                model: spec_for(model).to_dict()
+                for model in sorted(ALLOWED_FREE_MODELS)
+                if spec_for(model)
+            },
         }
 
     # ------------------------------------------------------------------
@@ -328,6 +455,21 @@ class Config:
     )
 
     # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+    #: Root log level. This matters for more than tidiness: the per-attempt
+    #: record in `LLMClient._log_attempt` logs a *successful* attempt at INFO,
+    #: and without an explicit level Python's root handler defaults to WARNING,
+    #: so every successful model call was silently dropped. The requirement is
+    #: to record every attempt, not only the failures.
+    LOG_LEVEL: str = _env_str("LOG_LEVEL", "INFO").upper()
+
+    #: Loggers that are allowed to emit. `Zaytoon.LLMClient` is in the list
+    #: specifically so a free-model failover is visible in the console without
+    #: turning on third-party debug output.
+    LOG_QUIET_THIRD_PARTY: bool = _env_bool("LOG_QUIET_THIRD_PARTY", True)
+
+    # ------------------------------------------------------------------
     # Rate limiting / misc
     # ------------------------------------------------------------------
     RATE_LIMIT_MAX: int = _env_int("RATE_LIMIT_MAX", 60)
@@ -351,3 +493,6 @@ class Config:
 
 
 config = Config()
+
+
+

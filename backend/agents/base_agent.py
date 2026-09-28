@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Callable
 import httpx
 
 from config import TIER_FAST, TIER_REASONING, config
+from services.completion_validator import CHAT_CONTRACT, CompletionContract
 from services.llm_client import LLMClient, LLMError, get_llm_client
 
 logger = logging.getLogger("Zaytoon")
@@ -95,6 +96,7 @@ class BaseAgent(ABC):
         self,
         messages: List[Dict[str, str]],
         retries: int = 2,
+        contract: Optional[CompletionContract] = None,
     ) -> str:
         try:
             return await self.llm.complete(
@@ -103,6 +105,7 @@ class BaseAgent(ABC):
                 max_tokens=min(self.max_tokens, config.LLM_MAX_TOKENS_CAP),
                 temperature=self.temperature,
                 retries=retries,
+                contract=contract or CHAT_CONTRACT,
             )
         except LLMError as e:
             logger.error("%s exhausted all providers: %s", self.agent_name, e)

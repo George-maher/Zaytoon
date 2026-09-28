@@ -20,6 +20,11 @@ from config import (
     is_free_model,
 )
 from services.llm_client import LLMClient, LLMError, ProviderEndpoint, get_llm_client
+from services.model_registry import (
+    MODEL_REGISTRY,
+    is_free_router,
+    select_models,
+)
 
 
 BILLABLE_MODELS = [
@@ -36,8 +41,8 @@ BILLABLE_MODELS = [
 
 FREE_MODELS = [
     "qwen/qwen3.8-27b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
     "thinkingmachines/inkling-small:free",
-    "openrouter/free",
     "meta-llama/llama-3.1-8b:free",
     "google/gemma-3-27b-it:free",
     "mistralai/mistral-small-3.1:free",
@@ -62,7 +67,6 @@ class TestIsFreeModel:
 
     def test_free_tag_is_case_insensitive(self):
         assert is_free_model("Qwen/Qwen3-8B:FREE") is True
-        assert is_free_model("OPENROUTER/FREE") is True
 
     def test_suffix_must_be_exactly_free(self):
         # A model whose name merely *contains* "free" is not free.
@@ -72,9 +76,22 @@ class TestIsFreeModel:
     def test_trailing_whitespace_tolerated(self):
         assert is_free_model("  qwen/qwen3-8b:free  ") is True
 
-    def test_free_router_endpoint(self):
+    def test_the_free_router_is_not_a_free_form_we_call(self):
+        """`openrouter/free` is free, but it is not *controlled*.
+
+        It resolves to a different arbitrary free model on each call depending on
+        upstream load, which makes a routing bug unreproducible and a fix
+        unverifiable -- and it answered a `get_time` request with the literal
+        string "User Safety: safe". So it is recognised in order to be refused.
+        """
         assert FREE_ROUTER_ENDPOINT == "openrouter/free"
-        assert is_free_model(FREE_ROUTER_ENDPOINT) is True
+        assert is_free_model(FREE_ROUTER_ENDPOINT) is False
+        assert is_free_router(FREE_ROUTER_ENDPOINT) is True
+        assert is_allowed_model(FREE_ROUTER_ENDPOINT) is False
+
+    @pytest.mark.parametrize("model", BILLABLE_MODELS)
+    def test_no_billable_model_is_allow_listed(self, model):
+        assert is_allowed_model(model) is False
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +101,8 @@ class TestConfigFreeModelValidation:
     def test_configured_models_are_free_by_default(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
         monkeypatch.setattr(config, "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free", raising=False)
-        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
+        monkeypatch.setattr(config, "OPENROUTER_FREE_FALLBACK_MODELS", "nvidia/nemotron-3-super-120b-a12b:free", raising=False)
         assert config.validate_free_models() == []
 
     def test_reports_billable_config(self, monkeypatch):
@@ -138,12 +156,14 @@ class TestEndpointGuard:
         )
         assert ep.is_free is True
 
-    def test_free_router_allowed(self):
-        ep = ProviderEndpoint(
-            provider=PROVIDER_OPENROUTER, model="openrouter/free",
-            url="https://openrouter.ai/api/v1/chat/completions", headers={},
-        )
-        assert ep.is_free is True
+    def test_the_free_router_is_refused_at_construction(self):
+        """The auto-router cannot be constructed, let alone called."""
+        with pytest.raises(NonFreeModelError) as exc:
+            ProviderEndpoint(
+                provider=PROVIDER_OPENROUTER, model="openrouter/free",
+                url="https://openrouter.ai/api/v1/chat/completions", headers={},
+            )
+        assert "openrouter/free" in str(exc.value)
 
     @pytest.mark.parametrize("model", BILLABLE_MODELS)
     def test_billable_endpoint_rejected_at_construction(self, model):
@@ -171,7 +191,7 @@ class TestEndpointGuard:
     def test_build_payload_revalidates(self, monkeypatch):
         """A model swapped in after construction is still caught."""
         ep = ProviderEndpoint(
-            provider=PROVIDER_OPENROUTER, model="openrouter/free",
+            provider=PROVIDER_OPENROUTER, model="qwen/qwen3.8-27b:free",
             url="http://x", headers={},
         )
         object.__setattr__(ep, "model", "openai/gpt-4o")
@@ -182,13 +202,26 @@ class TestEndpointGuard:
 # ---------------------------------------------------------------------------
 # Chain construction
 # ---------------------------------------------------------------------------
+#: Two explicitly configured free models, so chain-order assertions are about
+#: order and not about how many models happen to be allow-listed today.
+POOL_HEAD = "qwen/qwen3.8-27b:free"
+POOL_TAIL = "nvidia/nemotron-3-super-120b-a12b:free"
+
+
 @pytest.fixture
 def free_env(monkeypatch):
     monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
     monkeypatch.setattr(config, "LLM_REQUIRE_FREE_MODELS", True, raising=False)
-    monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "qwen/qwen3.8-27b:free", raising=False)
-    monkeypatch.setattr(config, "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free", raising=False)
-    monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", "openrouter/free", raising=False)
+    monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", POOL_HEAD, raising=False)
+    monkeypatch.setattr(
+        config, "OPENROUTER_REASONING_MODEL", "thinkingmachines/inkling-small:free",
+        raising=False,
+    )
+    monkeypatch.setattr(config, "OPENROUTER_FALLBACK_MODEL", POOL_TAIL, raising=False)
+    monkeypatch.setattr(
+        config, "OPENROUTER_FREE_FALLBACK_MODELS", POOL_TAIL, raising=False
+    )
+    monkeypatch.setattr(config, "OPENROUTER_MAX_ATTEMPTS", 4, raising=False)
     return config
 
 
@@ -201,19 +234,25 @@ class TestChainFreeOnly:
         assert openrouter_models
         for model in openrouter_models:
             assert is_free_model(model), f"{model} is not free"
+            assert is_allowed_model(model), f"{model} is not allow-listed"
 
-    def test_chain_contains_only_verified_free_defaults(self, free_env):
+    def test_chain_follows_the_configured_order(self, free_env):
         chain = LLMClient().build_chain("reasoning")
         models = [ep.model for ep in chain if ep.provider == PROVIDER_OPENROUTER]
+        # The tier head is the deliberate choice and stays first, whatever the
+        # registry's `rank` says about it.
         assert models[0] == "thinkingmachines/inkling-small:free"
-        assert "openrouter/free" in models
+        assert models[1] == POOL_TAIL
 
-    def test_chain_has_no_local_fallback(self, free_env):
-        """The chain is primary -> openrouter/free, and nothing else."""
+    def test_chain_never_contains_the_auto_router(self, free_env):
+        for tier in ("fast", "reasoning", "fallback"):
+            models = [e.model for e in LLMClient().build_chain(tier)]
+            assert "openrouter/free" not in models, tier
+
+    def test_chain_is_explicitly_configured_only(self, free_env):
+        """Nothing appears in the chain unless an operator configured it."""
         chain = LLMClient().build_chain("fast")
-        assert [e.model for e in chain] == [
-            "qwen/qwen3.8-27b:free", "openrouter/free",
-        ]
+        assert [e.model for e in chain] == [POOL_HEAD, POOL_TAIL]
         assert all(ep.provider == PROVIDER_OPENROUTER for ep in chain)
         assert all(ep.url.startswith("https://openrouter.ai/") for ep in chain)
 
@@ -223,17 +262,54 @@ class TestChainFreeOnly:
             LLMClient().build_chain("fast")
         assert "OPENROUTER_API_KEY" in str(exc.value)
 
-    def test_billable_config_raises_when_building_chain(self, free_env, monkeypatch):
+    def test_a_billable_primary_is_dropped_not_called(self, free_env, monkeypatch):
+        """A paid id in .env must never be called.
+
+        It used to raise, bricking the request. Now the bad model is *excluded*
+        from the pool and the remaining free models serve the turn, which is
+        strictly better: a typo in a model id degrades instead of breaking the
+        assistant. The invariant that matters is unchanged -- it is never called.
+        """
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "openai/gpt-4o", raising=False)
+        client = LLMClient()
+        chain = client.build_chain("fast")
+
+        assert "openai/gpt-4o" not in [e.model for e in chain]
+        assert chain, "the pool must still serve the request"
+
+    def test_a_fully_billable_pool_raises_rather_than_calling(self, free_env, monkeypatch):
+        """With nothing free left, the answer is an error, not a paid call."""
+        for attr in (
+            "OPENROUTER_PRIMARY_MODEL",
+            "OPENROUTER_REASONING_MODEL",
+            "OPENROUTER_FALLBACK_MODEL",
+        ):
+            monkeypatch.setattr(config, attr, "openai/gpt-4o", raising=False)
+        monkeypatch.setattr(
+            config, "OPENROUTER_FREE_FALLBACK_MODELS", "openai/gpt-4o", raising=False
+        )
         with pytest.raises(NonFreeModelError):
             LLMClient().build_chain("fast")
 
-    def test_no_request_is_sent_for_billable_model(self, free_env, monkeypatch):
+    async def test_no_request_is_sent_for_a_billable_model(self, free_env, monkeypatch):
         """The whole point: rejection happens before any socket is opened."""
         monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "openai/gpt-4o", raising=False)
         client = LLMClient()
-        with pytest.raises(NonFreeModelError):
-            client.build_chain("fast")
+        exploding = _ExplodingClient()
+        client._client = exploding
+
+        def handler(url, payload, headers):
+            # Only a *free* model may ever reach this.
+            assert is_free_model(payload["model"]), payload["model"]
+            return _ok("served by a free model")
+
+        client._client = _Recorder(handler)
+        assert await client.complete(
+            [{"role": "user", "content": "x"}]
+        ) == "served by a free model"
+        assert all(
+            is_free_model(r["json"]["model"]) for r in client._client.requests
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +336,16 @@ class _ExplodingClient:
 
 
 class TestNoNetworkForBillable:
-    async def test_complete_never_reaches_the_socket(self, free_env, monkeypatch):
-        monkeypatch.setattr(config, "OPENROUTER_PRIMARY_MODEL", "openai/gpt-4o", raising=False)
+    async def test_a_billable_only_pool_never_reaches_the_socket(self, free_env, monkeypatch):
+        for attr in (
+            "OPENROUTER_PRIMARY_MODEL",
+            "OPENROUTER_REASONING_MODEL",
+            "OPENROUTER_FALLBACK_MODEL",
+        ):
+            monkeypatch.setattr(config, attr, "openai/gpt-4o", raising=False)
+        monkeypatch.setattr(
+            config, "OPENROUTER_FREE_FALLBACK_MODELS", "openai/gpt-4o", raising=False
+        )
         client = LLMClient()
         exploding = _ExplodingClient()
         client._client = exploding
@@ -276,13 +360,14 @@ class TestNoNetworkForBillable:
         exploding = _ExplodingClient()
         client._client = exploding
         ep = ProviderEndpoint(
-            provider=PROVIDER_OPENROUTER, model="openrouter/free",
+            provider=PROVIDER_OPENROUTER, model=POOL_HEAD,
             url="https://openrouter.ai/api/v1/chat/completions", headers={},
         )
-        # A legitimate free request does go out.
+        # A legitimate free request does build a payload.
         assert ep.build_payload([{"role": "user", "content": "hi"}], 10, 0.1)["model"] == (
-            "openrouter/free"
+            POOL_HEAD
         )
+        assert exploding.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +425,9 @@ def _err(status):
 
 
 class TestFreeModelFallback:
-    async def test_429_falls_to_free_fallback(self, free_env):
+    async def test_429_falls_to_the_next_configured_free_model(self, free_env):
         def handler(url, payload, headers):
-            if payload["model"] == "qwen/qwen3.8-27b:free":
+            if payload["model"] == POOL_HEAD:
                 return _err(429)
             return _ok("served by fallback")
 
@@ -350,11 +435,16 @@ class TestFreeModelFallback:
         client._client = _Recorder(handler)
         result = await client.complete([{"role": "user", "content": "x"}])
         assert result == "served by fallback"
-        assert client._client.requests[-1]["json"]["model"] == "openrouter/free"
+        assert client._client.requests[-1]["json"]["model"] == POOL_TAIL
+        # A 429 must not be retried on the same model: the point of the pool is
+        # to move to a different free model, not to hammer a contended one.
+        assert [r["json"]["model"] for r in client._client.requests] == [
+            POOL_HEAD, POOL_TAIL,
+        ]
 
     async def test_500_falls_through_chain(self, free_env):
         def handler(url, payload, headers):
-            if payload["model"] == "qwen/qwen3.8-27b:free":
+            if payload["model"] == POOL_HEAD:
                 return _err(500)
             return _ok("recovered")
 
