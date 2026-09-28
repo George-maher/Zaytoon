@@ -11,6 +11,8 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +24,7 @@ from agents.engine import (  # noqa: E402
     LoopResult,
     build_system_prompt,
     extract_tool_calls,
+    looks_like_tool_call,
     render_observation,
     tool_label,
 )
@@ -211,6 +214,261 @@ class TestExtractToolCalls:
 
 
 # ---------------------------------------------------------------------------
+# The pseudo-XML form
+# ---------------------------------------------------------------------------
+# Observed live: asked for JSON, `qwen/qwen3.8-27b:free` replied
+#   <tool_call>get_time
+#
+#   </tool_call>
+# and the engine handed that to the user as the assistant's answer. These tests
+# exist so that cannot regress.
+class TestTaggedToolCalls:
+    def test_bare_name_inside_tags(self):
+        calls, prose = extract_tool_calls("<tool_call>get_time</tool_call>")
+        assert len(calls) == 1
+        assert calls[0].name == "get_time"
+        assert calls[0].params == {}
+        assert prose == ""
+
+    def test_multiline_body(self):
+        calls, _ = extract_tool_calls(
+            "<tool_call>get_time\n\n</tool_call>"
+        )
+        assert [c.name for c in calls] == ["get_time"]
+
+    def test_json_body_inside_tags(self):
+        calls, _ = extract_tool_calls(
+            '<tool_call>\n{"action": "get_time", "params": {}}\n</tool_call>'
+        )
+        assert [c.name for c in calls] == ["get_time"]
+
+    def test_nested_params_inside_tags(self):
+        calls, _ = extract_tool_calls(
+            '<tool_call>{"action": "file_write", "params": {"path": "a.txt"}}'
+            "</tool_call>"
+        )
+        assert calls[0].params == {"path": "a.txt"}
+
+    def test_several_tagged_calls(self):
+        calls, _ = extract_tool_calls(
+            "<tool_call>get_time</tool_call>\n<tool_call>system_info</tool_call>"
+        )
+        assert [c.name for c in calls] == ["get_time", "system_info"]
+
+    def test_unterminated_tag_is_still_a_call(self):
+        """Truncated mid-stream, but the intent is unambiguous."""
+        calls, _ = extract_tool_calls("<tool_call>get_time")
+        assert [c.name for c in calls] == ["get_time"]
+
+    def test_trailing_words_do_not_become_the_tool_name(self):
+        calls, _ = extract_tool_calls("<tool_call>get_time now please</tool_call>")
+        assert calls[0].name == "get_time"
+
+    def test_prose_around_a_tagged_call_survives(self):
+        calls, prose = extract_tool_calls(
+            "Let me check that. <tool_call>get_time</tool_call> One moment."
+        )
+        assert len(calls) == 1
+        assert "Let me check" in prose
+
+    def test_json_and_tagged_calls_coexist(self):
+        calls, _ = extract_tool_calls(
+            '{"action": "get_time"}\n<tool_call>system_info</tool_call>'
+        )
+        assert sorted(c.name for c in calls) == ["get_time", "system_info"]
+
+    def test_empty_tag_body_is_not_a_call(self):
+        calls, _ = extract_tool_calls("<tool_call></tool_call>")
+        assert calls == []
+
+    def test_ordinary_prose_is_unaffected(self):
+        calls, prose = extract_tool_calls(
+            "I can call the get_time tool if you like, but it is 3pm now."
+        )
+        assert calls == []
+        assert "3pm" in prose
+
+
+class TestLooksLikeToolCall:
+    def test_detects_a_leaked_tag(self):
+        assert looks_like_tool_call("<tool_call>get_time</tool_call>")
+        assert looks_like_tool_call("</tool_call>")
+
+    def test_detects_qwen_special_tokens(self):
+        """Observed live, twice, in a dialect the parsers did not know."""
+        assert looks_like_tool_call("<|tool_call_start|>[get_time()]<|tool_call_end|>")
+
+    def test_detects_a_lone_tagged_name(self):
+        assert looks_like_tool_call("<get_time>")
+
+    def test_detects_a_bracketed_call(self):
+        assert looks_like_tool_call("[get_time()]")
+
+    def test_plain_prose_is_not_flagged(self):
+        assert not looks_like_tool_call("It is 3pm.")
+        assert not looks_like_tool_call("I used the get_time tool.")
+        assert not looks_like_tool_call("")
+
+    def test_a_real_answer_mentioning_angle_brackets_is_not_flagged(self):
+        assert not looks_like_tool_call("Pass --flag <value> to set the port.")
+
+    def test_a_normal_sentence_with_brackets_is_not_flagged(self):
+        assert not looks_like_tool_call(
+            "I found 3 items in the list [one, two, three] for you."
+        )
+
+
+class TestQwenCallDialect:
+    """`<|tool_call_start|>[name(args)]<|tool_call_end|>`.
+
+    The second live dialect. Unlike the bare `<tool_call>name</tool_call>`
+    form this one carries arguments, so it is strictly more useful — worth
+    supporting rather than shrugging at.
+    """
+
+    def test_no_arguments(self):
+        calls, prose = extract_tool_calls(
+            "<|tool_call_start|>[get_time()]<|tool_call_end|>"
+        )
+        assert [c.name for c in calls] == ["get_time"]
+        assert calls[0].params == {}
+        assert prose == ""
+
+    def test_keyword_arguments(self):
+        calls, _ = extract_tool_calls(
+            '<|tool_call_start|>[file_write(path="a.txt", content="hi")]'
+            "<|tool_call_end|>"
+        )
+        assert calls[0].name == "file_write"
+        assert calls[0].params == {"path": "a.txt", "content": "hi"}
+
+    def test_positional_arguments(self):
+        calls, _ = extract_tool_calls(
+            "<|tool_call_start|>[search_files(src)]<|tool_call_end|>"
+        )
+        assert calls[0].params == {"arg0": "src"}
+
+    def test_nested_and_numeric_literals(self):
+        calls, _ = extract_tool_calls(
+            "<|tool_call_start|>[calculator(expression=[1, 2, 3], n=4)]"
+            "<|tool_call_end|>"
+        )
+        assert calls[0].params["expression"] == [1, 2, 3]
+        assert calls[0].params["n"] == 4
+
+    def test_a_bare_identifier_reads_as_its_name(self):
+        """`[search_files(src)]` must not become `Name(id='src', ctx=Load())`."""
+        calls, _ = extract_tool_calls(
+            "<|tool_call_start|>[search_files(src)]<|tool_call_end|>"
+        )
+        assert calls[0].params == {"arg0": "src"}
+
+    def test_unterminated(self):
+        calls, _ = extract_tool_calls("<|tool_call_start|>[get_time()]")
+        assert [c.name for c in calls] == ["get_time"]
+
+    def test_prose_around_it_survives(self):
+        calls, prose = extract_tool_calls(
+            "One moment. <|tool_call_start|>[get_time()]<|tool_call_end|> Done."
+        )
+        assert len(calls) == 1
+        assert "One moment" in prose
+
+    def test_coexists_with_a_json_call(self):
+        calls, _ = extract_tool_calls(
+            '{"action": "get_time"}\n<|tool_call_start|>[system_info()]<|tool_call_end|>'
+        )
+        assert sorted(c.name for c in calls) == ["get_time", "system_info"]
+
+    def test_a_malformed_body_is_not_a_call(self):
+        calls, _ = extract_tool_calls(
+            "<|tool_call_start|>[not valid python(]<|tool_call_end|>"
+        )
+        assert calls == []
+
+    def test_the_ast_path_cannot_execute_anything(self):
+        """The expression is parsed, never compiled or evaluated.
+
+        A model could ask for `__import__("os").system("calc.exe")`. Whatever
+        the parser makes of it, the security property is that nothing runs
+        here, and the name is then refused by the registry as unknown.
+        """
+        marker = Path(tempfile.gettempdir()) / "zaytoon_should_not_exist.txt"
+        if marker.exists():
+            marker.unlink()
+
+        calls, _ = extract_tool_calls(
+            '<|tool_call_start|>[__import__("os").system("calc.exe")]'
+            "<|tool_call_end|>"
+        )
+        # Inert: every parameter is a plain string or a list, never a module.
+        for value in (v for c in calls for v in c.params.values()):
+            assert isinstance(value, (str, int, float, bool, list, dict, type(None)))
+
+        # And the registry would refuse the name anyway.
+        from tools.registry import build_default_registry
+
+        assert not build_default_registry().has("__import__")
+
+
+class TestMalformedReplyIsNotTheAnswer:
+    async def test_a_tagged_call_is_executed_not_echoed(self, registry):
+        """The live-run regression: the model emitted a tag, not JSON.
+
+        Before the tagged form was taught to the parser this string was
+        returned to the user verbatim. The right fix is to *run* the call, so
+        that is what is asserted here.
+        """
+        llm = ScriptedLLM([
+            "<tool_call>get_time</tool_call>",
+            "It is 3pm.",
+        ])
+        result = await AgentEngine(llm, registry).run("what time is it")
+
+        assert result.tool_calls == ["get_time"]
+        assert result.text == "It is 3pm."
+        assert "tool_call" not in result.text
+
+    async def test_an_unparseable_call_shape_is_not_the_answer(self, registry):
+        """The guard, for shapes the parser genuinely cannot handle."""
+        llm = ScriptedLLM([
+            "<get_time>",
+            "It is 3pm.",
+        ])
+        result = await AgentEngine(llm, registry).run("what time is it")
+
+        assert result.text == "It is 3pm."
+        assert "<get_time>" not in result.text
+        assert any("unrecognised tool-call format" in e for e in result.errors)
+
+    async def test_the_model_is_nagged_once(self, registry):
+        llm = ScriptedLLM(["<get_time>", "<get_time>"])
+        result = await AgentEngine(llm, registry).run("what time is it")
+
+        # One nudge, then a plain-language report. Critically, the raw markup
+        # is never returned: the guard must not fall through to the
+        # "no tool call, so this is the answer" branch.
+        assert result.stopped_reason == "malformed_response"
+        assert "<get_time>" not in result.text
+        assert "could not get a usable response" in result.text.lower()
+        assert llm.calls == 2
+
+    async def test_persistent_malformation_does_not_burn_the_budget(self, registry):
+        llm = ScriptedLLM(["<get_time>"] * 20)
+        result = await AgentEngine(llm, registry, max_iterations=8).run("what time")
+
+        # It stops at the second offence, not at the budget: there is nothing to
+        # gain from eight more identical failures.
+        assert result.stopped_reason == "malformed_response"
+        assert llm.calls == 2
+
+    async def test_the_nudge_tells_the_model_not_to_use_tags(self, registry):
+        llm = ScriptedLLM(["<get_time>", "Fine."])
+        await AgentEngine(llm, registry).run("what time is it")
+        assert "XML" in json.dumps(llm.requests[1])
+
+
+# ---------------------------------------------------------------------------
 # Observations
 # ---------------------------------------------------------------------------
 class TestRenderObservation:
@@ -274,6 +532,47 @@ class TestPrompts:
         catalogue = engine._catalogue("en")
         assert "file_write" in catalogue
         assert "get_time" in catalogue
+
+    def test_catalogue_renders_methods_as_text(self, registry):
+        """`name`/`description` are methods, not properties.
+
+        This assertion previously passed for the wrong reason: the doubles'
+        `__repr__` contains their name, so `"file_write" in catalogue` matched
+        the repr of an un-called bound method. Formatting a bound method into
+        the prompt hands the model
+        `<bound method Calculator.name of <Calculator ...>>`, which is why the
+        live run failed while every unit test was green.
+        """
+        catalogue = AgentEngine(ScriptedLLM([]), registry)._catalogue("en")
+
+        assert "bound method" not in catalogue
+        assert "object at 0x" not in catalogue
+        for line in catalogue.splitlines():
+            assert line.startswith("- ")
+            assert line[2:3].isalpha(), f"not a tool name: {line!r}"
+
+    def test_catalogue_includes_the_tier_and_signature(self, registry):
+        catalogue = AgentEngine(ScriptedLLM([]), registry)._catalogue("en")
+        assert "- get_time(" in catalogue
+        assert "[safe]" in catalogue
+        assert "[confirm]" in catalogue
+
+    def test_real_registry_catalogue_is_clean(self):
+        """Against the real 30 tools, not a hand-rolled double.
+
+        The point of this one is that it cannot be fooled by a double whose
+        repr happens to look useful.
+        """
+        from tools.registry import build_default_registry
+
+        engine = AgentEngine(ScriptedLLM([]), build_default_registry())
+        catalogue = engine._catalogue("en")
+
+        assert "bound method" not in catalogue
+        assert catalogue.count("\n") >= 25  # ~30 tools
+        # Every real tool name must appear, and nothing but a name may lead.
+        for tool in build_default_registry().tools():
+            assert f"- {tool.name()}(" in catalogue, tool.name()
 
     def test_labels_are_user_facing_not_model_output(self):
         """The label is what the UI shows in place of the model's reasoning."""

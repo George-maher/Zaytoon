@@ -41,6 +41,7 @@ is a provider change rather than a rewrite.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
@@ -120,6 +121,209 @@ def _iter_json_objects(text: str):
         index = closed_at
 
 
+#: Some models ignore "reply with a JSON object" and emit a pseudo-XML tool
+#: call instead, having absorbed the convention from their own training. The
+#: live run showed `qwen/qwen3.8-27b:free` doing exactly this for
+#: "what time is it right now":
+#:
+#:     <tool_call>get_time
+#:
+#:     </tool_call>
+#:
+#: The JSON parser finds nothing, the engine concludes "no tool call, so this is
+#: the answer", and the user is shown a literal XML tag. That is the worst
+#: possible failure: it looks like a bug and it is *the answer*. So the tagged
+#: form is parsed too, and anything still tag-shaped afterwards is treated as a
+#: parse failure rather than as prose.
+_TAG_CALL = re.compile(
+    r"<\s*tool_call\s*>(.*?)<\s*/\s*tool_call\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+#: A tool call the model began but never closed (truncated mid-stream).
+_TAG_OPEN = re.compile(r"<\s*tool_call\s*>(.*)\Z", re.DOTALL | re.IGNORECASE)
+
+#: Qwen's native dialect, observed live for the same request:
+#:
+#:     <|tool_call_start|>[get_time()]<|tool_call_end|>
+#:
+#: The model reaches for whichever tool-call convention it saw in training, and
+#: it reaches for more than one: across four identical live runs of "what time
+#: is it right now" this codebase had to cope with the JSON form, the
+#: ``<tool_call>`` form and this one. The body is a call expression
+#: (``name(arg=value)``), not JSON, so it needs a different parser — but it is
+#: a *better* dialect than the XML one, because the arguments survive.
+_PIPE_CALL = re.compile(
+    r"<\|\s*tool_call_start\s*\|>(.*?)<\|\s*tool_call_end\s*\|>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PIPE_CALL_OPEN = re.compile(
+    r"<\|\s*tool_call_start\s*\|>(.*)\Z", re.DOTALL | re.IGNORECASE
+)
+#: `get_time()` or `file_write(path="a.txt", content="x")`, optionally wrapped in
+#: the square brackets Qwen adds.
+_CALL_EXPR = re.compile(r"^\[?\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*\]?\s*$", re.DOTALL)
+
+
+def _iter_tag_calls(text: str):
+    """Yield ``(start, end, ToolCall)`` for each tagged call of any dialect.
+
+    Three forms are recognised, tried in order of how much they carry:
+
+    1. ``<|tool_call_start|>[name(args)]<|tool_call_end|>``  (Qwen native)
+    2. ``<tool_call>{"action": …}</tool_call>``  (JSON inside a tag)
+    3. ``<tool_call>name</tool_call>``  (bare name)
+
+    The unterminated fallback for each only fires when nothing closed cleanly.
+    Matching both unconditionally double-counts every well-formed tag.
+    """
+    for regex, open_regex, parser in (
+        (_PIPE_CALL, _PIPE_CALL_OPEN, _parse_call_expr),
+        (_TAG_CALL, _TAG_OPEN, _parse_call_body),
+    ):
+        matched_closed = False
+        for match in regex.finditer(text):
+            call = parser(match.group(1).strip())
+            if call is not None:
+                matched_closed = True
+                yield match.start(), match.end(), call
+        if matched_closed:
+            continue
+
+        # An unterminated tag is a truncated call, not prose.
+        tail = open_regex.search(text)
+        if tail:
+            call = parser(tail.group(1).strip())
+            if call is not None:
+                yield tail.start(), len(text), call
+
+
+def _read_arg(node: ast.AST) -> Any:
+    """Best-effort inert value for an argument that is not a literal.
+
+    A bare name becomes its identifier, which is what a model means by
+    ``[search_files(src)]``. Anything else is reduced to its source text, never
+    evaluated — this is a parser, not an execution path.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _read_arg(node.value)
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return ast.dump(node)
+
+
+def _parse_call_expr(body: str) -> Optional[ToolCall]:
+    """Parse ``name(arg=value, …)`` — the Qwen call dialect.
+
+    Uses ``ast.parse`` and reads the tree. The expression is *never* compiled or
+    evaluated, so this is a parser and not an execution path; the only reason
+    ``ast`` is used rather than a regex is that argument values can be nested
+    literals, and splitting on commas inside them is wrong.
+    """
+    if not body:
+        return None
+    match = _CALL_EXPR.match(body)
+    if not match:
+        return None
+    name, raw_args = match.group(1), match.group(2)
+
+    params: Dict[str, Any] = {}
+    if raw_args.strip():
+        try:
+            tree = ast.parse(f"f({raw_args})", mode="eval")
+        except (SyntaxError, ValueError, MemoryError, RecursionError):
+            return None
+        node = tree.body
+        if not isinstance(node, ast.Call):  # pragma: no cover - regex guarantees
+            return None
+        for index, arg in enumerate(node.args):
+            try:
+                params[f"arg{index}"] = ast.literal_eval(arg)
+            except (ValueError, SyntaxError):
+                # A bare identifier such as `[search_files(src)]` is the common
+                # case, and a model means the *name*. `ast.dump` would turn it
+                # into "Name(id='src', ctx=Load())", which then travels into the
+                # observation text as noise.
+                params[f"arg{index}"] = _read_arg(arg)
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                continue  # `**kwargs` splat, not expressible here
+            try:
+                params[keyword.arg] = ast.literal_eval(keyword.value)
+            except (ValueError, SyntaxError):
+                params[keyword.arg] = _read_arg(keyword.value)
+
+    return ToolCall(name=name, params=params, raw=body)
+
+
+def _parse_call_body(body: str) -> Optional[ToolCall]:
+    """Parse the inside of a tagged call: JSON object, or a bare name."""
+    if not body:
+        # An empty tag is not a call. Guarded explicitly because the bare-name
+        # branch below indexes `split()[0]`, and an empty body makes that an
+        # IndexError -- which would abort the whole turn rather than just this
+        # one call.
+        return None
+    if body.startswith("{"):
+        try:
+            parsed = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        name = next(
+            (parsed[k] for k in _ACTION_KEYS if isinstance(parsed.get(k), str)), None
+        )
+        if not name:
+            return None
+        params = parsed.get("params")
+        if not isinstance(params, dict):
+            params = {k: v for k, v in parsed.items() if k not in _ACTION_KEYS}
+        return ToolCall(name=name.strip(), params=params, raw=body)
+
+    # Bare form. Take the first whitespace-delimited token, so
+    # "get_time now please" is still a get_time call rather than a bogus tool.
+    name = body.split()[0].strip().strip("\"'`.,;:")
+    if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    return ToolCall(name=name, params={}, raw=body)
+
+
+def looks_like_tool_call(text: str) -> bool:
+    """Whether ``text`` is still shaped like an unparsed tool call.
+
+    Used as a guard: text that looks like this is a *parse failure*, and
+    returning it to the user as the assistant's answer is worse than admitting
+    the model did not comply.
+
+    Deliberately broad. The model has now demonstrated three different
+    tool-call dialects in four identical live runs, so this cannot be a list of
+    the forms we happen to have implemented — it asks "does this contain
+    tool-call machinery at all?", and defaults to yes.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    # Any mention of the convention, in any dialect.
+    if "tool_call" in stripped.lower() or "toolcall" in stripped.lower():
+        return True
+    # Qwen's special tokens.
+    if "<|" in stripped and "|>" in stripped:
+        return True
+    # A lone tool name in angle brackets, e.g. "<get_time>".
+    if re.fullmatch(r"</?\s*[A-Za-z_][A-Za-z0-9_]*\s*>", stripped):
+        return True
+    # A bracketed call expression with no prose around it, e.g. "[get_time()]".
+    if _CALL_EXPR.match(stripped) and len(stripped) <= 200:
+        return True
+    return False
+
+
 @dataclass
 class ToolCall:
     """One parsed request to run a tool."""
@@ -153,49 +357,73 @@ def extract_tool_calls(text: str) -> Tuple[List[ToolCall], str]:
     Deliberately forgiving: a model that wraps its JSON in a ```json fence, or
     prefixes it with "Sure, I'll open that:", still parses. An object that
     fails to parse is left as prose rather than dropped, so nothing is lost.
+
+    Two forms are recognised, and they are **not** independent: the tagged form
+    is tried first and wins any overlap, because ``<tool_call>{"action":
+    "x"}</tool_call>`` contains a JSON object that the plain scanner would
+    otherwise claim. Overlap resolution is why that case yields one call rather
+    than two.
     """
     if not text:
         return [], ""
 
-    calls: List[ToolCall] = []
-    consumed: List[Tuple[int, int]] = []
+    accepted: List[Tuple[int, int, ToolCall]] = []
+    taken: List[Tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(not (end <= s or start >= e) for s, e in taken)
+
+    for start, end, call in _iter_tag_calls(text):
+        if overlaps(start, end):
+            continue
+        accepted.append((start, end, call))
+        taken.append((start, end))
 
     for start, end, raw in _iter_json_objects(text):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
+        if overlaps(start, end):
             continue
-        if not isinstance(parsed, dict):
+        call = _parse_json_object(raw)
+        if call is None:
             continue
+        accepted.append((start, end, call))
+        taken.append((start, end))
 
-        name = next(
-            (parsed[k] for k in _ACTION_KEYS if isinstance(parsed.get(k), str)),
-            None,
-        )
-        if not name:
-            continue
-
-        params = parsed.get("params")
-        if not isinstance(params, dict):
-            # Flat form: {"action": "x", "path": "y"}
-            params = {k: v for k, v in parsed.items() if k not in _ACTION_KEYS}
-        calls.append(ToolCall(name=name.strip(), params=params, raw=raw))
-        consumed.append((start, end))
-
-    if not consumed:
+    if not accepted:
         return [], text
 
-    # Reassemble the prose, dropping the JSON blocks.
+    # Reassemble the prose, dropping every recognised call.
     parts: List[str] = []
     cursor = 0
-    for start, end in consumed:
+    for start, end, _ in sorted(accepted):
         parts.append(text[cursor:start])
         cursor = end
     parts.append(text[cursor:])
     leftover = "".join(parts).strip()
     # Strip a code fence left behind by the removed block.
     leftover = leftover.replace("```json", "").replace("```", "").strip()
-    return calls, leftover
+    return [call for _, _, call in sorted(accepted)], leftover
+
+
+def _parse_json_object(raw: str) -> Optional[ToolCall]:
+    """Turn one balanced ``{...}`` into a :class:`ToolCall`, or ``None``."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    name = next(
+        (parsed[k] for k in _ACTION_KEYS if isinstance(parsed.get(k), str)), None
+    )
+    if not name:
+        return None
+
+    params = parsed.get("params")
+    if not isinstance(params, dict):
+        # Flat form: {"action": "x", "path": "y"}
+        params = {k: v for k, v in parsed.items() if k not in _ACTION_KEYS}
+    return ToolCall(name=name.strip(), params=params, raw=raw)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +506,17 @@ SYSTEM_AR = """\
 def build_system_prompt(catalogue: str, language: str = "en") -> str:
     template = SYSTEM_AR if language == "ar" else SYSTEM_EN
     return template.replace("{catalogue}", catalogue)
+
+
+#: Shown when the model twice replies in a format neither scanner understands.
+#: Deliberately does not quote the offending text back at the user.
+_MALFORMED_REPLY = {
+    "en": (
+        "I could not get a usable response from the language model that time. "
+        "Please try rephrasing your request."
+    ),
+    "ar": "مقدرتش أجيب رد مفهوم من الموديل المرة دي. جرّب تطلب تاني.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +671,9 @@ class AgentEngine:
         failed: List[str] = []
         errors: List[str] = []
         last_prose = ""
+        #: One correction is allowed for a malformed reply. More than one and a
+        #: confused model just burns the budget.
+        nagged = False
 
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
@@ -448,6 +690,50 @@ class AgentEngine:
             calls, prose = extract_tool_calls(raw)
 
             if not calls:
+                # A reply that is *still* shaped like a tool call is a parse
+                # failure, not an answer. Returning it verbatim means the user
+                # sees "<tool_call>get_time</tool_call>" as the assistant's
+                # reply, which is what the live run did before the tagged form
+                # was taught to the parser. Nudge the model once; if it
+                # misbehaves again, say so rather than passing it on.
+                if looks_like_tool_call(prose or raw):
+                    if not nagged:
+                        nagged = True
+                        errors.append(
+                            "the model replied in an unrecognised tool-call format"
+                        )
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "That was not a reply I could use. Either send a "
+                                'tool call as {"action": "tool_name", "params": '
+                                "{...}} or answer the user in plain prose. "
+                                "Do not use XML tags."
+                            ),
+                        })
+                        continue
+
+                    # Second offence: stop. Reporting a malformed response is
+                    # honest; echoing the raw markup is not. Falling through to
+                    # the "no tool call, so this is the answer" branch here is
+                    # exactly the bug this guard exists to prevent.
+                    errors.append(
+                        "the model repeated an unrecognised tool-call format"
+                    )
+                    answer = _MALFORMED_REPLY.get(language, _MALFORMED_REPLY["en"])
+                    await bus.error(answer)
+                    await bus.response_chunk(answer, response_id=response_id)
+                    await bus.completed(reason="malformed_response", iterations=iteration)
+                    return LoopResult(
+                        text=answer,
+                        iterations=iteration,
+                        tool_calls=tool_names,
+                        failed_calls=failed,
+                        stopped_reason="malformed_response",
+                        errors=errors,
+                    )
+
                 # No tool call: this is the answer. Stream it as prose.
                 answer = prose or raw
                 await bus.response_chunk(answer, response_id=response_id)
@@ -533,7 +819,17 @@ class AgentEngine:
         for tool in self.registry.tools():
             required = tool.schema().get("required", [])
             signature = ", ".join(required) if required else "(no parameters)"
-            lines.append(f"- {tool.name}({signature}) [{tool.permission}] {tool.description}")
+            # `name` and `description` are abstract *methods* on BaseTool, not
+            # properties. Without the parens Python formats the bound method
+            # itself, so the model was being handed
+            #   - <bound method Calculator.name of <Calculator ...>>([safe]) <bound ...>
+            # and could not tell a single tool apart. Caught by driving the real
+            # registry; the unit test passed only because the test double's
+            # __repr__ happened to contain its name. There is now a regression
+            # test asserting no line contains "bound method".
+            lines.append(
+                f"- {tool.name()}({signature}) [{tool.permission}] {tool.description()}"
+            )
         return "\n".join(lines)
 
     async def _ask(

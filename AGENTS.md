@@ -353,7 +353,7 @@ explicitly told it plans but does not act.
 ## Tests
 
 ```bash
-# backend (1011 tests)
+# backend (1090 tests)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
@@ -370,10 +370,22 @@ npm run verify          # lint && test && build
 - Tests skip API-dependent tests when OpenRouter is unreachable.
 - `tests/test_llm_client.py` mocks all HTTP (including SSE) — no network needed.
 - `tests/test_websocket_confirmation.py` drives the real WS handler with a fake socket.
-- `tests/test_agent_engine.py` — the loop: nested-JSON extraction, observations,
-  the iteration budget, provider/tool failure recovery, declined confirmations,
-  and the guarantee that intermediate model output is never a response chunk.
+- `tests/test_agent_engine.py` — the loop: all three tool-call dialects, the
+  malformed-reply guard, observations, the iteration budget, provider/tool
+  failure recovery, declined confirmations, and the guarantee that intermediate
+  model output is never a response chunk.
   `frontend/src/hooks/useAgentEvents.test.jsx` covers the same events client-side.
+- `tests/test_router_routing.py` — routing **order**, not regexes. See above.
+
+> **A caution earned the hard way.** A passing suite is not the same as a
+> working product. `test_catalogue_shows_required_parameters` was green for
+> several commits while the tool catalogue handed the model
+> `<bound method Calculator.name of <Calculator ...>>` for every tool — the
+> assertion passed only because the test double's `__repr__` contained its
+> name. Everything downstream was broken and nothing noticed. The replacement
+> asserts `"bound method" not in catalogue` and runs against the real
+> 30-tool registry, because a double that can make a broken thing look fine is
+> worse than no double. Run the app.
 - `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
   and an exploding HTTP client proving no request is attempted for a billable model.
 - `tests/test_voice_routing.py` — locale normalisation, text-based language
@@ -531,14 +543,69 @@ back to the model. The engine consults that callback **only** when
 `registry.assess()` reports `RiskLevel.HIGH`, so `get_time` never needs a
 confirmation channel plumbed through it.
 
-Tool selection is JSON-in-text, not native function calling. The three
-allow-listed free models are a hard-coded set and one of them currently 403s;
-betting the product on a free endpoint advertising function-calling support is a
-worse trade than parsing text reliably. `ToolRegistry.openai_tools()` already
-emits the spec, so switching is a provider change rather than a rewrite. Note
-that a plain `{...}` regex cannot do the extraction — the documented call form
-*nests* `params`, so `agents/engine.py` uses a brace-matching scanner that is
-also string-aware.
+Tool selection is JSON-in-text, not native function calling. `ToolRegistry.openai_tools()`
+already emits the spec, so switching is a provider change rather than a rewrite.
+
+> **This decision was made on evidence, and the evidence complicates it.** A live
+> run against `qwen/qwen3.8-27b:free` showed the model using **three different
+> tool-call dialects** across identical requests: the documented JSON, a
+> `<\u200btool_call>name</tool_call>` pseudo-XML form, and Qwen's native
+> `<|tool_call_start|>[name(args)]<|tool_call_end|>`. All three are parsed now
+> (`_iter_tag_calls`), and `looks_like_tool_call()` is the backstop: anything
+> still shaped like tool-call machinery is treated as a **parse failure**, not
+> as an answer, so an unknown fourth dialect degrades to an honest apology
+> rather than to raw markup on screen. The call dialect is parsed with
+> `ast.parse` and read from the tree — never compiled, never evaluated.
+>
+> Note that a plain `{...}` regex cannot do the JSON extraction either: the
+> documented call form *nests* `params`, so `agents/engine.py` uses a
+> brace-matching scanner that is string-aware, and resolves overlaps explicitly
+> because the tagged and JSON scanners both match a tagged JSON call.
+
+## Router priority (ordering is the whole system)
+
+`KEYWORD_ROUTES` is an ordered list and `route()` returns on the **first**
+match, so the order *is* the priority system.
+
+It used to put the catch-all `(what|how|why|…) -> chat` above the specific
+rules. Every "what …" request therefore became `chat`, and the `what time`
+rule was unreachable dead code. The live run answered *"what time is it right
+now"* with "I don't have access to real-time data" while a `get_time` tool sat
+unused in the registry. The catch-all is now last, and new rules were added for
+git, `create_project`, `run_tests`, npm, file reads/writes, calculator,
+screenshot and volume.
+
+`tests/test_router_routing.py` guards the *ordering*, not the regexes:
+
+- every case in a 33-phrase table must reach its expected intent;
+- **no phrase may need the LLM to be routed** — the free tier 429s constantly
+  and on exhaustion the router defaults to `chat`, so tools would be unreachable
+  exactly when the model is busiest;
+- a rule may only be shadowed by one of equal-or-higher confidence (a broader
+  fallback placed after a specific rule is correct design, and demanding
+  otherwise would invert the table);
+- no intent class may be entirely unreachable;
+- no duplicate alternatives (`(create|create)` was real).
+
+## What the live run verified
+
+Driving the real backend over a real WebSocket, `C:\…\live_loop_probe.py`
+style — 3/3 on the three-step request *"create a folder, write a file inside
+it, read it back"*:
+
+- three chained calls across three iterations, real files on disk;
+- `create_folder` and `file_write` (tier `confirm`) each prompted;
+  `file_read` (tier `safe`) did **not** — the tier logic is right end to end;
+- run 2 and 3 reported *"probe_demo already exists"*: the model adapted from the
+  observation rather than retrying blindly;
+- no tool JSON ever reached the transcript;
+- Arabic works: `كم الساعة دلوقتي` → `get_time`, label `أشوف الوقت`.
+
+**The 429 is the real remaining risk.** `qwen/qwen3.8-27b:free` is rate-limited
+most of the time, and the `openrouter/free` fallback returns arbitrary free
+models — it answered `get_time` with the literal string `"User Safety: safe"`,
+which the loop accepted as a final answer. There is currently no quality floor
+on a fallback completion.
 
 ## Agent events
 

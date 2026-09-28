@@ -7,23 +7,55 @@ from .base_agent import BaseAgent
 
 logger = logging.getLogger("Zaytoon.RouterAgent")
 
+#: Ordered **most specific first**. `route()` returns on the first match, so
+#: order is the whole priority system, and a broad rule placed above a narrow
+#: one makes the narrow one unreachable.
+#:
+#: This list used to put the catch-all `(what|how|why|…) -> chat` on line 19,
+#: above the `what time` rule on line 24. Every "what …" request therefore
+#: became `chat`, and the time rule was dead code — a live run of "what time is
+#: it right now" went to FastAgent, which replied that it had no access to
+#: real-time data, while a `get_time` tool sat in the registry unused.
+#:
+#: `tests/test_router_routing.py` asserts that each rule is reachable, so this
+#: ordering cannot silently invert again.
 KEYWORD_ROUTES: list[tuple[re.Pattern, str, float]] = [
-    (re.compile(r"(remind|reminder|remind me|فكرني|ذكرني|تذكير|نبهني|save|schedule)"), "scheduling", 0.9),
+    # -- narrow, high-confidence phrasings --------------------------------
+    (re.compile(r"(what time|what date|current time|current date|what's the time|الوقت|الساعة|التاريخ|كام الساعة|ايه التاريخ|ange time|ange date)"), "tools", 0.95),
+    (re.compile(r"(what did we|what was|what did i|remember|last time|قبل|امبارح|ince|آخر مرة|فاكر|تفتكر)"), "memory", 0.85),
     (re.compile(r"(delete|حذف|remove|مسح|شيل)\s+(reminder|task|المهمة|التذكير)"), "scheduling", 0.85),
-    (re.compile(r"(list|show|display|all|عرض|المواعيد|المهام)\s*(reminders?|tasks?|المواعيد|المهام)"), "scheduling", 0.85),
-    (re.compile(r"(open|launch|start|close|stop|شغل|شغال|فتح|افتح|إغلاق|أغلق|اغلق|اقفل|قفل)\s*\w+"), "tools", 0.85),
-    (re.compile(r"(run|تشغيل|execute|نفذ)\s+(python|code|script|command|أمر|كود)"), "action", 0.9),
-    (re.compile(r"(search|بحث|ابحث|google|find|دور)"), "tools", 0.85),
-    (re.compile(r"(write|اكتب|type|اكتب|build|إنشاء|create|create)\s+(code|app|application|function|component|تطبيق|program|programme|صفحة)"), "code", 0.85),
-    (re.compile(r"(type|اكتب|paste|الصق)\s+.+"), "tools", 0.9),
-    (re.compile(r"(what|how|why|when|tell|explain|إيه|ازاي|ليه|امتى|قول|اشرح|عرفني)"), "chat", 0.7),
-    (re.compile(r"(hello|hi|hey|مرحبا|السلام|أهو|hi|hello)"), "chat", 0.95),
-    (re.compile(r"(analyze|حلل|plan|خطط|compare|قارن|compare|complex|complex)"), "complex", 0.8),
-    (re.compile(r"(remember|what did we|what was|what did i|last time|before|قبل|امبارح|ince|آخر مرة|فاكر|تفتكر)"), "memory", 0.85),
+    (re.compile(r"(list|show|display|عرض)\s*(my\s+)?\s*(reminders?|tasks?|المواعيد|المهام)"), "scheduling", 0.85),
+    (re.compile(r"(git|commit|push|pull|branch|merge|rebase|stash)"), "tools", 0.9),
+    (re.compile(r"(create|new|generate|build)\s+(a\s+)?(react|node|python|flask|django|html|project|app|application|تطبيق|مشروع)"), "code", 0.85),
+    (re.compile(r"(run|تشغيل|execute|نفذ)\s+(the\s+)?(tests?|test suite|اختبارات)"), "code", 0.85),
+    (re.compile(r"(npm|yarn|pnpm|pip|install)"), "tools", 0.85),
+    (re.compile(r"(read|open|cat)\s+(the\s+)?file|(file)\s+\w+\.(py|js|jsx|txt|md|json|toml)"), "tools", 0.85),
+    (re.compile(r"(write|save|create)\s+(a\s+)?(file|script)"), "tools", 0.9),
+    (re.compile(r"(rename|move|copy)\s+(the\s+)?file"), "tools", 0.9),
     (re.compile(r"(weather|temperature|الطقس|درجة الحرارة|news|أخبار)"), "tools", 0.8),
-    (re.compile(r"(what time|what date|current time|current date|الوقت|الساعة|التاريخ|كام الساعة|ايه التاريخ|ange time|ange date)"), "tools", 0.95),
+    (re.compile(r"(system|حالة|systeminfo|mعلومات|إحصائيات|stats)"), "tools", 0.8),
+    (re.compile(r"(calculate|compute|calculator|احسب|حسب)"), "tools", 0.85),
+    (re.compile(r"(screenshot|screen shot|صورة الشاشة|سكرين شوت)"), "tools", 0.85),
+    (re.compile(r"(volume|صوت|كتم|c mute)"), "tools", 0.85),
+
+    # -- verbs that imply acting on the machine ----------------------------
+    (re.compile(r"(remind|reminder|فكرني|ذكرني|تذكير|نبهني)"), "scheduling", 0.9),
+    (re.compile(r"\b(schedule)\b"), "scheduling", 0.9),
+    (re.compile(r"(open|launch|start|close|stop|شغل|شغال|فتح|افتح|إغلاق|أغلق|اغلق|اقفل|قفل)\s*\w+"), "tools", 0.85),
+    (re.compile(r"(run|تشغيل|execute|نفذ)\s+(?:\w+\s+){0,2}(python|code|script|command|أمر|كود)"), "action", 0.9),
+    (re.compile(r"(search|بحث|ابحث|google|دور)"), "tools", 0.85),
+    (re.compile(r"(write|اكتب|build|إنشاء)\s+(code|app|application|function|component|تطبيق|برنامج|صفحة)"), "code", 0.85),
+    (re.compile(r"(type|اكتب|paste|الصق)\s+.+"), "tools", 0.9),
+    (re.compile(r"(analyze|حلل|plan|خطط|compare|قارن)"), "complex", 0.8),
     (re.compile(r"(date|time|الوقت|الساعة|التاريخ|اليوم)"), "tools", 0.85),
-    (re.compile(r"(system|حالة|systeminfo|info|معلومات|إحصائيات|stats)"), "tools", 0.8),
+
+    # -- greetings ---------------------------------------------------------
+    (re.compile(r"^\s*(hello|hi|hey|مرحبا|السلام|أهلا|ازيك)[\s!.,?]*$"), "chat", 0.95),
+
+    # -- catch-all. MUST stay last: it matches the opening word of almost any
+    # English question, so anything above it that starts with "what", "how" or
+    # "when" is unreachable.
+    (re.compile(r"(what|how|why|when|tell|explain|إيه|ازاي|ليه|امتى|قول|اشرح|عرفني)"), "chat", 0.7),
 ]
 
 
