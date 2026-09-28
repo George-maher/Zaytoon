@@ -69,6 +69,10 @@ class EventType(str, Enum):
     REQUIRE_CONFIRMATION = "require_confirmation"
     CONFIRMATION_RESULT = "confirmation_result"
     ERROR = "error"
+    REMINDER = "reminder"
+    REMINDER_LIST = "reminder_list"
+    REMINDER_DELETED = "reminder_deleted"
+    REMINDER_DONE = "reminder_done"
     UNKNOWN = "unknown"
 
 

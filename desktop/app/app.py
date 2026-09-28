@@ -353,6 +353,26 @@ class ZaytoonApp:
             self.panel.set_busy(False)
             self._set_status("error")
             return
+        if event.type is protocol.EventType.REMINDER:
+            message = event.data.get("message", "Reminder")
+            self.panel.add_message("system", f"⏰ {message}")
+            if self.tray.available:
+                self.tray.notify("Zaytoon Reminder", message)
+            return
+        if event.type is protocol.EventType.REMINDER_LIST:
+            reminders = event.data.get("reminders", [])
+            self.panel.show_reminders(reminders)
+            return
+        if event.type is protocol.EventType.REMINDER_DELETED:
+            reminder_id = event.data.get("id")
+            if reminder_id is not None:
+                self.panel.remove_reminder(reminder_id)
+            return
+        if event.type is protocol.EventType.REMINDER_DONE:
+            reminder_id = event.data.get("id")
+            if reminder_id is not None:
+                self.panel.remove_reminder(reminder_id)
+            return
 
     def _set_status(self, status: str) -> None:
         self.status = status

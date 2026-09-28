@@ -342,3 +342,23 @@ class ChatPanel(ctk.CTkToplevel):
     @property
     def awaiting_confirmation(self) -> bool:
         return self._pending_confirmation is not None
+
+    # -- reminders ----------------------------------------------------------
+    def show_reminders(self, reminders: list[dict]) -> None:
+        """Display a list of reminders in the transcript."""
+        if not reminders:
+            self.add_message("system", "No pending reminders.")
+            return
+        for r in reminders:
+            rid = r.get("reminder_id") or r.get("id")
+            task = r.get("task") or r.get("title", "?")
+            time_raw = r.get("scheduled_time") or r.get("remind_time", "")
+            rec = r.get("recurring", "none")
+            rec_label = f" ({rec})" if rec and rec != "none" else ""
+            self.add_message("system", f"#{rid}: {task} @ {time_raw}{rec_label}")
+
+    def remove_reminder(self, reminder_id: int) -> None:
+        """Remove a reminder from the transcript by its ID."""
+        # Since reminders are added as system messages, we can't easily remove
+        # a specific one without tracking. For now, add a confirmation message.
+        self.add_message("system", f"✅ Reminder #{reminder_id} completed.")
