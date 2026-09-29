@@ -11,7 +11,25 @@ Design notes
   confined to the two classes below.
 * Audio is captured as mono 16-bit PCM at the configured rate, which is exactly
   what ``faster-whisper`` wants, so no conversion happens before the upload.
+* TTS audio from the backend is **MP3** (from edge-tts) and must be decoded
+  to PCM before being fed to the audio output stream.
 """
+
+# Audio decoder for TTS chunks
+import io
+import threading
+
+try:
+    from pydub import AudioSegment
+    _PYDUB_AVAILABLE = True
+except ImportError:
+    _PYDUB_AVAILABLE = False
+
+try:
+    import ffmpeg
+    _FFMPEG_AVAILABLE = True
+except ImportError:
+    _FFMPEG_AVAILABLE = False
 
 from __future__ import annotations
 
@@ -32,6 +50,103 @@ try:
     import sounddevice as sd
 except ImportError:  # pragma: no cover
     sd = None  # type: ignore[assignment]
+
+#: Bytes per sample for 16-bit mono audio.
+BYTES_PER_SAMPLE = 2
+
+
+# ---------------------------------------------------------------------------
+# MP3 to PCM Decoder
+# ---------------------------------------------------------------------------
+class Mp3Decoder:
+    """Decodes MP3 audio chunks to 16-bit PCM for playback.
+    
+    Uses pydub (which uses ffmpeg) for robust MP3 decoding with proper
+    frame boundary handling. Falls back to ffmpeg-python if pydub unavailable.
+    """
+    
+    def __init__(self, target_sample_rate: int = 24000, target_channels: int = 1):
+        self.target_sample_rate = target_sample_rate
+        self.target_channels = target_channels
+        self._mp3_buffer = bytearray()
+        self._initialized = False
+        
+    def _init_decoder(self):
+        """Initialize the MP3 decoder."""
+        if self._initialized:
+            return
+        self._initialized = True
+        
+    def decode(self, mp3_chunk: bytes) -> bytes:
+        """Decode an MP3 chunk to 16-bit PCM bytes.
+        
+        Returns empty bytes if the chunk doesn't contain a complete frame.
+        """
+        if not mp3_chunk:
+            return b""
+            
+        self._init_decoder()
+        self._mp3_buffer = getattr(self, '_mp3_buffer', bytearray())
+        self._mp3_buffer.extend(mp3_chunk)
+        
+        if not _PYDUB_AVAILABLE:
+            return self._decode_with_ffmpeg(mp3_chunk)
+            
+        try:
+            mp3_data = bytes(self._mp3_buffer)
+            
+            # Try to decode - pydub needs a complete MP3 frame
+            audio = AudioSegment.from_file(
+                io.BytesIO(mp3_data), 
+                format="mp3"
+            )
+            
+            # Convert to target format
+            audio = audio.set_frame_rate(self.target_sample_rate)
+            audio = audio.set_channels(self.target_channels)
+            audio = audio.set_sample_width(2)  # 16-bit
+            
+            # Clear buffer since we successfully decoded
+            self._mp3_buffer = bytearray()
+            
+            return audio.raw_data
+            
+        except Exception:
+            # Not enough data for a complete frame, or decode error
+            if len(self._mp3_buffer) > 100000:  # 100KB buffer limit
+                self._mp3_buffer = bytearray()
+            return b""
+            
+    def _decode_with_ffmpeg(self, mp3_chunk: bytes) -> bytes:
+        """Fallback decoder using ffmpeg-python."""
+        if not _FFMPEG_AVAILABLE:
+            return b""
+            
+        try:
+            process = (
+                ffmpeg
+                .input('pipe:0', format='mp3')
+                .output('pipe:1', format='s16le', acodec='pcm_s16le', 
+                       ar=str(self.target_sample_rate), ac=self.target_channels)
+                .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True)
+            )
+            pcm_data, _ = process.communicate(input=mp3_chunk, timeout=5)
+            return pcm_data
+        except Exception:
+            return b""
+            
+    def flush(self) -> bytes:
+        """Flush any remaining buffered data."""
+        buffer = getattr(self, '_mp3_buffer', bytearray())
+        if buffer:
+            self._mp3_buffer = bytearray()
+            return self.decode(bytes(buffer))
+        return b""
+        
+    def reset(self):
+        """Reset the decoder state."""
+        self._mp3_buffer = bytearray()
+
 
 #: Bytes per sample for 16-bit mono audio.
 BYTES_PER_SAMPLE = 2
@@ -278,6 +393,9 @@ class AudioPlayer:
     Chunks are pushed with :meth:`play` and drained by a PortAudio callback
     reading from a byte ring, so the next chunk can be enqueued while the
     current one is still playing.
+    
+    The backend sends MP3 audio chunks (from edge-tts) which are decoded
+    to 16-bit PCM on-the-fly before being fed to the audio output stream.
     """
 
     def __init__(self, *, sample_rate: int = 24000, device: str | None = None) -> None:
@@ -288,6 +406,8 @@ class AudioPlayer:
         self._stream = None
         self._playing = threading.Event()
         self._current = b""
+        # MP3 decoder for edge-tts output (which is MP3)
+        self._decoder = Mp3Decoder(target_sample_rate=sample_rate, target_channels=1)
 
     @property
     def playing(self) -> bool:
@@ -341,14 +461,23 @@ class AudioPlayer:
             except Exception as exc:  # pragma: no cover
                 logger.debug("error closing output stream: %s", exc)
 
-    def play(self, pcm: bytes) -> None:
-        if not pcm:
+    def play(self, mp3_chunk: bytes) -> None:
+        """Queue an MP3 chunk for playback. Decodes to PCM internally."""
+        if not mp3_chunk:
             return
-        with self._lock:
-            self._pending.append(pcm)
-        self._playing.set()
+        # Decode MP3 to PCM
+        pcm = self._decoder.decode(mp3_chunk)
+        if pcm:
+            with self._lock:
+                self._pending.append(pcm)
+            self._playing.set()
 
     def clear(self) -> None:
+        # Flush any remaining buffered MP3 data
+        pcm = self._decoder.flush()
+        if pcm:
+            with self._lock:
+                self._pending.append(pcm)
         with self._lock:
             self._pending.clear()
             self._current = b""
