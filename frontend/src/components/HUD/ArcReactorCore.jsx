@@ -1,35 +1,27 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import gsap from "gsap";
 
-export default function ArcReactorCore({ status = "idle" }) {
-  const containerRef = useRef(null);
-  const coreRef = useRef(null);
-  const ring1Ref = useRef(null);
-  const ring2Ref = useRef(null);
-  const ring3Ref = useRef(null);
+/**
+ * ArcReactorCore - The central visual element representing Zaytoon's "brain"
+ * Animated rings with status-based color changes
+ */
+export default memo(function ArcReactorCore({ status = "idle", size = 200 }) {
   const glowRef = useRef(null);
+  const ringsRef = useRef([]);
 
   useEffect(() => {
     const ctx = gsap.context(() => {
-      gsap.to(ring1Ref.current, {
-        rotation: 360,
-        duration: 20,
-        repeat: -1,
-        ease: "none",
+      // Rotate rings at different speeds
+      ringsRef.current.forEach((ring, i) => {
+        if (!ring.current) return;
+        gsap.to(ring.current, {
+          rotation: i % 2 === 0 ? 360 : -360,
+          duration: 20 + i * 10,
+          repeat: -1,
+          ease: "none",
+        });
       });
-      gsap.to(ring2Ref.current, {
-        rotation: -360,
-        duration: 30,
-        repeat: -1,
-        ease: "none",
-      });
-      gsap.to(ring3Ref.current, {
-        rotation: 360,
-        duration: 45,
-        repeat: -1,
-        ease: "none",
-      });
-    }, containerRef);
+    }, ringsRef.current);
     return () => ctx.revert();
   }, []);
 
@@ -63,6 +55,15 @@ export default function ArcReactorCore({ status = "idle" }) {
           yoyo: true,
           ease: "sine.inOut",
         });
+      } else if (status === "awaiting_confirmation") {
+        gsap.to(glowRef.current, {
+          scale: 1.1,
+          opacity: 0.8,
+          duration: 0.5,
+          repeat: -1,
+          yoyo: true,
+          ease: "sine.inOut",
+        });
       } else {
         gsap.to(glowRef.current, {
           scale: 1,
@@ -82,71 +83,99 @@ export default function ArcReactorCore({ status = "idle" }) {
       case "listening": return "rgba(0, 255, 136, 0.6)";
       case "thinking": return "rgba(0, 212, 255, 0.8)";
       case "speaking": return "rgba(0, 240, 255, 0.7)";
+      case "awaiting_confirmation": return "rgba(255, 179, 71, 0.7)";
+      case "error": return "rgba(255, 51, 85, 0.7)";
       default: return "rgba(0, 212, 255, 0.4)";
     }
   };
 
   const getCoreColor = () => {
     switch (status) {
-      case "listening": return "#00ff88";
-      case "thinking": return "#00d4ff";
-      case "speaking": return "#00f0ff";
-      default: return "#00d4ff";
+      case "listening": return "#00FF88";
+      case "thinking": return "#00D4FF";
+      case "speaking": return "#00F0FF";
+      case "awaiting_confirmation": return "#FFB347";
+      case "error": return "#FF3355";
+      default: return "#00D4FF";
     }
   };
 
   return (
-    <div ref={containerRef} className="relative w-48 h-48 flex items-center justify-center">
+    <div className="relative" style={{ width: size, height: size }}>
       {/* Outer glow */}
-      <div ref={glowRef} className="absolute inset-0 rounded-full" style={{
-        background: `radial-gradient(circle, ${getGlowColor()} 0%, transparent 70%)`,
-        filter: "blur(20px)",
-      }} />
+      <div
+        ref={glowRef}
+        className="absolute inset-0 rounded-full"
+        style={{
+          background: `radial-gradient(circle, ${getGlowColor()} 0%, transparent 70%)`,
+          filter: "blur(24px)",
+          opacity: 0.6,
+        }}
+      />
 
-      {/* Outer ring */}
-      <svg ref={ring3Ref} className="absolute inset-0 w-full h-full" viewBox="0 0 200 200">
-        <circle cx="100" cy="100" r="95" fill="none" stroke="rgba(0,212,255,0.08)" strokeWidth="0.5" />
-        <circle cx="100" cy="100" r="95" fill="none" stroke={getCoreColor()} strokeWidth="1"
-          strokeDasharray="8 180" opacity="0.4" />
-        <circle cx="100" cy="100" r="95" fill="none" stroke={getCoreColor()} strokeWidth="0.5"
-          strokeDasharray="3 250" strokeDashoffset="60" opacity="0.3" />
-      </svg>
-
-      {/* Middle ring */}
-      <svg ref={ring2Ref} className="absolute inset-3 w-[calc(100%-24px)] h-[calc(100%-24px)]" viewBox="0 0 200 200">
-        <circle cx="100" cy="100" r="88" fill="none" stroke="rgba(0,212,255,0.1)" strokeWidth="0.5" />
-        <circle cx="100" cy="100" r="88" fill="none" stroke={getCoreColor()} strokeWidth="1.5"
-          strokeDasharray="12 140" opacity="0.35" />
-        <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(0,240,255,0.06)" strokeWidth="0.5"
-          strokeDasharray="4 60" />
-      </svg>
-
-      {/* Inner ring */}
-      <svg ref={ring1Ref} className="absolute inset-6 w-[calc(100%-48px)] h-[calc(100%-48px)]" viewBox="0 0 200 200">
-        <circle cx="100" cy="100" r="75" fill="none" stroke="rgba(0,212,255,0.12)" strokeWidth="0.5" />
-        <circle cx="100" cy="100" r="75" fill="none" stroke={getCoreColor()} strokeWidth="1"
-          strokeDasharray="6 100" strokeDashoffset="30" opacity="0.5" />
-        {/* Tick marks */}
-        {[0, 45, 90, 135, 180, 225, 270, 315].map((deg) => (
-          <line key={deg} x1="100" y1="25" x2="100" y2="30"
-            stroke={getCoreColor()} strokeWidth="0.8" opacity="0.3"
-            transform={`rotate(${deg} 100 100)`} />
+      {/* Rotating rings */}
+      <div className="absolute inset-0" style={{ transformStyle: "preserve-3d" }}>
+        {[0, 1, 2, 3].map((i) => (
+          <svg
+            key={i}
+            ref={(el) => { ringsRef.current[i] = el; }}
+            className="absolute inset-0 w-full h-full"
+            viewBox="0 0 200 200"
+            style={{
+              filter: i === 0 ? "blur(0.5px)" : "none",
+              opacity: 0.8 - i * 0.15,
+            }}
+          >
+            <circle
+              cx="100" cy="100" r={90 - i * 15}
+              fill="none"
+              stroke="rgba(0, 212, 255, 0.08)"
+              strokeWidth="0.5"
+            />
+            <circle
+              cx="100" cy="100" r={90 - i * 15}
+              fill="none"
+              stroke="#00D4FF"
+              strokeWidth={1}
+              strokeDasharray="8 180"
+              opacity="0.4"
+            />
+            <circle
+              cx="100" cy="100" r={90 - i * 15}
+              fill="none"
+              stroke="#00D4FF"
+              strokeWidth="0.5"
+              strokeDasharray="3 250"
+              strokeDashoffset={i * 60}
+              opacity="0.3"
+            />
+          </svg>
         ))}
-      </svg>
+      </div>
 
-      {/* Core circle */}
-      <div ref={coreRef} className="relative z-10 w-20 h-20 rounded-full flex items-center justify-center" style={{
+      {/* Core */}
+      <div className="relative z-10 flex items-center justify-center" style={{
+        width: size * 0.35,
+        height: size * 0.35,
         background: `radial-gradient(circle, ${getCoreColor()}22 0%, transparent 70%)`,
-        border: `1.5px solid ${getCoreColor()}55`,
+        border: `2px solid ${getCoreColor()}55`,
+        borderRadius: "50%",
         boxShadow: `0 0 30px ${getCoreColor()}33, inset 0 0 20px ${getCoreColor()}11`,
       }}>
-        <div className="w-12 h-12 rounded-full flex items-center justify-center" style={{
+        <div style={{
+          width: "60%",
+          height: "60%",
+          borderRadius: "50%",
+          background: `radial-gradient(circle, ${getCoreColor()}33 0%, transparent 70%)`,
           border: `1px solid ${getCoreColor()}44`,
           boxShadow: `0 0 15px ${getCoreColor()}22`,
         }}>
-          <span className="text-lg font-display font-bold" style={{
+          <span style={{
             color: getCoreColor(),
             textShadow: `0 0 12px ${getCoreColor()}88`,
+            fontSize: "1.5rem",
+            fontWeight: 700,
+            fontFamily: "Orbitron, monospace",
           }}>Z</span>
         </div>
       </div>
@@ -160,4 +189,4 @@ export default function ArcReactorCore({ status = "idle" }) {
       </svg>
     </div>
   );
-}
+});

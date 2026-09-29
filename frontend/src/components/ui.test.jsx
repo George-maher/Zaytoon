@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import InputBar from './InputBar'
 import SettingsPanel from './SettingsPanel'
-import BottomDock from './HUD/BottomDock'
+import BottomDock from './BottomDock'
 
 // ---------------------------------------------------------------------------
 describe('InputBar', () => {

@@ -1,13 +1,9 @@
-import { useRef, useCallback, useEffect } from "react";
+import { memo, useRef, useCallback, useEffect } from "react";
 
 /**
- * Text composer.
- *
- * This component was fully implemented but never imported, which is why the
- * web app was voice-only: a complete `sendMessage` path existed in the hook
- * and nothing rendered a field to reach it.
+ * InputBar - Text composer with voice activation
  */
-export default function InputBar({
+export default memo(function InputBar({
   onSend,
   isConnected,
   language,
@@ -39,9 +35,9 @@ export default function InputBar({
     [handleSubmit],
   );
 
-  // Keep focus on the composer so a reply can be followed by typing. Guarded on
-  // `document.activeElement === document.body` so focus is never stolen from a
-  // dialog or another control the user is using.
+  // Keep focus on the composer so a reply can be followed by typing.
+  // Guarded on `document.activeElement === document.body` so focus is never stolen
+  // from a dialog or another control the user is using.
   useEffect(() => {
     if (isConnected && document.activeElement === document.body) {
       inputRef.current?.focus();
@@ -54,7 +50,7 @@ export default function InputBar({
       style={{
         background: "rgba(5, 5, 15, 0.8)",
         border: "1px solid var(--border-color)",
-        borderRadius: "0.125rem",
+        borderRadius: "var(--radius-sm)",
       }}
     >
       <div className="flex-1 relative min-w-0">
@@ -66,7 +62,7 @@ export default function InputBar({
             background: "rgba(0, 212, 255, 0.04)",
             border: "1px solid rgba(0, 212, 255, 0.12)",
             color: "var(--text-primary)",
-            caretColor: "#00d4ff",
+            caretColor: "#00D4FF",
           }}
           dir={language === "ar" ? "rtl" : "ltr"}
           onKeyDown={handleKeyDown}
@@ -77,9 +73,7 @@ export default function InputBar({
           <button type="button" onClick={onVoiceStart}
             className="absolute top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center rounded-sm transition-all"
             style={{
-              color: "#00ff88",
-              // Logical property, so the button sits on the correct side in
-              // RTL rather than needing a mirrored right/left pair.
+              color: "#00FF88",
               insetInlineEnd: "0.375rem",
               background: "rgba(0, 255, 136, 0.08)",
               border: "1px solid rgba(0, 255, 136, 0.2)",
@@ -97,10 +91,10 @@ export default function InputBar({
         )}
       </div>
       <button type="submit" disabled={!isConnected}
-        className="px-4 py-2 rounded-sm text-[10px] font-display font-bold tracking-[0.15em] transition-all disabled:opacity-20 flex-none"
+        className="px-4 py-2 rounded-sm text-[9px] font-display font-bold tracking-[0.15em] transition-all disabled:opacity-20 flex-none"
         style={{
           background: "rgba(0, 212, 255, 0.1)",
-          color: "#00d4ff",
+          color: "#00D4FF",
           border: "1px solid rgba(0, 212, 255, 0.25)",
           textShadow: "0 0 10px rgba(0,212,255,0.3)",
         }}
@@ -115,10 +109,10 @@ export default function InputBar({
         }}
       >{language === "ar" ? "إرسال" : "SEND"}</button>
       {voiceMode && (
-        <span className="text-[8px] font-mono tracking-wider flex-none" style={{ color: "#00ff88" }}>
+        <span className="text-[7px] font-mono tracking-wider flex-none" style={{ color: "#00FF88" }}>
           {language === "ar" ? "الصوت مفعّل" : "VOICE ON"}
         </span>
       )}
     </form>
   );
-}
+});

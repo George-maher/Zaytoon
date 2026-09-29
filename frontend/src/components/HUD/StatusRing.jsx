@@ -1,7 +1,10 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import gsap from "gsap";
 
-export default function StatusRing({ status = "idle", size = 220 }) {
+/**
+ * StatusRing - Animated ring showing current status
+ */
+export default memo(function StatusRing({ status = "idle", size = 220 }) {
   const ringRef = useRef(null);
   const dashRef = useRef(null);
 
@@ -10,9 +13,12 @@ export default function StatusRing({ status = "idle", size = 220 }) {
     const ctx = gsap.context(() => {
       const speed = {
         idle: 12,
+        connected: 10,
         listening: 4,
         thinking: 1.5,
         speaking: 3,
+        awaiting_confirmation: 2,
+        awaiting_command: 6,
       }[status] || 12;
 
       gsap.to(dashRef.current, {
@@ -27,10 +33,14 @@ export default function StatusRing({ status = "idle", size = 220 }) {
 
   const getColor = () => {
     switch (status) {
-      case "listening": return "#00ff88";
-      case "thinking": return "#00d4ff";
-      case "speaking": return "#00f0ff";
-      default: return "#00d4ff";
+      case "listening": return "#00FF88";
+      case "thinking": return "#00D4FF";
+      case "speaking": return "#00F0FF";
+      case "awaiting_confirmation": return "#FFB347";
+      case "awaiting_command": return "#FFB347";
+      case "error": return "#FF3355";
+      case "connected": return "#00D4FF";
+      default: return "#00D4FF";
     }
   };
 
@@ -39,6 +49,8 @@ export default function StatusRing({ status = "idle", size = 220 }) {
       case "listening": return "0 0 20px rgba(0,255,136,0.3)";
       case "thinking": return "0 0 25px rgba(0,212,255,0.4)";
       case "speaking": return "0 0 20px rgba(0,240,255,0.3)";
+      case "awaiting_confirmation": return "0 0 25px rgba(255,179,71,0.4)";
+      case "error": return "0 0 20px rgba(255,51,85,0.4)";
       default: return "0 0 10px rgba(0,212,255,0.1)";
     }
   };
@@ -61,4 +73,4 @@ export default function StatusRing({ status = "idle", size = 220 }) {
       </svg>
     </div>
   );
-}
+});

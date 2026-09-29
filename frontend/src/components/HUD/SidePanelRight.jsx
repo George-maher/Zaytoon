@@ -1,6 +1,9 @@
-import { useState, useEffect, useRef } from "react";
+import { memo, useState, useEffect, useRef } from "react";
 
-export default function SidePanelRight({ messages = [], language = "en" }) {
+/**
+ * SidePanelRight - Right panel with weather, activity log
+ */
+export default memo(function SidePanelRight({ messages = [], language = "en" }) {
   const [notifications, setNotifications] = useState([]);
   const scrollRef = useRef(null);
 
@@ -18,17 +21,17 @@ export default function SidePanelRight({ messages = [], language = "en" }) {
   }, [messages, language]);
 
   return (
-    <div className="w-48 flex flex-col gap-3 p-3 animate-fade-in" style={{ animationDelay: "0.2s" }}>
+    <div className="w-52 flex flex-col gap-3 p-3 animate-fade-in" style={{ animationDelay: "0.2s" }}>
       {/* Weather placeholder */}
-      <div className="hud-glass-light rounded-sm p-3">
-        <div className="text-[8px] font-display tracking-[0.2em] mb-1" style={{ color: "var(--text-muted)" }}>
+      <div className="glass-light rounded-md p-3">
+        <div className="text-[7px] font-display tracking-[0.2em] mb-1" style={{ color: "var(--text-muted)" }}>
           {language === "ar" ? "الطقس" : "WEATHER"}
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-2xl">&#9728;</span>
+          <span className="text-2xl">☀️</span>
           <div>
-            <div className="text-sm font-display font-bold" style={{ color: "#00d4ff" }}>28&deg;C</div>
-            <div className="text-[9px] font-mono" style={{ color: "var(--text-secondary)" }}>
+            <div className="text-sm font-display font-bold" style={{ color: "#00D4FF" }}>28°C</div>
+            <div className="text-[8px] font-mono" style={{ color: "var(--text-secondary)" }}>
               {language === "ar" ? "القاهرة" : "Cairo"}
             </div>
           </div>
@@ -36,22 +39,22 @@ export default function SidePanelRight({ messages = [], language = "en" }) {
       </div>
 
       {/* Notifications / Activity Feed */}
-      <div className="hud-glass-light rounded-sm p-3 flex-1 flex flex-col min-h-0">
-        <div className="text-[8px] font-display tracking-[0.2em] mb-2" style={{ color: "var(--text-muted)" }}>
+      <div className="glass-light rounded-md p-3 flex-1 flex flex-col min-h-0">
+        <div className="text-[7px] font-display tracking-[0.2em] mb-2" style={{ color: "var(--text-muted)" }}>
           {language === "ar" ? "آخر النشاطات" : "ACTIVITY LOG"}
         </div>
         <div ref={scrollRef} className="flex-1 overflow-y-auto space-y-1.5 min-h-0">
           {notifications.length === 0 ? (
-            <div className="text-[9px] font-mono text-center py-4" style={{ color: "var(--text-muted)" }}>
+            <div className="text-[8px] font-mono text-center py-4" style={{ color: "var(--text-muted)" }}>
               {language === "ar" ? "لا نشاط بعد" : "No activity yet"}
             </div>
           ) : (
             notifications.map((n) => (
               <div key={n.id} className="p-1.5 rounded-sm animate-fade-in" style={{
                 background: n.type === "reminder" ? "rgba(0,255,136,0.04)" : "rgba(0,212,255,0.03)",
-                borderLeft: `2px solid ${n.type === "reminder" ? "#00ff88" : "#00d4ff"}33`,
+                borderLeft: `2px solid ${n.type === "reminder" ? "#00FF88" : "#00D4FF"}33`,
               }}>
-                <p className="text-[9px] font-mono leading-tight" style={{ color: "var(--text-secondary)" }}>
+                <p className="text-[8px] font-mono leading-tight" style={{ color: "var(--text-secondary)" }}>
                   {n.text}
                 </p>
                 <span className="text-[7px] font-mono" style={{ color: "var(--text-muted)" }}>{n.time}</span>
@@ -62,4 +65,4 @@ export default function SidePanelRight({ messages = [], language = "en" }) {
       </div>
     </div>
   );
-}
+});

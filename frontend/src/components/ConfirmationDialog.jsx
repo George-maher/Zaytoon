@@ -1,10 +1,8 @@
 import { memo, useEffect } from "react";
 
 /**
- * Human-in-the-loop approval prompt.
- *
- * Rendered when the backend reports a high-risk tool call. Nothing is executed
- * server-side until `onRespond(true)` arrives, so both buttons must be wired.
+ * ConfirmationDialog - Human-in-the-loop approval prompt
+ * Rendered when the backend reports a high-risk tool call
  */
 function ConfirmationDialog({ request, onRespond, language = "en" }) {
   const isArabic = language === "ar";
@@ -105,7 +103,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
             style={{
               background: "rgba(0, 0, 0, 0.45)",
               border: "1px solid rgba(255, 255, 255, 0.1)",
-              color: "#cfe8ff",
+              color: "#CFE8FF",
             }}
           >
             {Object.entries(request.params)
@@ -119,7 +117,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
           style={{
             background: "rgba(255, 51, 85, 0.06)",
             border: "1px solid rgba(255, 51, 85, 0.2)",
-            color: "#ffd7dd",
+            color: "#FFD7DD",
           }}
         >
           {request.text || request.summary || request.action}
@@ -131,9 +129,9 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
               <li
                 key={i}
                 className="text-[11px] flex items-start gap-2"
-                style={{ color: "#ff9aa8" }}
+                style={{ color: "#FF9AA8" }}
               >
-                <span style={{ color: "#ff3355" }}>▸</span>
+                <span style={{ color: "#FF3355" }}>▸</span>
                 <span>{reason}</span>
               </li>
             ))}
@@ -141,7 +139,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
         )}
 
         <div className="flex items-center justify-end gap-3">
-          <span className="text-[10px] tracking-wider" style={{ color: "#8888aa" }}>
+          <span className="text-[10px] tracking-wider" style={{ color: "#8888AA" }}>
             {hint}
           </span>
           <button
@@ -149,7 +147,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
             className="text-[11px] px-4 py-2 rounded-sm font-bold tracking-[0.2em] transition-all"
             style={{
               background: "rgba(255, 51, 85, 0.08)",
-              color: "#ff5a75",
+              color: "#FF5A75",
               border: "1px solid rgba(255, 51, 85, 0.35)",
             }}
           >
@@ -161,7 +159,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
             className="text-[11px] px-4 py-2 rounded-sm font-bold tracking-[0.2em] transition-all"
             style={{
               background: "rgba(0, 255, 136, 0.1)",
-              color: "#00ff88",
+              color: "#00FF88",
               border: "1px solid rgba(0, 255, 136, 0.4)",
               boxShadow: "0 0 12px rgba(0,255,136,0.2)",
             }}

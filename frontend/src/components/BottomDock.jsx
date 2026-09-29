@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { memo, useCallback } from "react";
 
 const ICONS = [
   {
@@ -16,7 +16,7 @@ const ICONS = [
   {
     id: "lang",
     label: "LANG",
-    icon: <span className="text-[10px] font-display font-bold">AR/EN</span>,
+    icon: <span className="text-[9px] font-display font-bold tracking-wider">AR/EN</span>,
   },
   {
     id: "settings",
@@ -39,7 +39,7 @@ const ICONS = [
   },
 ];
 
-export default function BottomDock({
+function BottomDock({
   onMicToggle,
   onLanguageToggle,
   onSettingsToggle,
@@ -59,7 +59,6 @@ export default function BottomDock({
           onLanguageToggle?.();
           break;
         case "settings":
-          // This case did not exist, so the CONF button was a no-op.
           onSettingsToggle?.();
           break;
         case "stop":
@@ -73,10 +72,10 @@ export default function BottomDock({
   );
 
   const getActiveColor = (id) => {
-    if (id === "mic" && voiceMode) return "#00ff88";
-    if (id === "settings" && settingsOpen) return "#00ff88";
-    if (id === "stop" && status === "speaking") return "#ff3355";
-    return "#00d4ff";
+    if (id === "mic" && voiceMode) return "#00FF88";
+    if (id === "settings" && settingsOpen) return "#00FF88";
+    if (id === "stop" && status === "speaking") return "#FF3355";
+    return "#00D4FF";
   };
 
   return (
@@ -92,18 +91,18 @@ export default function BottomDock({
             key={icon.id}
             onClick={() => handleClick(icon.id)}
             type="button"
-            aria-pressed={isActive}
             className="group relative w-11 h-11 rounded-full flex items-center justify-center transition-all duration-300"
             style={{
-              background: isActive ? `${color}15` : "rgba(0,212,255,0.04)",
-              border: `1px solid ${isActive ? `${color}44` : "rgba(0,212,255,0.12)"}`,
+              background: isActive ? `${color}15` : "rgba(0, 212, 255, 0.04)",
+              border: `1px solid ${isActive ? `${color}44` : "rgba(0, 212, 255, 0.12)"}`,
               color: isActive ? color : "var(--text-muted)",
               boxShadow: isActive ? `0 0 15px ${color}22` : "none",
             }}
             title={icon.label}
+            aria-pressed={isActive}
           >
             {icon.id === "lang" ? (
-              <span className="text-[9px] font-display font-bold">{language === "ar" ? "EN" : "AR"}</span>
+              <span className="text-[9px] font-display font-bold tracking-wider">{language === "ar" ? "EN" : "AR"}</span>
             ) : (
               icon.icon
             )}
@@ -119,3 +118,5 @@ export default function BottomDock({
     </div>
   );
 }
+
+export default memo(BottomDock);

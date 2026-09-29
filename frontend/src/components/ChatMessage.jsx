@@ -17,7 +17,7 @@ export default memo(function ChatMessage({ msg, language }) {
           background: "rgba(0, 212, 255, 0.03)",
           border: "1px solid rgba(0, 212, 255, 0.08)",
         }}>
-          <p className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>{msg.content}</p>
+          <p className="text-[9px] font-mono" style={{ color: "var(--text-muted)" }}>{msg.content}</p>
         </div>
       ) : (
         <div className={`max-w-[85%] rounded-sm px-3 py-2 ${msg.streaming ? "border-l-[2px]" : "border"}`}
@@ -29,34 +29,32 @@ export default memo(function ChatMessage({ msg, language }) {
             borderColor: isUser
               ? "rgba(0, 212, 255, 0.12)"
               : msg.streaming
-                ? "rgba(0, 240, 255, 0.3)"
-                : "rgba(0, 212, 255, 0.08)",
-            borderLeftColor: msg.streaming ? "#00f0ff" : undefined,
+              ? "rgba(0, 240, 255, 0.3)"
+              : "rgba(0, 212, 255, 0.08)",
+            borderLeftColor: msg.streaming ? "#00F0FF" : undefined,
             boxShadow: msg.streaming
               ? "0 0 20px rgba(0, 240, 255, 0.05)"
               : "none",
           }}
         >
           <p className="text-xs font-mono leading-relaxed whitespace-pre-wrap"
-            style={{ color: isUser ? "#b0c4ff" : "var(--text-primary)" }}
+            style={{ color: isUser ? "#B0C4FF" : "var(--text-primary)" }}
           >
             {msg.content}
             {msg.streaming && (
               <span className="inline-flex gap-[2px] ml-1.5 align-middle">
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00f0ff" }} />
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00f0ff" }} />
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00f0ff" }} />
+                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
+                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
+                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
               </span>
             )}
           </p>
           <div className="flex items-center gap-2 mt-1">
-            <span className="text-[8px] font-mono tracking-wider"
-              style={{ color: isUser ? "rgba(0, 212, 255, 0.5)" : "rgba(0, 240, 255, 0.5)" }}
-            >
+            <span className="text-[7px] font-mono tracking-wider" style={{ color: isUser ? "rgba(0, 212, 255, 0.5)" : "rgba(0, 240, 255, 0.5)" }}>
               {isUser ? (language === "ar" ? "أنت" : "YOU") : "ZAYTOON"}
             </span>
             {msg.streaming && (
-              <span className="text-[7px] font-mono" style={{ color: "rgba(0, 240, 255, 0.4)" }}>▍STREAM</span>
+              <span className="text-[6px] font-mono" style={{ color: "rgba(0, 240, 255, 0.4)" }}>▍STREAM</span>
             )}
           </div>
         </div>

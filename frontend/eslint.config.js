@@ -3,6 +3,7 @@ import globals from 'globals'
 import react from 'eslint-plugin-react'
 import reactHooks from 'eslint-plugin-react-hooks'
 import reactRefresh from 'eslint-plugin-react-refresh'
+import babelParser from '@babel/eslint-parser'
 
 /**
  * Flat ESLint config.
@@ -30,8 +31,15 @@ export default [
       ecmaVersion: 2022,
       sourceType: 'module',
       globals: { ...globals.browser, ...globals.es2021 },
+      parser: babelParser,
       parserOptions: {
+        ecmaVersion: 2022,
+        sourceType: 'module',
         ecmaFeatures: { jsx: true },
+        requireConfigFile: false,
+        babelOptions: {
+          presets: ['@babel/preset-react', '@babel/preset-env'],
+        },
       },
     },
     plugins: { react },

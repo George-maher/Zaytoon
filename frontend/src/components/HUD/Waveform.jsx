@@ -1,14 +1,18 @@
-import { useEffect, useRef, useMemo } from "react";
+import { memo, useEffect, useRef, useMemo } from "react";
 
-export default function Waveform({ analyserNode = null, isListening = false, isSpeaking = false }) {
+/**
+ * Waveform - Audio visualizer for listening/speaking states
+ * Renders real-time audio waveform when listening or speaking
+ */
+export default memo(function Waveform({ analyserNode = null, isListening = false, isSpeaking = false }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const dataArrayRef = useRef(null);
 
   const color = useMemo(() => {
-    if (isSpeaking) return "#00f0ff";
-    if (isListening) return "#00ff88";
-    return "#00d4ff";
+    if (isSpeaking) return "#00F0FF";
+    if (isListening) return "#00FF88";
+    return "#00D4FF";
   }, [isListening, isSpeaking]);
 
   useEffect(() => {
@@ -18,11 +22,27 @@ export default function Waveform({ analyserNode = null, isListening = false, isS
     const W = canvas.width;
     const H = canvas.height;
 
+    const drawIdleWave = (ctx, W, H, color) => {
+      const t = Date.now() / 1000;
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.2;
+      ctx.beginPath();
+      for (let x = 0; x < W; x++) {
+        const y = H / 2 + Math.sin(x * 0.02 + t * 0.8) * 4 + Math.sin(x * 0.05 + t * 1.2) * 2;
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    };
+
     const draw = () => {
       animRef.current = requestAnimationFrame(draw);
+      if (!ctx) return;
       ctx.clearRect(0, 0, W, H);
 
-      if (!analyserNode || !isListening && !isSpeaking) {
+      if (!analyserNode || (!isListening && !isSpeaking)) {
         drawIdleWave(ctx, W, H, color);
         return;
       }
@@ -83,19 +103,4 @@ export default function Waveform({ analyserNode = null, isListening = false, isS
       style={{ opacity: isListening || isSpeaking ? 1 : 0.3 }}
     />
   );
-}
-
-function drawIdleWave(ctx, W, H, color) {
-  const t = Date.now() / 1000;
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = color;
-  ctx.globalAlpha = 0.2;
-  ctx.beginPath();
-  for (let x = 0; x < W; x++) {
-    const y = H / 2 + Math.sin(x * 0.02 + t * 0.8) * 4 + Math.sin(x * 0.05 + t * 1.2) * 2;
-    if (x === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-}
+});

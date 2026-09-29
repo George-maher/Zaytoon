@@ -1,16 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { healthCheck, getWorkspace, setWorkspace } from "../lib/api";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { getWorkspace, healthCheck, setWorkspace } from "../lib/api";
 
 /**
  * Configuration panel.
  *
- * This is what the `CONF` button in the bottom dock was wired to visually but
- * not functionally — `BottomDock.handleClick` had no `case "settings"`, so the
- * button did nothing at all.
+ * Three things, in priority order:
  *
- * It exists for three reasons, in priority order:
- *
- * 1. **The workspace root.** Every file tool is confined to it via a
+ * 1. **The workspace root.** Every file tool is confined to it by a
  *    `commonpath` containment check, so it decides what the assistant can
  *    touch at all. It used to be settable only by editing `backend/.env` and
  *    restarting, which made the containment boundary effectively invisible.
@@ -18,8 +14,18 @@ import { healthCheck, getWorkspace, setWorkspace } from "../lib/api";
  *    cannot answer, and until now the UI gave no hint of that.
  * 3. **The model actually in use.** The side panel used to display a
  *    hard-coded "QWEN 2.5 7B" that matched no configured model.
+ *
+ * Two properties this must keep, both covered in `ui.test.jsx`:
+ *
+ * - **A failure is reported, never papered over.** An unreachable backend or a
+ *   rejected path shows what happened; it does not fall back to rendering the
+ *   last known-good values, which would look like a healthy system.
+ * - **The workspace is edited as a draft and committed explicitly.** The path
+ *   field used to POST on every keystroke, so typing "D:/" fired a
+ *   `POST /settings/workspace` per character and a partially-typed path was
+ *   rejected (and displayed) three times before the first valid one.
  */
-export default function SettingsPanel({ open, onClose, language = "en" }) {
+function SettingsPanel({ open, onClose, language = "en" }) {
   const ar = language === "ar";
 
   const [health, setHealth] = useState(null);
@@ -38,7 +44,11 @@ export default function SettingsPanel({ open, onClose, language = "en" }) {
       setWorkspaceState(w);
       setDraft(w.root || "");
     } catch (e) {
+      // Stale data is worse than none: an unreachable backend rendered with
+      // the last successful payload reads as a working system.
       setHealthError(e.message || String(e));
+      setHealth(null);
+      setWorkspaceState(null);
     }
   }, []);
 
@@ -89,24 +99,39 @@ export default function SettingsPanel({ open, onClose, language = "en" }) {
   const rejected = Array.isArray(llm.rejected_models) ? llm.rejected_models : [];
   const voice = health?.voice || {};
   const safety = health?.safety || {};
+  const dirty = draft.trim() && draft.trim() !== workspace?.root;
 
   return (
-    <>
-      <div className="fixed inset-0 z-40" onClick={onClose} />
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style={{ background: "rgba(3, 3, 8, 0.78)", backdropFilter: "blur(6px)" }}
+      role="dialog"
+      aria-modal="true"
+      aria-label={ar ? "الإعدادات" : "Settings"}
+    >
       <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={ar ? "الإعدادات" : "Settings"}
-        className="fixed right-3 top-12 z-50 w-96 max-h-[75vh] rounded-sm overflow-hidden flex flex-col animate-fade-in font-mono"
+        className="w-full max-w-lg max-h-[85vh] overflow-y-auto rounded-lg p-5 font-mono"
         style={{
-          background: "rgba(5, 5, 12, 0.97)",
-          border: "1px solid rgba(0, 212, 255, 0.18)",
-          backdropFilter: "blur(20px)",
-          boxShadow: "0 8px 40px rgba(0,0,0,0.6), 0 0 30px rgba(0,212,255,0.05)",
+          background: "rgba(8, 8, 18, 0.97)",
+          border: "1px solid rgba(0, 212, 255, 0.2)",
+          boxShadow: "0 0 50px rgba(0, 212, 255, 0.06)",
         }}
       >
-        <Header ar={ar} onClose={onClose} />
-        <div className="overflow-y-auto p-3 space-y-4" style={{ maxHeight: "calc(75vh - 40px)" }}>
+        <div className="flex items-center gap-2 mb-3">
+          <span
+            className="inline-block w-2.5 h-2.5 rounded-full"
+            style={{
+              background: healthError ? "#F0B000" : "#00D4FF",
+              boxShadow: `0 0 10px ${healthError ? "#F0B000" : "#00D4FF"}`,
+              animation: "pulse-ring 1.2s infinite",
+            }}
+          />
+          <h2 className="text-xs font-bold tracking-[0.25em]" style={{ color: "#00D4FF" }}>
+            {ar ? "الإعدادات" : "SETTINGS"}
+          </h2>
+        </div>
+
+        <div className="space-y-4">
           {healthError && (
             <Banner
               tone="error"
@@ -114,76 +139,211 @@ export default function SettingsPanel({ open, onClose, language = "en" }) {
             />
           )}
 
-          <Workspace
-            ar={ar}
-            workspace={workspace}
-            draft={draft}
-            setDraft={setDraft}
-            inputRef={inputRef}
-            saving={saving}
-            onSave={save}
-          />
+          {/* LLM */}
+          <Card title="LLM CONFIGURATION">
+            <Row
+              label={ar ? "المفتاح" : "API key"}
+              value={
+                llm.configured === false
+                  ? ar ? "مفقود" : "MISSING"
+                  : ar ? "موجود" : "present"
+              }
+              tone={llm.configured === false ? "error" : "ok"}
+            />
+            <Row
+              label={ar ? "النموذج" : "Model"}
+              value={llm.primary_model || "—"}
+              title={llm.primary_model}
+            />
+            <Row
+              label={ar ? "الاستدلال" : "Reasoning"}
+              value={llm.reasoning_model || "—"}
+              title={llm.reasoning_model}
+            />
+            {chain.length > 0 && (
+              <Row
+                label={ar ? "سلسلة احتياطية" : "Fallback chain"}
+                value={chain.map((c) => c.model).join(" → ")}
+                title={chain.map((c) => c.model).join(" → ")}
+              />
+            )}
 
-          {notice && (
-            <Banner tone={notice.ok ? "ok" : "error"} text={notice.text} />
-          )}
+            {/*
+              A rejected model is a policy event, not a detail: the free-only
+              rule is enforced on the request path, so a model appearing here
+              means it was requested and refused.
+            */}
+            {rejected.length > 0 && (
+              <div className="mt-2">
+                <Banner
+                  tone="error"
+                  text={`${ar ? "نماذج مرفوضة" : "Rejected models"}: ${rejected.join(", ")}`}
+                />
+              </div>
+            )}
 
-          <Llm ar={ar} llm={llm} chain={chain} metrics={metrics} rejected={rejected} />
-          <Voice ar={ar} voice={voice} />
-          <Safety ar={ar} safety={safety} health={health} />
+            {typeof metrics.requests === "number" && (
+              <>
+                <div className="mt-2 pt-2 border-t" style={{ borderColor: "var(--border-color)" }}>
+                  <span className="text-[7px] font-mono tracking-wider" style={{ color: "var(--text-muted)" }}>
+                    METRICS
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 mt-1">
+                  <Stat label="REQUESTS" value={metrics.requests} color="#00D4FF" />
+                  <Stat label="SUCCESS" value={metrics.success ?? 0} color="#00FF88" />
+                  <Stat label="RATE LIMITED" value={metrics.rate_limited ?? 0} color="#FF3355" />
+                  <Stat label="INVALID" value={metrics.invalid_completion_total ?? 0} color="#FF3355" />
+                  <Stat
+                    label="AVG LATENCY"
+                    value={`${metrics.avg_latency_ms ?? 0} ms`}
+                    color="#F0B000"
+                    wide
+                  />
+                </div>
+              </>
+            )}
+          </Card>
+
+          {/* Voice */}
+          <Card title="VOICE">
+            <Row label="STT" value={voice.stt ? "AVAILABLE" : "UNAVAILABLE"} tone={voice.stt ? "ok" : "error"} />
+            <Row label="TTS" value={voice.tts ? "AVAILABLE" : "UNAVAILABLE"} tone={voice.tts ? "ok" : "error"} />
+          </Card>
+
+          {/* Safety */}
+          <Card title="SAFETY">
+            <Row
+              label="TOOL SANDBOX"
+              value={safety.enabled ? "ENABLED" : "DISABLED"}
+              tone={safety.enabled ? "ok" : "error"}
+            />
+            <Row label="CONFIRM TIMEOUT" value={`${safety.confirm_timeout ?? 120}s`} />
+            <Row label="ALWAYS CONFIRM" value={safety.always_confirm || "—"} />
+            <Row label={ar ? "أدوات محمّلة" : "TOOLS LOADED"} value={health?.tools_loaded ?? 0} />
+          </Card>
+
+          {/* Workspace */}
+          <Card title={ar ? "مجلد العمل" : "WORKSPACE"}>
+            <p className="text-[8px] mb-2 leading-relaxed" style={{ color: "var(--text-muted)" }}>
+              {ar
+                ? "كل أدوات الملفات مقيّدة بهذا المجلد. أي مسار خارجه يُرفض."
+                : "Every file tool is confined to this directory. Any path outside it is refused."}
+            </p>
+            <div className="flex gap-2">
+              {/* dir="ltr": a Windows path must never be reordered by RTL. */}
+              <input
+                ref={inputRef}
+                type="text"
+                dir="ltr"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && save()}
+                disabled={saving}
+                spellCheck={false}
+                placeholder="D:/Projects"
+                className="flex-1 min-w-0 px-3 py-2 rounded-sm text-[9px] outline-none transition-all"
+                style={{
+                  background: "rgba(0, 212, 255, 0.04)",
+                  border: `1px solid ${dirty ? "rgba(240,176,0,0.3)" : "rgba(0, 212, 255, 0.12)"}`,
+                  color: "var(--text-primary)",
+                  caretColor: "#00D4FF",
+                }}
+              />
+              <button
+                onClick={save}
+                disabled={saving || !dirty}
+                className="px-3 py-2 rounded-sm text-[9px] font-bold tracking-[0.15em] transition-all disabled:opacity-30"
+                style={{
+                  background: "rgba(0, 212, 255, 0.1)",
+                  color: "#00D4FF",
+                  border: "1px solid rgba(0, 212, 255, 0.25)",
+                }}
+              >
+                {saving ? "…" : ar ? "حفظ" : "SET"}
+              </button>
+            </div>
+            {workspace?.enforced && (
+              <div className="mt-2">
+                <Row
+                  label={ar ? "التقيد" : "Enforced"}
+                  value={workspace.available ? (ar ? "مفعّل" : "yes") : (ar ? "غير متاح" : "unavailable")}
+                  tone={workspace.available ? "ok" : "error"}
+                />
+              </div>
+            )}
+            {Array.isArray(workspace?.entries) && workspace.entries.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {workspace.entries.slice(0, 12).map((entry) => (
+                  <span
+                    key={entry}
+                    className="text-[8px] px-1.5 py-0.5 rounded-sm"
+                    style={{ background: "rgba(0,212,255,0.05)", color: "var(--text-secondary)" }}
+                  >
+                    {entry}
+                  </span>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          {notice && <Banner tone={notice.ok ? "ok" : "error"} text={notice.text} />}
+        </div>
+
+        <div className="flex items-center justify-end gap-3 pt-4">
+          <button
+            onClick={onClose}
+            className="text-[9px] px-4 py-2 rounded-sm font-bold tracking-[0.15em] transition-all"
+            style={{
+              background: "rgba(255, 51, 85, 0.08)",
+              color: "#FF5A75",
+              border: "1px solid rgba(255, 51, 85, 0.35)",
+            }}
+          >
+            {ar ? "إغلاق" : "CLOSE"}
+          </button>
         </div>
       </div>
-    </>
-  );
-}
-
-function Header({ ar, onClose }) {
-  return (
-    <div
-      className="flex items-center justify-between px-3 py-2 border-b flex-none"
-      style={{ borderColor: "rgba(0, 212, 255, 0.1)" }}
-    >
-      <span className="text-[10px] font-display font-bold tracking-wider" style={{ color: "#00d4ff" }}>
-        {ar ? "الإعدادات" : "SETTINGS"}
-      </span>
-      <button
-        onClick={onClose}
-        className="text-[8px] px-1.5 py-0.5 rounded-sm font-mono"
-        style={{ color: "var(--text-muted)" }}
-      >
-        {ar ? "إغلاق" : "CLOSE"}
-      </button>
     </div>
   );
 }
 
-function Section({ title, children }) {
+function Card({ title, children }) {
   return (
-    <section>
-      <h3 className="text-[8px] font-display tracking-[0.2em] mb-1.5" style={{ color: "var(--text-muted)" }}>
+    <div className="glass-light rounded-md p-3">
+      <div className="text-[7px] font-display tracking-[0.2em] mb-3" style={{ color: "var(--text-muted)" }}>
         {title}
-      </h3>
-      {children}
-    </section>
+      </div>
+      <div className="space-y-1">{children}</div>
+    </div>
   );
 }
 
 function Row({ label, value, tone = "default", title }) {
   const color =
-    tone === "ok" ? "#00ff88" : tone === "warn" ? "#ffb400" : tone === "error" ? "#ff3355" : "var(--text-primary)";
+    tone === "ok" ? "#00FF88" : tone === "warn" ? "#F0B000" : tone === "error" ? "#FF3355" : "#00D4FF";
   return (
-    <div className="flex items-start justify-between gap-2 py-0.5" title={title}>
-      <span className="text-[9px] flex-none" style={{ color: "var(--text-muted)" }}>{label}</span>
-      <span className="text-[9px] text-right break-all min-w-0" style={{ color }}>{value}</span>
+    <div className="flex items-start justify-between gap-2" title={title}>
+      <span className="text-[8px] font-mono flex-none" style={{ color: "var(--text-muted)" }}>{label}</span>
+      <span className="text-[9px] font-mono text-right break-all min-w-0" style={{ color }}>{value}</span>
+    </div>
+  );
+}
+
+function Stat({ label, value, color, wide }) {
+  return (
+    <div className={wide ? "col-span-2" : ""}>
+      <span className="text-[7px] font-mono tracking-wider" style={{ color: "var(--text-muted)" }}>{label}</span>
+      <div className="text-[11px] font-mono font-bold" style={{ color }}>{value}</div>
     </div>
   );
 }
 
 function Banner({ tone, text }) {
-  const color = tone === "ok" ? "#00ff88" : "#ff5a75";
+  const color = tone === "ok" ? "#00FF88" : "#FF5A75";
   return (
     <div
-      className="text-[9px] p-2 rounded-sm break-words"
+      className="text-[9px] p-2 rounded-sm font-mono break-words"
       style={{
         background: tone === "ok" ? "rgba(0,255,136,0.06)" : "rgba(255,51,85,0.08)",
         border: `1px solid ${tone === "ok" ? "rgba(0,255,136,0.2)" : "rgba(255,51,85,0.25)"}`,
@@ -195,164 +355,4 @@ function Banner({ tone, text }) {
   );
 }
 
-function Workspace({ ar, workspace, draft, setDraft, inputRef, saving, onSave }) {
-  return (
-    <Section title={ar ? "مجلد العمل" : "WORKSPACE"}>
-      <p className="text-[8px] mb-1.5 leading-relaxed" style={{ color: "var(--text-muted)" }}>
-        {ar
-          ? "كل أدوات الملفات مقيّدة بهذا المجلد. أي مسار خارجه يُرفض."
-          : "Every file tool is confined to this directory. Any path outside it is refused."}
-      </p>
-      <div className="flex gap-1">
-        {/* dir="ltr": a Windows path must never be reordered by RTL. */}
-        <input
-          ref={inputRef}
-          dir="ltr"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && onSave()}
-          spellCheck={false}
-          placeholder="D:/Projects"
-          className="flex-1 min-w-0 px-2 py-1.5 rounded-sm text-[10px] outline-none"
-          style={{
-            background: "rgba(0, 212, 255, 0.04)",
-            border: "1px solid rgba(0, 212, 255, 0.15)",
-            color: "var(--text-primary)",
-          }}
-        />
-        <button
-          onClick={onSave}
-          disabled={saving || !draft.trim() || draft.trim() === workspace?.root}
-          className="px-2 py-1.5 rounded-sm text-[9px] font-bold tracking-wider disabled:opacity-30"
-          style={{
-            background: "rgba(0, 212, 255, 0.1)",
-            color: "#00d4ff",
-            border: "1px solid rgba(0, 212, 255, 0.25)",
-          }}
-        >
-          {saving ? "…" : ar ? "حفظ" : "SET"}
-        </button>
-      </div>
-      {workspace?.enforced && (
-        <div className="mt-1">
-          <Row
-            label={ar ? "التقيد" : "Enforced"}
-            value={ar ? "مفعّل" : "yes"}
-            tone={workspace.available ? "ok" : "error"}
-          />
-        </div>
-      )}
-      {Array.isArray(workspace?.entries) && workspace.entries.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap gap-1">
-          {workspace.entries.slice(0, 12).map((entry) => (
-            <span
-              key={entry}
-              className="text-[8px] px-1.5 py-0.5 rounded-sm"
-              style={{ background: "rgba(0,212,255,0.05)", color: "var(--text-secondary)" }}
-            >
-              {entry}
-            </span>
-          ))}
-        </div>
-      )}
-    </Section>
-  );
-}
-
-function Llm({ ar, llm, chain, metrics, rejected }) {
-  return (
-    <Section title="LLM">
-      <Row
-        label={ar ? "المزوّد" : "Provider"}
-        value={llm.provider || "—"}
-      />
-      <Row
-        label={ar ? "المفتاح" : "API key"}
-        value={
-          llm.configured === false
-            ? ar ? "مفقود" : "MISSING"
-            : ar ? "موجود" : "present"
-        }
-        tone={llm.configured === false ? "error" : "ok"}
-      />
-      <Row
-        label={ar ? "النموذج" : "Model"}
-        value={llm.primary_model || "—"}
-        title={llm.primary_model}
-      />
-      <Row
-        label={ar ? "الاستدلال" : "Reasoning"}
-        value={llm.reasoning_model || "—"}
-        title={llm.reasoning_model}
-      />
-      {chain.length > 0 && (
-        <div className="mt-1">
-          <Row
-            label={ar ? "سلسلة احتياطية" : "Fallback chain"}
-            value={chain.map((c) => c.model).join(" → ")}
-            title={chain.map((c) => c.model).join(" → ")}
-          />
-        </div>
-      )}
-      {rejected.length > 0 && (
-        <div className="mt-1">
-          <Banner
-            tone="error"
-            text={`${ar ? "نماذج مرفوضة" : "Rejected models"}: ${rejected.join(", ")}`}
-          />
-        </div>
-      )}
-      {typeof metrics.requests === "number" && (
-        <>
-          <div className="mt-1.5" />
-          <Row label={ar ? "الطلبات" : "Requests"} value={metrics.requests} />
-          <Row
-            label={ar ? "معدّل النجاح" : "Success"}
-            value={`${metrics.success ?? 0} (${metrics.rate_limited ?? 0} rl, ${metrics.timeouts ?? 0} to)`}
-          />
-          <Row
-            label={ar ? "زمن الاستجابة" : "Avg latency"}
-            value={`${metrics.avg_latency_ms ?? 0} ms`}
-          />
-        </>
-      )}
-    </Section>
-  );
-}
-
-function Voice({ ar, voice }) {
-  return (
-    <Section title={ar ? "الصوت" : "VOICE"}>
-      <Row
-        label="STT"
-        value={voice.stt ? (ar ? "متاح" : "ready") : ar ? "غير متاح" : "unavailable"}
-        tone={voice.stt ? "ok" : "warn"}
-      />
-      <Row
-        label="TTS"
-        value={voice.tts ? (ar ? "متاح" : "ready") : ar ? "غير متاح" : "unavailable"}
-        tone={voice.tts ? "ok" : "warn"}
-      />
-    </Section>
-  );
-}
-
-function Safety({ ar, safety, health }) {
-  return (
-    <Section title={ar ? "الأمان" : "SAFETY"}>
-      <Row
-        label={ar ? "بوابة التأكيد" : "Gate"}
-        value={safety.enabled ? (ar ? "مفعّلة" : "on") : ar ? "معطّلة" : "OFF"}
-        tone={safety.enabled ? "ok" : "error"}
-      />
-      <Row
-        label={ar ? "مهلة التأكيد" : "Timeout"}
-        value={`${safety.confirm_timeout ?? 0}s`}
-      />
-      <Row
-        label={ar ? "أدوات محمّلة" : "Tools"}
-        value={health?.tools_loaded ?? 0}
-      />
-    </Section>
-  );
-}
+export default memo(SettingsPanel);

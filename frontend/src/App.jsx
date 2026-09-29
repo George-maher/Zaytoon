@@ -7,12 +7,10 @@ import StatusRing from "./components/HUD/StatusRing";
 import Waveform from "./components/HUD/Waveform";
 import SidePanelLeft from "./components/HUD/SidePanelLeft";
 import SidePanelRight from "./components/HUD/SidePanelRight";
-import BottomDock from "./components/HUD/BottomDock";
+import BottomDock from "./components/BottomDock";
 import ChatTranscript from "./components/Chat/ChatTranscript";
 import ActivityFeed from "./components/Chat/ActivityFeed";
 import ConfirmationDialog from "./components/ConfirmationDialog";
-// These were fully implemented but never imported anywhere, so the shipped app
-// had no text input, no reminders UI, and a settings button that did nothing.
 import InputBar from "./components/InputBar";
 import ReminderPanel from "./components/ReminderPanel";
 import SettingsPanel from "./components/SettingsPanel";
@@ -78,35 +76,29 @@ export default memo(function App() {
   };
 
   const getStatusColor = () => {
-    if (!isConnected) return "#ff3355";
-    if (pendingConfirmation) return "#ff3355";
-    if (awaitingCommand) return "#f0b000";
-    if (isListening) return "#00ff88";
-    if (status === "executing") return "#f0b000";
-    if (status === "planning") return "#00d4ff";
-    if (isTyping || status === "thinking") return "#00d4ff";
-    if (isSpeaking) return "#00f0ff";
-    return "var(--neon-blue)";
+    if (!isConnected) return "#FF3355";
+    if (pendingConfirmation) return "#FF3355";
+    if (awaitingCommand) return "#F0B000";
+    if (isListening) return "#00FF88";
+    if (status === "executing") return "#F0B000";
+    if (status === "planning") return "#00D4FF";
+    if (isTyping || status === "thinking") return "#00D4FF";
+    if (isSpeaking) return "#00F0FF";
+    return "var(--neon-cyan)";
   };
 
   return (
-    <div ref={containerRef} className="h-screen w-screen flex flex-col overflow-hidden"
-      style={{ background: "var(--bg-primary)" }}>
-
+    <div ref={containerRef} className="h-screen w-screen flex flex-col overflow-hidden grid-bg"
+      style={{ background: "var(--bg-deep)" }}>
       {/* Scan line overlay */}
       <div className="scan-line" />
-      <div className="hud-corner hud-corner-tl" />
-      <div className="hud-corner hud-corner-tr" />
-      <div className="hud-corner hud-corner-bl" />
-      <div className="hud-corner hud-corner-br" />
+      <div className="corner-accent corner-tl" />
+      <div className="corner-accent corner-tr" />
+      <div className="corner-accent corner-bl" />
+      <div className="corner-accent corner-br" />
 
       {/* Header */}
-      <header className="flex-none px-4 py-2 flex items-center justify-between z-20"
-        style={{
-          background: "rgba(5, 5, 12, 0.6)",
-          borderBottom: "1px solid var(--border-color)",
-          backdropFilter: "blur(12px)",
-        }}>
+      <header className="flex-none px-4 py-2 flex items-center justify-between z-20 hud-glass">
         <div className="flex items-center gap-3">
           <div className="relative w-8 h-8 flex items-center justify-center" style={{ perspective: "600px" }}>
             <div className="absolute inset-0 rounded-sm border" style={{
@@ -115,16 +107,16 @@ export default memo(function App() {
               transform: "rotateX(5deg) rotateY(-5deg)",
             }} />
             <span className="text-base font-bold font-display relative z-10 glow-text" style={{
-              color: "#00d4ff",
+              color: "#00D4FF",
               transform: "rotateX(5deg) rotateY(-5deg)",
             }}>Z</span>
           </div>
           <div>
-            <h1 className="text-[11px] font-display font-bold tracking-[0.3em] glow-text" style={{ color: "#00d4ff" }}>
+            <h1 className="text-[11px] font-display font-bold tracking-[0.3em] glow-text" style={{ color: "#00D4FF" }}>
               ZAYTOON
             </h1>
             <div className="flex items-center gap-1.5 mt-0.5">
-              <span className="text-[8px] font-mono tracking-widest" style={{ color: "#8888aa", opacity: 0.6 }}>
+              <span className="text-[8px] font-mono tracking-widest" style={{ color: "#8888AA", opacity: 0.6 }}>
                 J.A.R.V.I.S.-Class AI
               </span>
             </div>
@@ -132,9 +124,7 @@ export default memo(function App() {
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Reminders. Previously unreachable: the panel was implemented but
-              never imported, so there was no way to view, complete or delete a
-              reminder in the web app at all. */}
+          {/* Reminders */}
           <ReminderPanel
             reminders={reminders}
             onRefresh={refreshReminders}
@@ -147,7 +137,7 @@ export default memo(function App() {
             className="text-[9px] px-2 py-1 rounded-sm font-display font-bold tracking-wider transition-all"
             style={{
               background: language === "ar" ? "rgba(0, 255, 136, 0.08)" : "rgba(0, 212, 255, 0.08)",
-              color: language === "ar" ? "#00ff88" : "#00d4ff",
+              color: language === "ar" ? "#00FF88" : "#00D4FF",
               border: `1px solid ${language === "ar" ? "rgba(0, 255, 136, 0.2)" : "rgba(0, 212, 255, 0.2)"}`,
             }}
           >{language === "ar" ? "EN" : "AR"}</button>
@@ -157,7 +147,7 @@ export default memo(function App() {
               className="text-[9px] px-2 py-1 rounded-sm font-mono tracking-wider"
               style={{
                 background: "rgba(0, 240, 255, 0.08)",
-                color: "#00f0ff",
+                color: "#00F0FF",
                 border: "1px solid rgba(0, 240, 255, 0.2)",
               }}
             >STOP</button>
@@ -195,7 +185,7 @@ export default memo(function App() {
             {isSpeaking && speakingVoice && (
               <span
                 className="text-[8px] font-mono tracking-wider"
-                style={{ color: "#8888aa", opacity: 0.75 }}
+                style={{ color: "#8888AA", opacity: 0.75 }}
                 title="Active TTS voice"
               >
                 {speakingVoice.replace("Neural", "")}
@@ -250,9 +240,7 @@ export default memo(function App() {
             />
           </div>
 
-          {/* Text input. The app was previously voice-only: `InputBar` existed
-              but was never imported, and a full `sendMessage` implementation sat
-              unreachable in the hook. */}
+          {/* Text input */}
           <div className="relative z-20 w-full max-w-2xl px-4">
             <InputBar
               onSend={sendMessage}
@@ -278,11 +266,7 @@ export default memo(function App() {
       />
 
       {/* Bottom dock */}
-      <footer className="hud-bottom flex-none px-4 py-3 flex items-center justify-center z-20" style={{
-        background: "rgba(5, 5, 12, 0.6)",
-        borderTop: "1px solid var(--border-color)",
-        backdropFilter: "blur(12px)",
-      }}>
+      <footer className="hud-bottom flex-none px-4 py-3 flex items-center justify-center z-20 hud-glass">
         <BottomDock
           voiceMode={voiceMode}
           language={language}
