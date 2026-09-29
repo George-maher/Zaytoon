@@ -515,7 +515,7 @@ export default function useWebSocket() {
   }, [sendReminderCmd]);
 
   const transmitAudio = useCallback(
-    (chunks, mimeType, minSize = 5000) => {
+    (chunks, mimeType, minSize = 5000, isManualVoice = false) => {
       if (!chunks || chunks.length === 0) return;
       const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
       if (blob.size < minSize || blob.size > 5 * 1024 * 1024) {
@@ -530,7 +530,7 @@ export default function useWebSocket() {
         if (isSocketOpen()) {
           console.log(`Base64 prefix: ${base64.slice(0, 8)}`);
           addMessage("user", "\uD83C\uDFA4");
-          wsRef.current.send(JSON.stringify({ type: "audio", audio: base64, language }));
+          wsRef.current.send(JSON.stringify({ type: "audio", audio: base64, language, isManualVoice }));
           setIsTyping(true);
           setStatus("transcribing");
         } else {
@@ -675,7 +675,7 @@ if (rms > threshold) {
             }
             _restartRecorder();
             mediaChunksRef.current = [];
-            transmitAudio(chunks, mime);
+            transmitAudio(chunks, mime, 5000, true);
           }
         }
       }
@@ -712,7 +712,7 @@ if (rms > threshold) {
       unsentSpeechRef.current = false;
       isProcessingRef.current = true;
       if (shouldInterrupt) sendInterrupt();
-      transmitAudio(chunks, mime, 2000);
+      transmitAudio(chunks, mime, 2000, true);
     }
     setStatus(isSocketOpen() ? "connected" : "disconnected");
   }, [sendInterrupt, transmitAudio, isSocketOpen]);

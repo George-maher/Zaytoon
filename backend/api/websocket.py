@@ -149,7 +149,9 @@ async def create_websocket_handler(
             elif msg_type == "audio":
                 audio_b64 = data.get("audio", "")
                 language = data.get("language", None)
-                logger.warning(f"Audio msg received: b64_len={len(audio_b64)} lang={language}")
+                # Manual voice mode (user pressed mic button) skips wake-word gate
+                is_manual_voice = data.get("isManualVoice", False)
+                logger.warning(f"Audio msg received: b64_len={len(audio_b64)} lang={language} manual={is_manual_voice}")
                 if not audio_b64:
                     continue
                 try:
@@ -189,12 +191,14 @@ async def create_websocket_handler(
                         })
 
                     state = session_states.get(session_id)
+                    # Skip wake-word gate for manual voice mode (user explicitly pressed mic)
+                    wake_enabled = config.WAKE_WORD_REQUIRED and not is_manual_voice
                     wake = apply_wake_gate(
                         text,
                         awaiting_command=bool(state.awaiting_command) if state else False,
                         last_active_ts=state.last_active_ts if state else 0.0,
                         timeout_secs=config.WAKE_SESSION_TIMEOUT,
-                        enabled=config.WAKE_WORD_REQUIRED,
+                        enabled=wake_enabled,
                     )
                     if wake.detected and state:
                         # A wake word was spoken: arm the follow-up window so the
