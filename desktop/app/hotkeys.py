@@ -64,7 +64,20 @@ class HotkeyManager:
         return self._available
 
     def register(self, hotkey: str, callback) -> bool:
-        """Register one global hotkey. Returns False if it could not be bound."""
+        """Register one global hotkey. Returns False if it could not be bound.
+
+        Nothing may escape this method. A global hook is the one piece of the
+        shell that depends on machine state nobody controls: another process
+        may already own the key, the shell may not be elevated while the owner
+        is, or the underlying ``keyboard`` package may fail while building its
+        name tables. Observed in the wild, that last case escaped as a
+        ``BaseException`` subclass during ``add_hotkey`` and killed startup --
+        so the handler below catches ``BaseException`` and re-raises only the
+        two signals that genuinely should stop the process.
+
+        The documented contract is that a hotkey failure degrades to the tray
+        menu and is reported, and it is only true because of this.
+        """
         if not hotkey:
             return False
         if keyboard is None:
@@ -73,9 +86,17 @@ class HotkeyManager:
             return False
         try:
             handle = keyboard.add_hotkey(hotkey, callback, suppress=False)
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:  # noqa: BLE001 - see docstring
             logger.warning("could not bind %s: %s", hotkey, exc)
             self.error = f"{format_hotkey(hotkey)} is already in use by another application"
+            # The hook may be half-installed even though binding failed; drop
+            # the listener so the next attempt starts clean.
+            try:
+                keyboard.unhook_all_hotkeys()
+            except BaseException:  # pragma: no cover - best effort
+                pass
             return False
         self._registered[hotkey] = handle
         return True

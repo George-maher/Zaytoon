@@ -162,12 +162,25 @@ def main(argv: list[str] | None = None) -> int:
     if not backend_is_up(config.host, config.port) and config.manage_backend:
         print("Starting the Zaytoon backend, this takes a few seconds…")
 
+    # One orb, one keyboard hook. Claimed before anything global is created,
+    # so a second launch reports the conflict instead of contending for the
+    # hotkey -- which, depending on timing and elevation, surfaced as a crash
+    # inside the `keyboard` package rather than as a message.
+    from app.instance import claim_or_report
+
+    guard = claim_or_report()
+    if guard is None:
+        return 0
+
     from app.app import ZaytoonApp
 
     application = ZaytoonApp(config)
     if args.panel:
         application._enter_panel()
-    return application.run()
+    try:
+        return application.run()
+    finally:
+        guard.release()
 
 
 if __name__ == "__main__":
