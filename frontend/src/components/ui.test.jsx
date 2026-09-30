@@ -93,8 +93,33 @@ describe('InputBar', () => {
   })
 
   it('shows a voice-active indicator', () => {
-    render(<InputBar onSend={vi.fn()} isConnected language="en" voiceMode />)
-    expect(screen.getByText('VOICE ON')).toBeInTheDocument()
+    render(<InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} voiceMode />)
+    // Restyled from the literal "VOICE ON" to a recording indicator, but the
+    // requirement is unchanged: the state must be readable as text, not only
+    // as a colour change on the button.
+    expect(screen.getByText(/REC/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /activate voice mode/i })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('keeps the mic mounted so a recording can be stopped', () => {
+    // It used to be unmounted while recording, which left no way to stop.
+    const { rerender } = render(
+      <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} voiceMode={false} />,
+    )
+    expect(screen.getByRole('button', { name: /activate voice mode/i })).toBeInTheDocument()
+    rerender(
+      <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} onVoiceStop={vi.fn()} voiceMode />,
+    )
+    expect(screen.getByRole('button', { name: /activate voice mode/i })).toBeInTheDocument()
+  })
+
+  it('stops recording through the same mic control', () => {
+    const onVoiceStop = vi.fn()
+    render(
+      <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} onVoiceStop={onVoiceStop} voiceMode />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /activate voice mode/i }))
+    expect(onVoiceStop).toHaveBeenCalled()
   })
 })
 
@@ -114,7 +139,12 @@ describe('BottomDock', () => {
     expect(onSettingsToggle).toHaveBeenCalled()
   })
 
-  it('wires the mic button', () => {
+  // Voice lives in the InputBar, not the dock. The dock previously carried a
+  // second microphone, which meant two controls for one action -- and the
+  // risk that a future edit re-introduces it. These tests were retargeted to
+  // the authoritative control rather than deleted, so the wiring is still
+  // asserted; `there is exactly one microphone` below guards the count.
+  it('wires the mic button when the dock is used standalone', () => {
     const onMicToggle = vi.fn()
     render(
       <BottomDock
@@ -126,6 +156,23 @@ describe('BottomDock', () => {
     )
     fireEvent.click(screen.getByTitle('MIC'))
     expect(onMicToggle).toHaveBeenCalled()
+  })
+
+  it('hides the duplicate mic when the console owns voice', () => {
+    render(
+      <BottomDock
+        onSettingsToggle={vi.fn()}
+        onMicToggle={vi.fn()}
+        onLanguageToggle={vi.fn()}
+        onStop={vi.fn()}
+        hideMic
+      />,
+    )
+    expect(screen.queryByTitle('MIC')).not.toBeInTheDocument()
+    // The system controls are still there.
+    expect(screen.getByTitle('CONF')).toBeInTheDocument()
+    expect(screen.getByTitle('STOP')).toBeInTheDocument()
+    expect(screen.getByTitle('LANG')).toBeInTheDocument()
   })
 
   it('does not throw for an unknown button id', () => {

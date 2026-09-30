@@ -48,6 +48,7 @@ function BottomDock({
   language,
   status,
   settingsOpen,
+  hideMic = false,
 }) {
   const handleClick = useCallback(
     (id) => {
@@ -72,15 +73,15 @@ function BottomDock({
   );
 
   const getActiveColor = (id) => {
-    if (id === "mic" && voiceMode) return "#00FF88";
-    if (id === "settings" && settingsOpen) return "#00FF88";
-    if (id === "stop" && status === "speaking") return "#FF3355";
-    return "#00D4FF";
+    if (id === "mic" && voiceMode) return "#00ff9c";
+    if (id === "settings" && settingsOpen) return "#00ff9c";
+    if (id === "stop" && status === "speaking") return "#ff3b5c";
+    return "#00e5ff";
   };
 
   return (
-    <div className="flex items-center gap-3">
-      {ICONS.map((icon) => {
+    <div className="flex items-center gap-1">
+      {ICONS.filter((icon) => !(hideMic && icon.id === "mic")).map((icon) => {
         const color = getActiveColor(icon.id);
         const isActive =
           (icon.id === "mic" && voiceMode) ||
@@ -91,27 +92,25 @@ function BottomDock({
             key={icon.id}
             onClick={() => handleClick(icon.id)}
             type="button"
-            className="group relative w-11 h-11 rounded-full flex items-center justify-center transition-all duration-300"
+            aria-pressed={isActive}
+            /* Square, hairline-framed system controls. No radius on purpose:
+               rounded pills read as a consumer app, not as instrumentation. */
+            className="relative w-9 h-9 flex items-center justify-center transition-all duration-200"
             style={{
-              background: isActive ? `${color}15` : "rgba(0, 212, 255, 0.04)",
-              border: `1px solid ${isActive ? `${color}44` : "rgba(0, 212, 255, 0.12)"}`,
-              color: isActive ? color : "var(--text-muted)",
-              boxShadow: isActive ? `0 0 15px ${color}22` : "none",
+              background: isActive ? `${color}14` : "rgba(6, 17, 26, 0.72)",
+              border: `1px solid ${isActive ? `${color}55` : "var(--hud-edge)"}`,
+              color: isActive ? color : "var(--hud-text-mute)",
+              boxShadow: isActive ? `0 0 12px ${color}22` : "none",
             }}
             title={icon.label}
-            aria-pressed={isActive}
           >
             {icon.id === "lang" ? (
-              <span className="text-[9px] font-display font-bold tracking-wider">{language === "ar" ? "EN" : "AR"}</span>
+              <span className="text-[9px] font-display font-bold tracking-wider">
+                {language === "ar" ? "EN" : "AR"}
+              </span>
             ) : (
               icon.icon
             )}
-            {/* Hover glow ring */}
-            <span className="absolute inset-0 rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none"
-              style={{
-                boxShadow: `0 0 20px ${color}22, inset 0 0 15px ${color}08`,
-              }}
-            />
           </button>
         );
       })}

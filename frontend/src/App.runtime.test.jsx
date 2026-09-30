@@ -67,6 +67,18 @@ describe("App runtime", () => {
     consoleErrors = [];
     vi.spyOn(console, "error").mockImplementation((...a) => consoleErrors.push(a.join(" ")));
     global.WebSocket = FakeSocket;
+    // Default to the wide layout; individual tests override it to exercise the
+    // narrow drawer. jsdom's own matchMedia reports matches:false for
+    // everything, which would make every layout assertion test the phone.
+    global.matchMedia = vi.fn((q) => ({
+      matches: /min-width:\s*1280px/.test(q),
+      media: q,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+    }));
+    window.matchMedia = global.matchMedia;
     // jsdom has no audio output; the hook must not crash on playback.
     global.Audio = class {
       constructor() { this.src = ""; }
@@ -90,13 +102,74 @@ describe("App runtime", () => {
     // The input and the mic are the two things the app is useless without.
     expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/activate voice mode/i)).toBeInTheDocument();
-    // Dock buttons.
-    expect(screen.getByTitle("MIC")).toBeInTheDocument();
+    // Dock buttons. The mic is no longer one of them -- see the
+    // "exactly one microphone" test.
     expect(screen.getByTitle("CONF")).toBeInTheDocument();
     expect(screen.getByTitle("STOP")).toBeInTheDocument();
     // No React exception during mount.
     const fatal = consoleErrors.filter((e) => /Uncaught|Cannot read|is not a function|undefined is not/i.test(e));
     expect(fatal).toEqual([]);
+  });
+
+  it("has exactly one microphone in the product", async () => {
+    // InputBar and the dock each used to carry one, so there were two
+    // controls for a single action and no way to tell which was live.
+    await act(async () => { render(<App />); });
+    expect(screen.getAllByLabelText(/activate voice mode/i)).toHaveLength(1);
+    expect(screen.queryByTitle("MIC")).not.toBeInTheDocument();
+  });
+
+  it("renders the command centre regions at desktop width", async () => {
+    // Pin the breakpoint: jsdom's matchMedia reports matches:false for
+    // everything, which would silently test the narrow drawer instead of the
+    // three-column command deck.
+    global.matchMedia = vi.fn((q) => ({
+      matches: /min-width:\s*1280px/.test(q),
+      media: q,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+    }));
+    window.matchMedia = global.matchMedia;
+    await act(async () => { render(<App />); });
+
+    expect(screen.getAllByText("ZAYTOON").length).toBeGreaterThan(0);
+    // The core exposes itself as an image with the resolved state in its name.
+    expect(screen.getByRole("img", { name: /ai core/i })).toBeInTheDocument();
+    expect(screen.getByText(/transcript/i)).toBeInTheDocument();
+    expect(screen.getByText(/command console/i)).toBeInTheDocument();
+    // Both rails, exactly one copy of each (discriminated by the panel code
+    // chips, because the drawer tabs reuse the same words).
+    expect(screen.getAllByText(/system status/i)).toHaveLength(1);
+    expect(screen.getAllByText(/^MSN$/)).toHaveLength(1);
+    // The tabbed drawer must not also be present at this width.
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  });
+
+  it("collapses the rails into one tabbed drawer at narrow width", async () => {
+    global.matchMedia = vi.fn((q) => ({
+      matches: false,
+      media: q,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+    }));
+    window.matchMedia = global.matchMedia;
+    await act(async () => { render(<App />); });
+
+    expect(screen.getByRole("tablist")).toBeInTheDocument();
+    // The SYSTEM tab is open, so SystemStatus is mounted once...
+    expect(screen.getAllByText(/system status/i)).toHaveLength(1);
+    // ...and the mission panel is behind the other tab rather than duplicated
+    // alongside it. Discriminate on the panel's code chip: the tab button is
+    // itself labelled "MISSION", so the title text cannot be used.
+    expect(screen.queryByText(/^MSN$/)).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /mission/i })).toBeInTheDocument();
+    // The core and the console survive the collapse.
+    expect(screen.getByRole("img", { name: /ai core/i })).toBeInTheDocument();
+    expect(screen.getByText(/command console/i)).toBeInTheDocument();
   });
 
   it("sends a typed message over the socket", async () => {
@@ -265,7 +338,8 @@ describe("App runtime", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 60));
     });
-    await act(async () => { fireEvent.click(screen.getByTitle("MIC")); });
+    // The mic lives in the console input, so that is what toggles it off.
+    await act(async () => { fireEvent.click(screen.getByLabelText(/activate voice mode/i)); });
     await waitFor(() => expect(sent.filter((m) => m.type === "audio").length).toBe(1));
 
     const audio = sent.find((m) => m.type === "audio");

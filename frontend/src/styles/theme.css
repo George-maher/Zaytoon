@@ -2,79 +2,76 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ===========================================================================
+   Zaytoon HUD design tokens
+   Implements docs/DESIGN_SYSTEM.md. desktop/app/theme.py mirrors these values
+   so the orb and the browser are recognisably the same product.
+   =========================================================================== */
+
 :root {
-  /* Core palette - JARVIS-inspired cyan/blue theme */
-  --neon-cyan: #00D4FF;
-  --neon-cyan-dim: #0099CC;
-  --neon-green: #00FF88;
-  --neon-amber: #FFB347;
-  --neon-red: #FF3355;
-  --neon-purple: #7C3AED;
-  
-  /* Background layers */
-  --bg-deep: #020611;
-  --bg-primary: #050B14;
-  --bg-secondary: #0A121F;
-  --bg-card: #0D1426;
-  --bg-card-hover: #141E35;
-  --bg-elevated: #1A2538;
-  
-  /* Text */
-  --text-primary: #E8F0FE;
-  --text-secondary: #8892AA;
-  --text-muted: #5A637A;
-  --text-inverse: #050B14;
-  
-  /* Borders */
-  --border-subtle: rgba(0, 212, 255, 0.08);
-  --border-default: rgba(0, 212, 255, 0.15);
-  --border-glow: rgba(0, 212, 255, 0.3);
-  --border-strong: rgba(0, 212, 255, 0.5);
-  
-  /* Glow effects */
-  --glow-cyan: rgba(0, 212, 255, 0.4);
-  --glow-green: rgba(0, 255, 136, 0.4);
-  --glow-amber: rgba(255, 179, 71, 0.4);
-  --glow-red: rgba(255, 51, 85, 0.4);
-  
-  /* Glass morphism */
-  --glass-bg: rgba(10, 18, 32, 0.7);
-  --glass-border: rgba(0, 212, 255, 0.12);
-  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  
-  /* Typography */
+  /* -- surfaces: flat, never blurred ------------------------------------ */
+  --hud-void: #03070d;
+  --hud-deep: #06111a;
+  --hud-raised: #081722;
+  --hud-line: #0c1e2c;
+
+  /* -- accents ---------------------------------------------------------- */
+  --hud-cyan: #00e5ff;
+  --hud-cyan-core: #00cfff;
+  --hud-blue: #168dff;
+  --hud-indigo: #2878ff;
+  --hud-amber: #ffb020;
+  --hud-green: #00ff9c;
+  --hud-red: #ff3b5c;
+
+  /* -- text ------------------------------------------------------------- */
+  --hud-text: #e8f7ff;
+  --hud-text-dim: #a8c7d8;
+  --hud-text-mute: #63879a;
+
+  /* -- edges and glow --------------------------------------------------- */
+  --hud-edge: rgba(0, 210, 255, 0.15);
+  --hud-edge-strong: rgba(0, 210, 255, 0.3);
+  --hud-edge-faint: rgba(0, 210, 255, 0.07);
+  --hud-glow-soft: rgba(0, 229, 255, 0.18);
+  --hud-glow-hard: rgba(0, 229, 255, 0.45);
+  --hud-amber-glow: rgba(255, 176, 32, 0.3);
+  --hud-red-glow: rgba(255, 59, 92, 0.3);
+  --hud-green-glow: rgba(0, 255, 156, 0.28);
+
+  /* Legacy aliases. Several components still read --neon-* / --text-*; they
+     are mapped here so the palette stays defined in exactly one place rather
+     than duplicated per component. */
+  --neon-cyan: var(--hud-cyan);
+  --neon-cyan-dim: #0a7d99;
+  --neon-green: var(--hud-green);
+  --neon-amber: var(--hud-amber);
+  --neon-red: var(--hud-red);
+  --bg-deep: var(--hud-void);
+  --bg-primary: var(--hud-deep);
+  --bg-card: var(--hud-raised);
+  --bg-elevated: var(--hud-line);
+  --text-primary: var(--hud-text);
+  --text-secondary: var(--hud-text-dim);
+  --text-muted: var(--hud-text-mute);
+  --border-color: var(--hud-edge);
+  --border-glow: var(--hud-edge-strong);
+  --border-subtle: var(--hud-edge-faint);
+  --radius-sm: 2px;
+
+  /* -- state colour lookup ---------------------------------------------- */
+  --state-color: var(--hud-cyan);
+  --state-glow: var(--hud-glow-soft);
+
+  /* -- type ------------------------------------------------------------- */
   --font-display: "Orbitron", "Rajdhani", sans-serif;
-  --font-body: "Rajdhani", "Inter", sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", monospace;
-  
-  /* Spacing scale */
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-  --space-8: 48px;
-  
-  /* Border radius */
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
-  --radius-full: 9999px;
-  
-  /* Transitions */
-  --transition-fast: 150ms ease-out;
-  --transition-normal: 250ms ease-out;
-  --transition-slow: 400ms ease-out;
-  
-  /* Z-index scale */
-  --z-base: 1;
-  --z-dropdown: 100;
-  --z-sticky: 200;
-  --z-modal: 300;
-  --z-toast: 400;
-  --z-tooltip: 500;
+  --font-body: "Rajdhani", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+
+  /* -- motion ----------------------------------------------------------- */
+  --t-micro: 120ms ease-out;
+  --t-panel: 240ms ease-out;
+  --t-core: 600ms ease-in-out;
 }
 
 * {
@@ -83,194 +80,361 @@
   box-sizing: border-box;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   width: 100%;
   height: 100%;
   overflow: hidden;
 }
 
 body {
-  background: var(--bg-deep);
-  color: var(--text-primary);
+  background: var(--hud-void);
+  color: var(--hud-text);
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  letter-spacing: 0.01em;
   line-height: 1.5;
 }
 
-* {
-  box-sizing: border-box;
-}
-
 *::selection {
-  background: rgba(0, 212, 255, 0.3);
-  color: var(--text-inverse);
+  background: rgba(0, 229, 255, 0.28);
+  color: var(--hud-void);
 }
 
-/* Focus styles */
-*:focus-visible {
-  outline: 2px solid var(--neon-cyan);
+:focus-visible {
+  outline: 2px solid var(--hud-cyan);
   outline-offset: 2px;
 }
 
-/* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border-default);
-  border-radius: 3px;
+  background: var(--hud-edge);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--neon-cyan);
+  background: var(--hud-edge-strong);
 }
 
-/* Animations */
-@keyframes fade-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.animate-fade-in { animation: fade-in 200ms ease-out; }
+/* ===========================================================================
+   Environment
+   Static, low-opacity geometry. Deliberately cheap: two gradients and one
+   repeating-linear-gradient, no images, no per-frame JS.
+   =========================================================================== */
 
-@keyframes slide-up {
-  from { opacity: 0; transform: translateY(12px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.animate-slide-up { animation: slide-up 300ms ease-out; }
-
-@keyframes slide-down {
-  from { opacity: 0; transform: translateY(-12px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.animate-slide-down { animation: slide-down 300ms ease-out; }
-
-@keyframes scale-in {
-  from { opacity: 0; transform: scale(0.95); }
-  to { opacity: 1; transform: scale(1); }
-}
-.animate-scale-in { animation: scale-in 200ms ease-out; }
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-.animate-pulse { animation: pulse 2s ease-in-out infinite; }
-
-@keyframes pulse-ring {
-  0% { box-shadow: 0 0 0 0 var(--glow-cyan); }
-  70% { box-shadow: 0 0 0 12px transparent; }
-  100% { box-shadow: 0 0 0 0 transparent; }
-}
-.pulse-ring { animation: pulse-ring 2s ease-out infinite; }
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-.animate-spin { animation: spin 1s linear infinite; }
-
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
-}
-.animate-shimmer {
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
-  background-size: 200% 100%;
-  animation: shimmer 2s infinite;
+.hud-void {
+  background-color: var(--hud-void);
+  /* Ambient cyan pooling top-centre and a cooler blue pool at the base. */
+  background-image:
+    radial-gradient(120% 70% at 50% -10%, rgba(0, 229, 255, 0.07), transparent 60%),
+    radial-gradient(90% 60% at 50% 115%, rgba(40, 120, 255, 0.06), transparent 65%);
 }
 
-/* Reduced motion */
+/* Fine technical grid. 48px cells, both axes, barely there. */
+.hud-grid {
+  background-image:
+    linear-gradient(var(--hud-edge-faint) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hud-edge-faint) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(120% 90% at 50% 40%, #000 30%, transparent 85%);
+  -webkit-mask-image: radial-gradient(120% 90% at 50% 40%, #000 30%, transparent 85%);
+}
+
+/* Faint circuit traces: orthogonal runs with occasional vias, drawn as
+   repeating gradients so the cost is a single composited layer. */
+.hud-traces {
+  background-image:
+    repeating-linear-gradient(90deg, transparent 0 118px, var(--hud-edge-faint) 118px 119px, transparent 119px 240px),
+    repeating-linear-gradient(0deg, transparent 0 158px, var(--hud-edge-faint) 158px 159px, transparent 159px 320px);
+  opacity: 0.55;
+  mask-image: radial-gradient(100% 80% at 50% 50%, #000 10%, transparent 80%);
+  -webkit-mask-image: radial-gradient(100% 80% at 50% 50%, #000 10%, transparent 80%);
+}
+
+/* A single slow scanline sweep. Transform-only, GPU friendly, and disabled
+   under reduced-motion. */
+.hud-scan {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.hud-scan::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 140px;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgba(0, 229, 255, 0.028) 55%,
+    rgba(0, 229, 255, 0.05) 50%,
+    transparent
+  );
+  animation: hud-sweep 9s linear infinite;
+}
+@keyframes hud-sweep {
+  from {
+    transform: translateY(-160px);
+  }
+  to {
+    transform: translateY(100vh);
+  }
+}
+
+/* ===========================================================================
+   Panel primitive
+   Flat fill, 1px lit edge, no blur, angular corners.
+   =========================================================================== */
+
+.hud-panel {
+  position: relative;
+  background: color-mix(in srgb, var(--hud-deep) 72%, transparent);
+  border: 1px solid var(--hud-edge);
+  /* A 1px inner highlight along the top edge reads as a lit instrument
+     surface; the reference gets this from a hard edge, not from a blur. */
+  box-shadow: inset 0 1px 0 rgba(0, 229, 255, 0.06);
+}
+
+.hud-panel--flush {
+  background: transparent;
+  border-color: var(--hud-edge-faint);
+  box-shadow: none;
+}
+
+/* Corner brackets. Applied to a panel, they replace rounded corners with
+   instrumentation. Uses ::before/::after with background gradients so no extra
+   DOM is required for the two visible rules; the vertical rules come from a
+   second pair on .hud-bracket. */
+.hud-bracket::before,
+.hud-bracket::after {
+  content: "";
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+  border-color: var(--hud-edge-strong);
+  border-style: solid;
+  border-width: 0;
+}
+.hud-bracket::before {
+  top: -1px;
+  left: -1px;
+  border-top-width: 1px;
+  border-left-width: 1px;
+}
+.hud-bracket::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom-width: 1px;
+  border-right-width: 1px;
+}
+
+/* Clipped (notched) corner, for panels that should read as machined. Kept off
+   interactive children so focus rings and hit areas stay rectangular. */
+.hud-notch {
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+}
+
+.hud-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--hud-edge-faint);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--hud-text-dim);
+}
+.hud-panel-head::before {
+  content: "";
+  width: 2px;
+  height: 10px;
+  background: var(--state-color, var(--hud-cyan));
+  box-shadow: 0 0 6px var(--state-glow, var(--hud-glow-soft));
+}
+
+.hud-rule {
+  height: 1px;
+  background: var(--hud-edge-faint);
+}
+
+/* Telemetry row: label left, value right, both monospace. */
+.hud-tele {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.5;
+}
+.hud-tele__k {
+  color: var(--hud-text-mute);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.hud-tele__v {
+  color: var(--hud-text);
+  text-align: right;
+  word-break: break-word;
+  min-width: 0;
+}
+
+/* Status LED. The glyph is what carries the state without colour, so it is
+   never decorative-only. */
+.hud-led {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  flex: none;
+  background: var(--state-color, var(--hud-cyan));
+  box-shadow: 0 0 7px var(--state-glow, var(--hud-glow-soft));
+}
+.hud-led--hollow {
+  background: transparent;
+  border: 1px solid var(--state-color, var(--hud-cyan));
+  box-shadow: none;
+}
+.hud-led--pulse {
+  animation: hud-pulse 1.6s ease-in-out infinite;
+}
+@keyframes hud-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.28;
+  }
+}
+
+/* ===========================================================================
+   Core
+   =========================================================================== */
+
+.hud-core-ring {
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
+.hud-core-spin-slow {
+  animation: hud-spin var(--ring-dur, 12s) linear infinite;
+}
+.hud-core-spin-rev {
+  animation: hud-spin var(--ring-dur, 12s) linear infinite reverse;
+}
+@keyframes hud-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.hud-core-breathe {
+  animation: hud-breathe var(--breathe-dur, 3.4s) ease-in-out infinite;
+}
+@keyframes hud-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.035);
+  }
+}
+
+/* ===========================================================================
+   Type helpers
+   =========================================================================== */
+
+.hud-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--hud-text-dim);
+}
+.hud-micro {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--hud-text-mute);
+}
+.hud-identity {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: var(--hud-cyan-core);
+  text-shadow: 0 0 14px var(--hud-glow-soft);
+}
+.hud-prose {
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--hud-text);
+}
+
+.hud-glow {
+  text-shadow: 0 0 10px var(--state-glow, var(--hud-glow-soft));
+}
+
+/* ===========================================================================
+   Legacy surface utilities
+   Retained because existing components reference them. The old `.glass`
+   frosted panels are intentionally NOT reproduced: blur over a dark HUD is
+   the SaaS-template look the design brief rules out.
+   =========================================================================== */
+
+.glass-light {
+  background: rgba(6, 17, 26, 0.72);
+  border: 1px solid var(--hud-edge-faint);
+}
+
+.status-connected { color: var(--hud-green); }
+.status-thinking { color: var(--hud-cyan); }
+.status-speaking { color: var(--hud-cyan); }
+.status-listening { color: var(--hud-green); }
+.status-error { color: var(--hud-red); }
+.status-warning { color: var(--hud-amber); }
+.status-idle { color: var(--hud-cyan); }
+
+/* ===========================================================================
+   Reduced motion
+   Every loop above is frozen to a static frame. State stays legible because
+   hue, glyph and the state word are all non-animated channels.
+   =========================================================================== */
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  .hud-scan::after,
+  .hud-core-spin-slow,
+  .hud-core-spin-rev,
+  .hud-core-breathe,
+  .hud-led--pulse {
+    animation: none !important;
+  }
+  .hud-scan::after {
+    opacity: 0;
+  }
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
 }
-
-/* Glass morphism utilities */
-.glass {
-  background: var(--glass-bg);
-  backdrop-filter: blur(20px);
-  border: 1px solid var(--glass-border);
-  box-shadow: var(--glass-shadow);
-}
-
-.glass-light {
-  background: rgba(20, 30, 50, 0.5);
-  backdrop-filter: blur(16px);
-  border: 1px solid var(--border-subtle);
-}
-
-/* Glow utilities */
-.glow-cyan {
-  box-shadow: 0 0 20px var(--glow-cyan), 0 0 40px rgba(0, 212, 255, 0.1);
-}
-
-.glow-green {
-  box-shadow: 0 0 20px var(--glow-green), 0 0 40px rgba(0, 255, 136, 0.1);
-}
-
-.glow-amber {
-  box-shadow: 0 0 20px var(--glow-amber), 0 0 40px rgba(255, 179, 71, 0.1);
-}
-
-.glow-red {
-  box-shadow: 0 0 20px var(--glow-red), 0 0 40px rgba(255, 51, 85, 0.1);
-}
-
-/* Text glow */
-.glow-text {
-  text-shadow: 0 0 10px currentColor, 0 0 20px currentColor, 0 0 40px currentColor;
-}
-
-/* Grid background */
-.grid-bg {
-  background-image: 
-    linear-gradient(rgba(0, 212, 255, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0, 212, 255, 0.02) 1px, transparent 1px);
-  background-size: 40px 40px;
-}
-
-/* Scan line effect */
-.scan-line::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 212, 255, 0.03) 2px,
-    rgba(0, 212, 255, 0.03) 4px
-  );
-  pointer-events: none;
-  opacity: 0.5;
-}
-
-/* Corner accents */
-.corner-accent {
-  position: absolute;
-  width: 24px;
-  height: 24px;
-  border-color: var(--neon-cyan);
-  opacity: 0.4;
-}
-.corner-tl { top: 12px; left: 12px; border-top: 1px solid; border-left: 1px solid; }
-.corner-tr { top: 12px; right: 12px; border-top: 1px solid; border-right: 1px solid; }
-.corner-bl { bottom: 12px; left: 12px; border-bottom: 1px solid; border-left: 1px solid; }
-.corner-br { bottom: 12px; right: 12px; border-bottom: 1px solid; border-right: 1px solid; }
-
-/* Status colors */
-.status-connected { color: #00FF88; }
-.status-thinking { color: #00D4FF; }
-.status-speaking { color: #00F0FF; }
-.status-listening { color: #00FF88; }
-.status-error { color: #FF3355; }
-.status-warning { color: #FFB347; }
-.status-idle { color: #00D4FF; }

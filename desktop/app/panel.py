@@ -16,34 +16,46 @@ from . import theme
 
 
 class MessageRow(ctk.CTkFrame):
-    """One chat bubble, aligned by speaker."""
+    """One transcript entry, framed as a system transmission.
+
+    Square corners and a 2px accent spine on the anchored side, rather than a
+    rounded bubble. The spine is cyan for the human and blue for the assistant,
+    so the two remain distinguishable in greyscale as well as by colour.
+    """
 
     def __init__(self, master, role: str, text: str = "") -> None:
         super().__init__(master, fg_color="transparent")
         self.role = role
 
         if role == "user":
-            fg, anchor, justify = theme.ACCENT_DIM, "e", "right"
+            spine, justify, anchor = theme.CYAN, "right", "e"
         elif role == "assistant":
-            fg, anchor, justify = theme.BG_ELEVATED, "w", "left"
+            spine, justify, anchor = theme.BLUE, "left", "w"
         elif role == "system":
-            fg, anchor, justify = theme.BG_PANEL, "w", "left"
+            spine, justify, anchor = theme.TEXT_MUTED, "left", "w"
         else:
-            fg, anchor, justify = theme.DANGER, "w", "left"
+            spine, justify, anchor = theme.DANGER, "left", "w"
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=(48 if role != "user" else 0, 48 if role == "user" else 0))
+
+        marker = ctk.CTkFrame(row, width=2, fg_color=spine, corner_radius=0)
+        marker.pack(side="left", fill="y", padx=(0, 8))
 
         self.bubble = ctk.CTkLabel(
-            self,
+            row,
             text=text,
-            fg_color=fg,
+            fg_color=theme.DEEP,
             text_color=theme.TEXT,
-            corner_radius=12,
+            corner_radius=theme.RADIUS,
             wraplength=560,
             justify=justify,
             anchor=anchor,
             padx=12,
             pady=8,
+            font=("Segoe UI", 12),
         )
-        self.bubble.pack(anchor=anchor, padx=(56 if role == "user" else 0, 56 if role != "user" else 0))
+        self.bubble.pack(side="left", fill="x", expand=True)
         self._label = self.bubble
 
     def set_text(self, text: str) -> None:
@@ -103,85 +115,136 @@ class ChatPanel(ctk.CTkToplevel):
         self._build_status_bar()
 
     def _build_header(self) -> None:
+        """Identity block plus window controls, on a hairline-ruled header."""
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
         header.grid_columnconfigure(0, weight=1)
 
+        # Identity mark: a framed "Z" plus the wordmark, matching the web
+        # header's square badge + letterspaced identity.
+        badge = ctk.CTkFrame(header, width=28, height=28, fg_color=theme.RAISED,
+                             border_width=1, border_color=theme.EDGE_STRONG,
+                             corner_radius=theme.RADIUS)
+        badge.grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
-            header, text="Zaytoon AI", font=("Segoe UI", 17, "bold"),
-            text_color=theme.TEXT, anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+            badge, text="Z", width=28, height=28, font=("Consolas", 15, "bold"),
+            text_color=theme.CYAN_CORE,
+        ).place(relx=0.5, rely=0.5, anchor="center")
+
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ctk.CTkLabel(
+            titles, text="Z A Y T O O N", anchor="w",
+            font=("Consolas", 13, "bold"), text_color=theme.CYAN_CORE,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            titles, text="TACTICAL COMMAND INTERFACE", anchor="w",
+            font=("Consolas", 8), text_color=theme.TEXT_MUTED,
+        ).pack(anchor="w")
+
+        # 1px rule under the header, the web's panel divider.
+        ctk.CTkFrame(self, height=1, fg_color=theme.EDGE_FAINT,
+                     corner_radius=0).grid(row=0, column=0, sticky="sew", padx=16,
+                                           pady=(52, 0))
 
         self.collapse_btn = ctk.CTkButton(
-            header, text="—", width=34, height=28, corner_radius=8,
-            fg_color=theme.BG_ELEVATED, hover_color=theme.BORDER,
-            text_color=theme.TEXT_MUTED, command=self._emit(self._on_collapse),
+            header, text="—", width=32, height=26, corner_radius=theme.RADIUS,
+            fg_color=theme.RAISED, hover_color=theme.EDGE,
+            border_width=1, border_color=theme.EDGE,
+            text_color=theme.TEXT_DIM, command=self._emit(self._on_collapse),
         )
-        self.collapse_btn.grid(row=0, column=1, padx=(8, 6))
+        self.collapse_btn.grid(row=0, column=2, padx=(8, 6))
 
         self.quit_btn = ctk.CTkButton(
-            header, text="✕", width=34, height=28, corner_radius=8,
-            fg_color=theme.BG_ELEVATED, hover_color=theme.DANGER,
-            text_color=theme.TEXT_MUTED, command=self._emit(self._on_quit),
+            header, text="✕", width=32, height=26, corner_radius=theme.RADIUS,
+            fg_color=theme.RAISED, hover_color=theme.DANGER,
+            border_width=1, border_color=theme.EDGE,
+            text_color=theme.TEXT_DIM, command=self._emit(self._on_quit),
         )
-        self.quit_btn.grid(row=0, column=2)
+        self.quit_btn.grid(row=0, column=3)
 
     def _build_composer(self) -> None:
-        composer = ctk.CTkFrame(self, fg_color="transparent")
-        composer.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        composer.grid_columnconfigure(0, weight=1)
+        """Command console: prompt glyph, input, mic, stop, send."""
+        console = ctk.CTkFrame(self, fg_color=theme.DEEP, corner_radius=theme.RADIUS,
+                               border_width=1, border_color=theme.EDGE)
+        console.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        console.grid_columnconfigure(1, weight=1)
+
+        # Prompt glyph: the desktop equivalent of the web console's ">".
+        ctk.CTkLabel(
+            console, text=">", width=18, font=("Consolas", 14, "bold"),
+            text_color=theme.CYAN,
+        ).grid(row=0, column=0, padx=(10, 0))
 
         self.entry = ctk.CTkEntry(
-            composer,
-            placeholder_text="Ask Zaytoon…  (Enter to send, Shift+Enter for a new line)",
-            fg_color=theme.BG_ELEVATED,
-            border_color=theme.BORDER,
+            console,
+            placeholder_text="ENTER COMMAND…",
+            fg_color="transparent",
+            border_width=0,
             text_color=theme.TEXT,
-            corner_radius=14,
-            height=40,
+            font=("Consolas", 12),
+            height=42,
         )
-        self.entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.entry.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
         self.entry.bind("<Return>", self._handle_return)
         self.entry.bind("<Shift-Return>", lambda _e: "break")
 
+        # Square hairline-framed controls. The mic is a drawn glyph rather than
+        # an emoji so it matches the web's outline icon set and renders the
+        # same on every machine.
         self.send_btn = ctk.CTkButton(
-            composer, text="Send", width=72, height=40, corner_radius=14,
-            fg_color=theme.ACCENT_DIM, hover_color=theme.ACCENT,
-            text_color=theme.TEXT, command=self._submit,
+            console, text="SEND", width=76, height=42, corner_radius=theme.RADIUS,
+            fg_color="#0A2A3A", hover_color="#12455E",
+            border_width=1, border_color=theme.EDGE,
+            text_color=theme.CYAN, font=("Consolas", 10, "bold"),
+            command=self._submit,
         )
-        self.send_btn.grid(row=0, column=1)
+        self.send_btn.grid(row=0, column=2, padx=(8, 0), pady=4)
 
         self.mic_btn = ctk.CTkButton(
-            composer, text="🎤", width=44, height=40, corner_radius=14,
-            fg_color=theme.BG_ELEVATED, hover_color=theme.BORDER,
-            text_color=theme.TEXT, command=self._emit(self._on_mic_toggle),
+            console, text="●", width=42, height=42, corner_radius=theme.RADIUS,
+            fg_color=theme.RAISED, hover_color=theme.EDGE,
+            border_width=1, border_color=theme.EDGE,
+            text_color=theme.TEXT_MUTED, font=("Consolas", 13),
+            command=self._emit(self._on_mic_toggle),
         )
-        self.mic_btn.grid(row=0, column=2, padx=(8, 0))
+        self.mic_btn.grid(row=0, column=3, padx=(8, 0), pady=4)
 
         self.stop_btn = ctk.CTkButton(
-            composer, text="■", width=44, height=40, corner_radius=14,
-            fg_color=theme.BG_ELEVATED, hover_color=theme.DANGER,
-            text_color=theme.TEXT, command=self._emit(self._on_interrupt),
+            console, text="■", width=42, height=42, corner_radius=theme.RADIUS,
+            fg_color=theme.RAISED, hover_color=theme.DANGER,
+            border_width=1, border_color=theme.EDGE,
+            text_color=theme.TEXT_MUTED, font=("Consolas", 11),
+            command=self._emit(self._on_interrupt),
         )
-        self.stop_btn.grid(row=0, column=3, padx=(8, 0))
+        self.stop_btn.grid(row=0, column=4, padx=(6, 4), pady=4)
 
     def _build_status_bar(self) -> None:
+        """Telemetry strip: LED, state word, and a hint field."""
         bar = ctk.CTkFrame(self, fg_color="transparent", height=26)
         bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
         bar.grid_columnconfigure(1, weight=1)
 
-        self.status_dot = ctk.CTkLabel(bar, text="●", width=14, text_color=theme.TEXT_MUTED)
-        self.status_dot.grid(row=0, column=0, sticky="w")
+        ctk.CTkFrame(bar, height=1, fg_color=theme.EDGE_FAINT,
+                     corner_radius=0).grid(row=0, column=0, columnspan=3,
+                                           sticky="ew", pady=(0, 6))
 
-        self.status_label = ctk.CTkLabel(
-            bar, text="Starting…", anchor="w", text_color=theme.TEXT_MUTED
+        self.status_dot = ctk.CTkLabel(
+            bar, text="■", width=14, font=("Consolas", 9), text_color=theme.TEXT_MUTED
         )
-        self.status_label.grid(row=0, column=1, sticky="w")
+        self.status_dot.grid(row=1, column=0, sticky="w")
+
+        # The glyph is a second channel so state is not colour-only.
+        self.status_label = ctk.CTkLabel(
+            bar, text="READY", anchor="w", font=("Consolas", 10, "bold"),
+            text_color=theme.TEXT_DIM,
+        )
+        self.status_label.grid(row=1, column=1, sticky="w")
 
         self.hint_label = ctk.CTkLabel(
-            bar, text="", anchor="e", text_color=theme.TEXT_MUTED
+            bar, text="", anchor="e", font=("Consolas", 9), text_color=theme.TEXT_MUTED
         )
-        self.hint_label.grid(row=0, column=2, sticky="e")
+        self.hint_label.grid(row=1, column=2, sticky="e")
 
     def _bind_keys(self) -> None:
         self.bind("<Escape>", lambda _e: self._emit(self._on_collapse)())
@@ -215,10 +278,20 @@ class ChatPanel(ctk.CTkToplevel):
         self.send_btn.configure(state="disabled" if busy else "normal")
 
     def set_mic(self, on: bool) -> None:
+        """Record the mic state with glyph, colour and frame -- three channels.
+
+        The button previously swapped between two emoji. An emoji is a
+        pictograph, not an instrument glyph, it renders differently per
+        machine, and it was the only thing indicating that a live microphone
+        was open. The recording state is now a filled dot in the success hue
+        inside a lit frame, matching the web console's REC indicator.
+        """
         self.mic_on = on
         self.mic_btn.configure(
-            text="🔴" if on else "🎤",
-            fg_color=theme.DANGER if on else theme.BG_ELEVATED,
+            text="●" if on else "○",
+            text_color=theme.GREEN if on else theme.TEXT_MUTED,
+            fg_color="#062A1C" if on else theme.RAISED,
+            border_color=theme.SUCCESS if on else theme.EDGE,
         )
 
     # -- transcript -------------------------------------------------------
@@ -266,13 +339,18 @@ class ChatPanel(ctk.CTkToplevel):
 
     # -- status -----------------------------------------------------------
     def set_status(self, status: str, language: str = "en") -> None:
-        self.status_label.configure(text=theme.status_text(status, language))
-        color = theme.WARNING if status == "awaiting_confirmation" else theme.ACCENT
-        if status == "disconnected":
-            color = theme.TEXT_MUTED
-        elif status == "error":
-            color = theme.DANGER
-        self.status_dot.configure(text_color=color)
+        """Update the telemetry strip from the shared state vocabulary.
+
+        Word, glyph and colour are set together. The glyph is not decoration:
+        it is the channel that keeps the state legible when colour alone would
+        not be enough.
+        """
+        word = theme.status_text(status, language)
+        color = theme.state_hue(status)
+        glyph = theme.state_glyph(status)
+
+        self.status_label.configure(text=word, text_color=color)
+        self.status_dot.configure(text=glyph, text_color=color)
 
     def set_hint(self, text: str) -> None:
         self.hint_label.configure(text=text)
@@ -283,7 +361,8 @@ class ChatPanel(ctk.CTkToplevel):
         self._pending_confirmation = payload.get("request_id")
         self.dismiss_confirmation()
 
-        card = ctk.CTkFrame(self, fg_color=theme.BG_ELEVATED, corner_radius=12)
+        card = ctk.CTkFrame(self, fg_color=theme.RAISED, corner_radius=theme.RADIUS,
+                            border_width=1, border_color=theme.WARNING)
         card.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
         card.grid_columnconfigure(0, weight=1)
         self._confirmation_card = card
@@ -294,31 +373,37 @@ class ChatPanel(ctk.CTkToplevel):
         level = payload.get("level", "high")
 
         ctk.CTkLabel(
-            card, text="Approval required",
-            font=("Segoe UI", 13, "bold"), text_color=theme.WARNING, anchor="w",
+            card, text="▲  AWAIT CONFIRM",
+            font=("Consolas", 12, "bold"), text_color=theme.WARNING, anchor="w",
         ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
 
         ctk.CTkLabel(
             card, text=str(summary), text_color=theme.TEXT, anchor="w",
-            wraplength=640, justify="left",
+            font=("Segoe UI", 12), wraplength=640, justify="left",
         ).grid(row=1, column=0, sticky="w", padx=14)
 
         if reasons:
             ctk.CTkLabel(
-                card, text="Risk: " + ", ".join(str(r) for r in reasons),
-                text_color=theme.TEXT_MUTED, anchor="w", wraplength=640, justify="left",
+                card, text="RISK: " + ", ".join(str(r) for r in reasons),
+                text_color=theme.TEXT_MUTED, anchor="w", font=("Consolas", 9),
+                wraplength=640, justify="left",
             ).grid(row=2, column=0, sticky="w", padx=14, pady=(2, 0))
 
         buttons = ctk.CTkFrame(card, fg_color="transparent")
         buttons.grid(row=3, column=0, sticky="e", padx=12, pady=(8, 12))
         ctk.CTkButton(
-            buttons, text="Deny", width=88, height=32, corner_radius=8,
-            fg_color=theme.DANGER, hover_color="#d63a58", text_color=theme.TEXT,
+            buttons, text="DENY", width=92, height=32, corner_radius=theme.RADIUS,
+            fg_color="#2A0C14", hover_color=theme.DANGER,
+            border_width=1, border_color=theme.DANGER,
+            text_color=theme.DANGER, font=("Consolas", 10, "bold"),
             command=lambda: self._resolve_confirmation(False),
         ).grid(row=0, column=0, padx=(0, 8))
         ctk.CTkButton(
-            buttons, text=f"Approve ({level})", width=120, height=32, corner_radius=8,
-            fg_color=theme.SUCCESS, hover_color="#00cc6e", text_color="#04241a",
+            buttons, text=f"APPROVE ({str(level).upper()})", width=150, height=32,
+            corner_radius=theme.RADIUS,
+            fg_color="#062A1C", hover_color=theme.SUCCESS,
+            border_width=1, border_color=theme.SUCCESS,
+            text_color=theme.SUCCESS, font=("Consolas", 10, "bold"),
             command=lambda: self._resolve_confirmation(True),
         ).grid(row=0, column=1)
 

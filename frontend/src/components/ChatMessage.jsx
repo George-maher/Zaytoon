@@ -4,61 +4,110 @@ function isArabic(text) {
   return /[\u0600-\u06FF]/.test(text);
 }
 
+/**
+ * A transcript entry, framed as a system transmission rather than a chat
+ * bubble.
+ *
+ * Each message carries a 2px accent spine on the side it is anchored to, a
+ * monospace source label, and — once a real timestamp exists — a time field.
+ * There is no per-message timestamp fabrication: `msg.ts` is only rendered
+ * when the backend actually supplied one, because inventing "14:32" on a
+ * message that has no clock reading is exactly the sort of invented
+ * telemetry this design brief forbids.
+ */
 export default memo(function ChatMessage({ msg, language }) {
   const isUser = msg.role === "user";
   const isSystem = msg.role === "system";
+  const isError = msg.type === "error";
 
-  return (
-    <div className="animate-fade-in flex"
-      style={{ justifyContent: isUser ? "flex-end" : isSystem ? "center" : "flex-start" }}
-    >
-      {isSystem ? (
-        <div className="max-w-[90%] px-3 py-1.5 rounded-sm" style={{
-          background: "rgba(0, 212, 255, 0.03)",
-          border: "1px solid rgba(0, 212, 255, 0.08)",
-        }}>
-          <p className="text-[9px] font-mono" style={{ color: "var(--text-muted)" }}>{msg.content}</p>
-        </div>
-      ) : (
-        <div className={`max-w-[85%] rounded-sm px-3 py-2 ${msg.streaming ? "border-l-[2px]" : "border"}`}
-          dir={isArabic(msg.content) ? "rtl" : "ltr"}
+  if (isSystem) {
+    return (
+      <div className="animate-fade-in flex justify-center">
+        <div
+          className="max-w-[90%] px-3 py-1"
           style={{
-            background: isUser
-              ? "rgba(0, 212, 255, 0.04)"
-              : "rgba(5, 5, 15, 0.6)",
-            borderColor: isUser
-              ? "rgba(0, 212, 255, 0.12)"
-              : msg.streaming
-              ? "rgba(0, 240, 255, 0.3)"
-              : "rgba(0, 212, 255, 0.08)",
-            borderLeftColor: msg.streaming ? "#00F0FF" : undefined,
-            boxShadow: msg.streaming
-              ? "0 0 20px rgba(0, 240, 255, 0.05)"
-              : "none",
+            background: "rgba(6, 17, 26, 0.6)",
+            border: "1px solid var(--hud-edge-faint)",
+            borderInlineStart: `2px solid ${isError ? "var(--hud-red)" : "var(--hud-text-mute)"}`,
           }}
+          role={isError ? "alert" : undefined}
         >
-          <p className="text-xs font-mono leading-relaxed whitespace-pre-wrap"
-            style={{ color: isUser ? "#B0C4FF" : "var(--text-primary)" }}
+          <p
+            className="font-mono"
+            style={{ color: isError ? "var(--hud-red)" : "var(--hud-text-dim)", fontSize: 10, lineHeight: 1.6 }}
           >
             {msg.content}
-            {msg.streaming && (
-              <span className="inline-flex gap-[2px] ml-1.5 align-middle">
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
-                <span className="w-[3px] h-[3px] rounded-full typing-dot" style={{ background: "#00F0FF" }} />
-              </span>
-            )}
           </p>
-          <div className="flex items-center gap-2 mt-1">
-            <span className="text-[7px] font-mono tracking-wider" style={{ color: isUser ? "rgba(0, 212, 255, 0.5)" : "rgba(0, 240, 255, 0.5)" }}>
-              {isUser ? (language === "ar" ? "أنت" : "YOU") : "ZAYTOON"}
-            </span>
-            {msg.streaming && (
-              <span className="text-[6px] font-mono" style={{ color: "rgba(0, 240, 255, 0.4)" }}>▍STREAM</span>
-            )}
-          </div>
         </div>
-      )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="animate-fade-in flex"
+      style={{ justifyContent: isUser ? "flex-end" : "flex-start" }}
+    >
+      <div
+        className="max-w-[85%] px-3 py-2"
+        dir={isArabic(msg.content) ? "rtl" : "ltr"}
+        style={{
+          background: isUser ? "rgba(0, 229, 255, 0.045)" : "rgba(3, 7, 13, 0.62)",
+          border: "1px solid var(--hud-edge-faint)",
+          // Spine on the anchored side; in RTL that flips with the document.
+          borderInlineStart: `2px solid ${isUser ? "var(--hud-cyan)" : "var(--hud-blue)"}`,
+          borderInlineEnd: isUser ? "none" : undefined,
+          borderInlineStartWidth: 2,
+          boxShadow: msg.streaming ? "0 0 18px rgba(0, 229, 255, 0.06)" : "none",
+        }}
+      >
+        <p
+          className="whitespace-pre-wrap leading-relaxed"
+          style={{
+            color: isUser ? "var(--hud-text)" : "var(--hud-text)",
+            fontFamily: "var(--font-body)",
+            fontSize: 13,
+          }}
+        >
+          {msg.content}
+          {msg.streaming && (
+            <span className="inline-flex gap-[2px] ml-1.5 align-middle" aria-hidden="true">
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  className="w-[3px] h-[3px] typing-dot"
+                  style={{ background: "var(--hud-cyan)" }}
+                />
+              ))}
+            </span>
+          )}
+        </p>
+        <div className="flex items-center gap-2 mt-1.5">
+          <span
+            className="font-mono"
+            style={{
+              color: isUser ? "var(--hud-cyan)" : "var(--hud-blue)",
+              fontSize: 8,
+              letterSpacing: "0.18em",
+            }}
+          >
+            {isUser ? (language === "ar" ? "أنت" : "YOU") : "ZAYTOON"}
+          </span>
+          {msg.streaming && (
+            <span
+              className="font-mono"
+              style={{ color: "var(--hud-text-mute)", fontSize: 7, letterSpacing: "0.18em" }}
+            >
+              ▍STREAM
+            </span>
+          )}
+          {msg.ts ? (
+            <span className="font-mono ml-auto" style={{ color: "var(--hud-text-mute)", fontSize: 8 }}>
+              {msg.ts}
+            </span>
+          ) : null}
+        </div>
+      </div>
     </div>
   );
 });

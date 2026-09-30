@@ -23,6 +23,23 @@ from . import theme
 TRANSPARENT_KEY = "#000001"
 
 
+def _rate_to_speed(rate: float) -> float:
+    """Convert a state's sweep period (seconds/rev) into a pulse increment.
+
+    A period of ``p`` seconds should complete one cycle in ``p``, and
+    ``_tick`` integrates ``speed`` radians per frame at 30fps, so
+    ``speed = 2*pi / (p * 30)``.
+
+    ``rate`` of 0 (offline) stops the animation outright. Idle keeps the shared
+    table's 12s period, which is a breath slow enough to read as "present but
+    not working" rather than as activity -- the previous code stopped idle
+    completely, which made a healthy-but-waiting assistant look dead.
+    """
+    if rate <= 0:
+        return 0.0
+    return (2.0 * math.pi) / (rate * 30.0)
+
+
 class OrbWindow(ctk.CTkToplevel):
     """A frameless, always-on-top, click-through-nowhere orb."""
 
@@ -152,8 +169,13 @@ class OrbWindow(ctk.CTkToplevel):
     def set_status(self, status: str) -> None:
         if status != self.status:
             self.status = status
-            # Thinking and speaking pulse; idle states hold still.
-            self._pulse_speed = 0.09 if status in theme.ACTIVE_STATES else 0.0
+            # Pulse rate is derived from the shared state's sweep period, so
+            # the orb is busy *proportionally*: thinking breathes about twice
+            # as fast as speaking, and idle holds still. Previously every
+            # active state used the same 0.09, which made "thinking" and
+            # "running a tool" indistinguishable on the one element the user
+            # is most likely to be looking at.
+            self._pulse_speed = _rate_to_speed(theme.state_rate(status))
             self.render()
 
     def set_level(self, level: float) -> None:
