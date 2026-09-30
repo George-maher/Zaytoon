@@ -1,5 +1,11 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
+/* Entry stylesheet.
+ *
+ * `theme.css` is self-contained: it opens with Tailwind's three directives and
+ * then defines every design token and HUD primitive. This file only imports it.
+ *
+ * The `@import` must be the first statement in a stylesheet (CSS requires
+ * imports to precede all other rules), so it cannot be appended after the
+ * `@tailwind` lines -- doing so fails the build with
+ * "[@import] statements must precede all other statements".
+ */
 @import './theme.css';
