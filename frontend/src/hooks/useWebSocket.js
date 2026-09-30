@@ -523,12 +523,10 @@ export default function useWebSocket() {
         isProcessingRef.current = false;
         return;
       }
-      console.log(`Sending audio blob: ${blob.size} bytes, type=${blob.type}`);
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64 = reader.result.split(",")[1];
         if (isSocketOpen()) {
-          console.log(`Base64 prefix: ${base64.slice(0, 8)}`);
           addMessage("user", "\uD83C\uDFA4");
           wsRef.current.send(JSON.stringify({ type: "audio", audio: base64, language, isManualVoice }));
           setIsTyping(true);
@@ -542,11 +540,14 @@ export default function useWebSocket() {
     [addMessage, language, isSocketOpen],
   );
 
+  // Prefers opus/webm because that is what faster-whisper decodes most
+  // reliably. The selected MIME type is reported by the out-of-range warning
+  // in transmitAudio when something is actually wrong, so it is not logged on
+  // every recording.
   const _createRecorder = (stream) => {
     const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
     for (const mime of types) {
       if (MediaRecorder.isTypeSupported(mime)) {
-        console.log(`Using MediaRecorder mimetype: ${mime}`);
         return new MediaRecorder(stream, { mimeType: mime });
       }
     }

@@ -194,3 +194,12 @@ class BackendClient:
 
     def respond_to_confirmation(self, request_id: str, approved: bool) -> bool:
         return self.send(protocol.tool_confirm(request_id, approved))
+
+    def reminder_cmd(self, action: str, reminder_id: int | None = None) -> bool:
+        """List, complete, or delete a reminder.
+
+        ``ValueError`` from a bad action or a missing id propagates rather than
+        being swallowed: it is a programming error in the caller, and silently
+        dropping it would leave the user clicking a button that does nothing.
+        """
+        return self.send(protocol.reminder_cmd(action, reminder_id))

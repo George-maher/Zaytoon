@@ -287,21 +287,30 @@ class MemoryAgent:
             return [dict(row) for row in rows]
 
     async def delete_reminder(self, reminder_id: int) -> bool:
+        """Delete a reminder. Returns whether a row was actually removed.
+
+        These used to return ``True`` unconditionally, so deleting an id that
+        did not exist reported success. The WebSocket handler relays that flag
+        to the UI as "Deleted.", and the desktop removes the row from its panel
+        on it -- so a stale or already-fired id made the app assert an action it
+        never performed. The row count is the only honest answer.
+        """
         await self._ensure_initialized()
         db = await self._get_db()
-        await db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        cursor = await db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
         await db.commit()
-        return True
+        return cursor.rowcount > 0
 
     async def complete_reminder(self, reminder_id: int) -> bool:
+        """Mark a reminder completed. Returns whether a row was updated."""
         await self._ensure_initialized()
         db = await self._get_db()
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE reminders SET status = 'completed' WHERE id = ?",
             (reminder_id,),
         )
         await db.commit()
-        return True
+        return cursor.rowcount > 0
 
     async def get_due_reminders(self) -> List[Dict[str, Any]]:
         await self._ensure_initialized()

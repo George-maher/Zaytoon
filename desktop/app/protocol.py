@@ -51,6 +51,35 @@ def tool_confirm(request_id: str, approved: bool) -> dict:
     }
 
 
+#: Actions the backend accepts on a ``reminder_cmd``. Kept here so the shell
+#: and the service cannot drift: the backend dispatches on exactly these.
+REMINDER_ACTIONS = ("list", "delete", "done")
+
+
+def reminder_cmd(action: str, reminder_id: int | None = None) -> dict:
+    """Ask the backend to list, complete, or delete a reminder.
+
+    The shell used to render reminders but had no way to *act* on them: it
+    handled the inbound ``reminder``/``reminder_list``/``reminder_done``/
+    ``reminder_deleted`` events, yet could not send the command that produces
+    the list or changes one, so the panel was read-only and the user had to
+    fall back to the browser app to clear a reminder.
+
+    ``id`` is required for ``delete`` and ``done`` and omitted for ``list``,
+    matching the backend's handler.
+    """
+    if action not in REMINDER_ACTIONS:
+        raise ValueError(
+            f"unknown reminder action {action!r}; expected one of {REMINDER_ACTIONS}"
+        )
+    payload: dict = {"type": "reminder_cmd", "action": action}
+    if action in ("delete", "done"):
+        if reminder_id is None:
+            raise ValueError(f"reminder action {action!r} requires a reminder id")
+        payload["id"] = int(reminder_id)
+    return payload
+
+
 # --- inbound --------------------------------------------------------------
 
 

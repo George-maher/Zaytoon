@@ -15,24 +15,9 @@ Design notes
   to PCM before being fed to the audio output stream.
 """
 
-# Audio decoder for TTS chunks
-import io
-import threading
-
-try:
-    from pydub import AudioSegment
-    _PYDUB_AVAILABLE = True
-except ImportError:
-    _PYDUB_AVAILABLE = False
-
-try:
-    import ffmpeg
-    _FFMPEG_AVAILABLE = True
-except ImportError:
-    _FFMPEG_AVAILABLE = False
-
 from __future__ import annotations
 
+import io
 import logging
 import queue
 import threading
@@ -40,6 +25,10 @@ from collections import deque
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+#: Set once, the first time a decode fails, so a missing decoder is reported
+#: in the log exactly once instead of on every chunk of every reply.
+_decoder_error_logged = False
 
 try:
     import numpy as np
@@ -51,77 +40,206 @@ try:
 except ImportError:  # pragma: no cover
     sd = None  # type: ignore[assignment]
 
+#: PyAV is the MP3 decoder. It matters that this is PyAV and not pydub:
+#: pydub is only a wrapper around the *ffmpeg binary*, which is not installed
+#: on a default Windows machine, so a pydub-based decoder silently yields zero
+#: bytes and the user hears nothing. PyAV links ffmpeg as a library, so it
+#: works from a plain `pip install` with no external tool.
+try:
+    import av  # noqa: F401
+    _AV_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only without PyAV
+    _AV_AVAILABLE = False
+
+# Fallbacks, tried in order, if PyAV is somehow unavailable. Probed with
+# find_spec rather than imported: `import pydub` emits a RuntimeWarning about
+# the missing ffmpeg binary on every single start, and neither fallback is
+# reached while PyAV works.
+def _module_present(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):  # pragma: no cover
+        return False
+
+
+_PYDUB_AVAILABLE = _module_present("pydub")
+_FFMPEG_AVAILABLE = _module_present("ffmpeg")
+
 #: Bytes per sample for 16-bit mono audio.
 BYTES_PER_SAMPLE = 2
+
+
+def _log_decoder_missing_once() -> None:
+    """Report an absent decoder exactly once per process.
+
+    The previous decoder caught every exception and returned ``b""``, which
+    turned "no decoder on this machine" into silence: the reply appeared to
+    work, the transcript looked fine, and the only symptom was no sound. A
+    missing dependency must be loud.
+    """
+    global _decoder_error_logged
+    if not _decoder_error_logged:
+        _decoder_error_logged = True
+        logger.error(
+            "no MP3 decoder available — TTS will be SILENT. Install PyAV "
+            "(`pip install av`), which needs no external ffmpeg binary. "
+            "pydub/ffmpeg-python are fallbacks but both require ffmpeg on PATH."
+        )
+
+
+def _log_decoder_error_once(message: str) -> None:
+    """Report a decode failure once, so a log storm cannot hide it."""
+    global _decoder_error_logged
+    if not _decoder_error_logged:
+        _decoder_error_logged = True
+        logger.error("MP3 decode error (further errors suppressed): %s", message)
 
 
 # ---------------------------------------------------------------------------
 # MP3 to PCM Decoder
 # ---------------------------------------------------------------------------
 class Mp3Decoder:
-    """Decodes MP3 audio chunks to 16-bit PCM for playback.
-    
-    Uses pydub (which uses ffmpeg) for robust MP3 decoding with proper
-    frame boundary handling. Falls back to ffmpeg-python if pydub unavailable.
+    """Decodes a streamed MP3 response into 16-bit PCM for playback.
+
+    Why this is not "decode each chunk as it arrives"
+    -------------------------------------------------
+    MP3 frames are not independently decodable. Each frame's ``main_data_begin``
+    points *backwards* into a bit reservoir carried by the preceding frames, so
+    a frame decoded without that history decodes to the wrong samples. The
+    first decoder here re-opened the container on a growing prefix and emitted
+    whatever parsed, discarding the undecoded remainder; on a real edge-tts
+    reply fed in small pieces that produced 98% near-silence with a peak of
+    5120 instead of 23831 — audible as clicks and gaps, not speech.
+
+    So the compressed stream is kept whole and decoded from frame zero, and
+    only the PCM *tail* beyond what has already been emitted is returned. The
+    decode is repeated per chunk (O(n^2) in principle, milliseconds in
+    practice for reply-sized audio) because correctness here is worth far more
+    than the redundant work: a reply is a few hundred kilobytes and the
+    alternative is audio nobody can hear.
     """
-    
+
+    #: Hard cap on retained compressed audio. A long reply is well under this;
+    #: the cap exists so a missing ``audio_end`` cannot leak memory forever.
+    MAX_BUFFER = 16 * 1024 * 1024
+
     def __init__(self, target_sample_rate: int = 24000, target_channels: int = 1):
         self.target_sample_rate = target_sample_rate
         self.target_channels = target_channels
         self._mp3_buffer = bytearray()
+        self._emitted = 0
         self._initialized = False
-        
+
+    @property
+    def available(self) -> bool:
+        """True when some decoder backend is importable."""
+        return _AV_AVAILABLE or _PYDUB_AVAILABLE or _FFMPEG_AVAILABLE
+
     def _init_decoder(self):
         """Initialize the MP3 decoder."""
         if self._initialized:
             return
         self._initialized = True
-        
+        if not self.available:
+            _log_decoder_missing_once()
+
     def decode(self, mp3_chunk: bytes) -> bytes:
-        """Decode an MP3 chunk to 16-bit PCM bytes.
-        
-        Returns empty bytes if the chunk doesn't contain a complete frame.
-        """
-        if not mp3_chunk:
+        """Add a chunk and return whatever new PCM is now decodable."""
+        if mp3_chunk:
+            self._init_decoder()
+            self._mp3_buffer.extend(mp3_chunk)
+
+        if not self._mp3_buffer:
             return b""
-            
-        self._init_decoder()
-        self._mp3_buffer = getattr(self, '_mp3_buffer', bytearray())
-        self._mp3_buffer.extend(mp3_chunk)
-        
-        if not _PYDUB_AVAILABLE:
-            return self._decode_with_ffmpeg(mp3_chunk)
-            
+
+        if _AV_AVAILABLE:
+            pcm = self._decode_with_av()
+        elif _PYDUB_AVAILABLE:
+            pcm = self._decode_with_pydub()
+        elif _FFMPEG_AVAILABLE:
+            pcm = self._decode_with_ffmpeg(bytes(self._mp3_buffer))
+        else:
+            _log_decoder_missing_once()
+            return b""
+
+        if len(pcm) <= self._emitted:
+            # Nothing new yet: the trailing frame is still incomplete. The
+            # stream is deliberately *not* reset, because the next chunk needs
+            # the bytes already buffered to decode that frame correctly.
+            if len(self._mp3_buffer) > self.MAX_BUFFER:
+                _log_decoder_error_once(
+                    f"compressed buffer reached {len(self._mp3_buffer)} bytes "
+                    "without new audio; resetting decoder"
+                )
+                self.reset()
+            return b""
+
+        fresh = pcm[self._emitted :]
+        self._emitted = len(pcm)
+        return fresh
+
+    def _decode_with_av(self) -> bytes:
+        """Decode with PyAV, which links ffmpeg as a library (no binary)."""
+        import av
+
+        data = bytes(self._mp3_buffer)
+        if not data:
+            return b""
+        out: list[bytes] = []
+        container = None
         try:
-            mp3_data = bytes(self._mp3_buffer)
-            
-            # Try to decode - pydub needs a complete MP3 frame
-            audio = AudioSegment.from_file(
-                io.BytesIO(mp3_data), 
-                format="mp3"
+            container = av.open(io.BytesIO(data))
+            resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=self.target_sample_rate
             )
-            
-            # Convert to target format
-            audio = audio.set_frame_rate(self.target_sample_rate)
-            audio = audio.set_channels(self.target_channels)
-            audio = audio.set_sample_width(2)  # 16-bit
-            
-            # Clear buffer since we successfully decoded
-            self._mp3_buffer = bytearray()
-            
-            return audio.raw_data
-            
-        except Exception:
-            # Not enough data for a complete frame, or decode error
-            if len(self._mp3_buffer) > 100000:  # 100KB buffer limit
-                self._mp3_buffer = bytearray()
+            for frame in container.decode(audio=0):
+                for resampled in resampler.resample(frame):
+                    out.append(resampled.to_ndarray().tobytes())
+            for resampled in resampler.resample(None):
+                out.append(resampled.to_ndarray().tobytes())
+        except av.FFmpegError as exc:
+            # Expected while streaming: the buffer ends mid-frame, so the
+            # demuxer hits an incomplete packet. Whatever decoded before that
+            # point is still valid and is returned, so this is not a failure
+            # and must not be logged as one.
+            logger.debug("av decode stopped on a partial frame: %s", exc)
+        except Exception as exc:
+            _log_decoder_error_once(f"av decode failed: {type(exc).__name__}: {exc}")
+        finally:
+            if container is not None:
+                try:
+                    container.close()
+                except Exception:  # pragma: no cover
+                    pass
+        return b"".join(out)
+
+    def _decode_with_pydub(self) -> bytes:
+        """Fallback via pydub, which requires the ffmpeg *binary* on PATH."""
+        if not _PYDUB_AVAILABLE:
             return b""
+        try:
+            from pydub import AudioSegment
+
+            audio = AudioSegment.from_file(
+                io.BytesIO(bytes(self._mp3_buffer)), format="mp3"
+            )
+        except Exception as exc:
+            _log_decoder_error_once(f"pydub decode failed: {type(exc).__name__}: {exc}")
+            return b""
+        audio = audio.set_frame_rate(self.target_sample_rate)
+        audio = audio.set_channels(self.target_channels)
+        audio = audio.set_sample_width(2)
+        return audio.raw_data
             
     def _decode_with_ffmpeg(self, mp3_chunk: bytes) -> bytes:
         """Fallback decoder using ffmpeg-python."""
         if not _FFMPEG_AVAILABLE:
             return b""
-            
+
+        import ffmpeg
+
         try:
             process = (
                 ffmpeg
@@ -136,16 +254,17 @@ class Mp3Decoder:
             return b""
             
     def flush(self) -> bytes:
-        """Flush any remaining buffered data."""
-        buffer = getattr(self, '_mp3_buffer', bytearray())
-        if buffer:
-            self._mp3_buffer = bytearray()
-            return self.decode(bytes(buffer))
-        return b""
-        
+        """Return any PCM that only became decodable at end-of-stream."""
+        return self.decode(b"")
+
     def reset(self):
-        """Reset the decoder state."""
+        """Reset the decoder state.
+
+        Called on interrupt so the next response starts a fresh MP3 stream
+        instead of being appended to the interrupted one.
+        """
         self._mp3_buffer = bytearray()
+        self._emitted = 0
 
 
 #: Bytes per sample for 16-bit mono audio.
@@ -473,14 +592,18 @@ class AudioPlayer:
             self._playing.set()
 
     def clear(self) -> None:
-        # Flush any remaining buffered MP3 data
-        pcm = self._decoder.flush()
-        if pcm:
-            with self._lock:
-                self._pending.append(pcm)
+        """Drop everything queued and start the next response from scratch.
+
+        This is the interrupt path, so it *resets* rather than flushes: a
+        flush would emit whatever partial MP3 the interrupted response had
+        buffered (audible as a truncated fragment after the user hit stop) and
+        would leave the decoder mid-stream, so the next response's MP3 would be
+        appended to this one's and both would be corrupt.
+        """
         with self._lock:
             self._pending.clear()
             self._current = b""
+        self._decoder.reset()
         self._playing.clear()
 
     def wait_idle(self, timeout: float = 0.05, max_wait: float = 30.0) -> bool:

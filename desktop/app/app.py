@@ -364,15 +364,27 @@ class ZaytoonApp:
             self.panel.show_reminders(reminders)
             return
         if event.type is protocol.EventType.REMINDER_DELETED:
-            reminder_id = event.data.get("id")
-            if reminder_id is not None:
-                self.panel.remove_reminder(reminder_id)
+            self._resolve_reminder(event, "deleted")
             return
         if event.type is protocol.EventType.REMINDER_DONE:
-            reminder_id = event.data.get("id")
-            if reminder_id is not None:
-                self.panel.remove_reminder(reminder_id)
+            self._resolve_reminder(event, "completed")
             return
+
+    def _resolve_reminder(self, event, verb: str) -> None:
+        """Drop a reminder from the panel, but only if the backend did it.
+
+        The row was removed unconditionally, so a request for an id that no
+        longer existed made the row vanish and the app implied a deletion that
+        never happened. The backend now reports ``success`` honestly; honour it
+        and surface the reason when it declines.
+        """
+        reminder_id = event.data.get("id")
+        if reminder_id is None:
+            return
+        if event.data.get("success") is False:
+            self.panel.add_message("system", event.data.get("message", "No such reminder."))
+            return
+        self.panel.remove_reminder(reminder_id)
 
     def _set_status(self, status: str) -> None:
         self.status = status

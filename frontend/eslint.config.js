@@ -76,4 +76,13 @@ export default [
       'no-empty': 'off',
     },
   },
+  {
+    // Build/dev scripts run under Node, not the browser: they use __dirname,
+    // process and fetch. Without this they are linted against browser globals
+    // and every one of those is reported as undefined.
+    files: ['scripts/**/*.{js,cjs,mjs}', '*.config.{js,cjs,mjs}'],
+    languageOptions: {
+      globals: { ...globals.node },
+    },
+  },
 ]

@@ -273,13 +273,21 @@ async def create_websocket_handler(
                     })
                 elif action == "delete" and rid is not None:
                     ok = await reminder_service.delete(int(rid))
-                    msg = "Deleted." if lang == "en" else "تم الحذف."
+                    if ok:
+                        msg = "Deleted." if lang == "en" else "تم الحذف."
+                    else:
+                        # Never claim an action that did not happen: the client
+                        # removes the row from its panel on success.
+                        msg = "No such reminder." if lang == "en" else "لا يوجد تذكير بهذا المعرف."
                     await connection_manager.send(websocket, {
                         "type": "reminder_deleted", "id": int(rid), "success": ok, "message": msg,
                     })
                 elif action == "done" and rid is not None:
                     ok = await reminder_service.mark_completed(int(rid))
-                    msg = "Marked as done." if lang == "en" else "تم."
+                    if ok:
+                        msg = "Marked as done." if lang == "en" else "تم."
+                    else:
+                        msg = "No such reminder." if lang == "en" else "لا يوجد تذكير بهذا المعرف."
                     await connection_manager.send(websocket, {
                         "type": "reminder_done", "id": int(rid), "success": ok, "message": msg,
                     })
@@ -652,6 +660,7 @@ async def _handle_message(
         except Exception:
             pass
 
+    tts_task = None
     if not tts_triggered:
         await connection_manager.send(websocket, {"type": "status", "content": "speaking"})
         tts_task = asyncio.create_task(
@@ -674,6 +683,28 @@ async def _handle_message(
             )
             if state:
                 state.tts_task = tts_task
+
+    # The terminal status is emitted *after* the TTS stream drains, not when the
+    # task is merely created. It was previously sent immediately, so the client
+    # received `done` and `listening` before a single audio_chunk had arrived
+    # and the UI reported "listening" for the whole time the assistant was
+    # audibly speaking. The wait is bounded so a wedged TTS provider cannot
+    # leave the turn without a terminal frame.
+    if tts_task is not None and not cancel_event.is_set():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(tts_task),
+                timeout=config.TTS_TIMEOUT if hasattr(config, "TTS_TIMEOUT") else 120.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Session %s: TTS drain timed out; sending terminal status", session_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Session %s: TTS task raised: %s", session_id, exc)
+
+    if cancel_event and cancel_event.is_set():
+        return
 
     await connection_manager.send(websocket, {
         "type": "status", "content": "done", "response_id": response_id,
