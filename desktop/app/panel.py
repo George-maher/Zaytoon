@@ -1,69 +1,222 @@
-"""The expanded chat panel.
+"""The application shell: header, core, transcript, side panel, composer.
 
-A frameless, always-on-top window holding the transcript, the composer, the
-human-in-the-loop approval dialog, and a live status bar. Every widget is
-created once and updated in place — rebuilding the message list on each token
-would flicker and leak widgets.
+Layout contract (the row constants below name every grid position, because a
+transposed index renders as an invisible row):
+
+* the window is an ordinary toplevel — OS title bar, OS resize borders,
+  maximize; no ``overrideredirect``;
+* the **transcript is the only weighted cell**, so growth goes to the
+  conversation while the header, composer and status line keep their height at
+  any window size;
+* the core column and the side panel have fixed widths and are dropped (along
+  with their column ``minsize``) when the window is too narrow for them — see
+  :func:`layout_plan`, which is pure and therefore testable;
+* ``minsize`` (``MIN_WIDTH``/``MIN_HEIGHT``) is the floor, ``<Configure>``
+  re-applies the layout plan and rewraps the transcript, so text follows the
+  window instead of clipping.
+
+Widgets here dispatch: every action reaches ``app.py`` through the callbacks
+passed to ``__init__``, and every display value is pushed in from outside. No
+connection, protocol or business logic lives in this file.
 """
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
+from dataclasses import dataclass
 
 import customtkinter as ctk
 
-from . import theme
+from . import dialogs, states, theme
+from .activity import ActivityFeed
+from .core import CoreCanvas
+from .header import HeaderBar
+from .sidepanel import PANEL_WIDTH, SidePanel
+from .states import UiState
+
+#: Smallest window the shell accepts: header, one confirmation, the composer
+#: and the status bar all still fit at 420x380.
+MIN_WIDTH = 420
+MIN_HEIGHT = 380
+
+#: Grid rows/columns of the shell itself.
+HEADER_ROW = 0
+BODY_ROW = 1
+QUICK_ROW = 2
+COMPOSER_ROW = 3
+STATUS_ROW = 4
+BODY_COLUMN = 0
+
+#: Below these window widths the core / side panel yield their space back to
+#: the transcript (and their column minsize goes with them).
+CORE_MIN_WIDTH = 640
+SIDE_MIN_WIDTH = 900
+#: Header pills collapse a little earlier than the core does.
+COMPACT_WIDTH = 700
+
+CORE_WIDTH = 150
+
+#: Quick actions are fixed phrases the router already recognises.
+QUICK_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("RUN TESTS", "run tests"),
+    ("GIT STATUS", "git status"),
+    ("SYSTEM INFO", "system info"),
+)
+
+
+def compute_wrap(
+    width: int,
+    *,
+    base: int = theme.WRAP_BASE,
+    margin: int = theme.WRAP_MARGIN,
+    floor: int = theme.WRAP_MIN,
+) -> int:
+    """Transcript wraplength for a container of ``width`` pixels.
+
+    Bounded above so a very wide window still produces readable line lengths,
+    and below so a narrow one cannot collapse the text into a column.
+    """
+    return max(floor, min(base, int(width) - margin))
+
+
+@dataclass(frozen=True)
+class LayoutPlan:
+    """Which optional columns this window width can afford."""
+
+    core: bool
+    side: bool
+    core_width: int = 0
+    side_width: int = 0
+
+
+def layout_plan(width: int, side_enabled: bool = True) -> LayoutPlan:
+    """Decide the shell's column set from the window width.
+
+    Pure, so the resize behaviour is testable without moving a real window:
+    at the 420px floor it is transcript-only, at the default 820 it gains the
+    core, and only a genuinely wide window gets the side panel as well.
+    """
+    core = int(width) >= CORE_MIN_WIDTH
+    side = bool(side_enabled) and int(width) >= SIDE_MIN_WIDTH
+    return LayoutPlan(
+        core=core,
+        side=side,
+        core_width=CORE_WIDTH if core else 0,
+        side_width=PANEL_WIDTH if side else 0,
+    )
+
+
+@dataclass(frozen=True)
+class RowStyle:
+    """How a transcript row of a given role is drawn."""
+
+    align: str          # "left" | "right"
+    anchor: str         # tk anchor for the bubble
+    spine: str          # accent edge colour
+    background: str     # bubble fill
+    text: str           # bubble text colour
+    justify: str
+
+
+#: One table, so the transcript cannot render the same role two ways.
+_ROW_STYLES: dict[str, RowStyle] = {
+    "user": RowStyle(
+        align="right", anchor="e", spine=theme.CYAN,
+        background=theme.tint(theme.CYAN, 0.08, theme.BG1),
+        text=theme.TEXT_BASE, justify="right",
+    ),
+    "assistant": RowStyle(
+        align="left", anchor="w", spine=theme.VIOLET,
+        background=theme.BG2, text=theme.TEXT_BASE, justify="left",
+    ),
+    "system": RowStyle(
+        align="left", anchor="w", spine=theme.TEXT_FAINT,
+        background=theme.BG1, text=theme.TEXT_MUTE, justify="left",
+    ),
+    "error": RowStyle(
+        align="left", anchor="w", spine=theme.RED,
+        background=theme.tint(theme.RED, 0.08, theme.BG1),
+        text=theme.TEXT_BASE, justify="left",
+    ),
+}
+
+
+def row_style(role: str) -> RowStyle:
+    """Unknown roles read as system rather than raising mid-stream."""
+    return _ROW_STYLES.get(role, _ROW_STYLES["system"])
 
 
 class MessageRow(ctk.CTkFrame):
-    """One transcript entry, framed as a system transmission.
+    """One transcript entry: bubble, accent edge, monospace timestamp chip."""
 
-    Square corners and a 2px accent spine on the anchored side, rather than a
-    rounded bubble. The spine is cyan for the human and blue for the assistant,
-    so the two remain distinguishable in greyscale as well as by colour.
-    """
-
-    def __init__(self, master, role: str, text: str = "") -> None:
+    def __init__(self, master, role: str, text: str = "", trace_id: str | None = None) -> None:
         super().__init__(master, fg_color="transparent")
         self.role = role
+        self.trace_id = trace_id
+        self.style = row_style(role)
+        self.timestamp = time.strftime("%H:%M:%S")
 
-        if role == "user":
-            spine, justify, anchor = theme.CYAN, "right", "e"
-        elif role == "assistant":
-            spine, justify, anchor = theme.BLUE, "left", "w"
-        elif role == "system":
-            spine, justify, anchor = theme.TEXT_MUTED, "left", "w"
-        else:
-            spine, justify, anchor = theme.DANGER, "left", "w"
+        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer.pack(fill="x")
 
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=(48 if role != "user" else 0, 48 if role == "user" else 0))
-
-        marker = ctk.CTkFrame(row, width=2, fg_color=spine, corner_radius=0)
-        marker.pack(side="left", fill="y", padx=(0, 8))
-
-        self.bubble = ctk.CTkLabel(
-            row,
-            text=text,
-            fg_color=theme.DEEP,
-            text_color=theme.TEXT,
-            corner_radius=theme.RADIUS,
-            wraplength=560,
-            justify=justify,
-            anchor=anchor,
-            padx=12,
-            pady=8,
-            font=("Segoe UI", 12),
+        bubble = ctk.CTkFrame(
+            outer, fg_color=self.style.background,
+            corner_radius=theme.RADIUS_CARD,
         )
-        self.bubble.pack(side="left", fill="x", expand=True)
-        self._label = self.bubble
+        if self.style.align == "right":
+            bubble.pack(anchor="e", padx=(theme.SPACE_6, 0))
+        else:
+            bubble.pack(anchor="w", padx=(0, theme.SPACE_6))
+
+        # A plain Tk frame on purpose: ctk.CTkFrame defaults to height=200,
+        # which is inherited even with fill="y" and forces every row to 300
+        # physical px of empty space. Tk.Frame with no -height has no opinion.
+        if self.style.align == "right":
+            tk.Frame(bubble, width=theme.SPINE_W, bg=self.style.spine).pack(
+                side="right", fill="y"
+            )
+        else:
+            tk.Frame(bubble, width=theme.SPINE_W, bg=self.style.spine).pack(
+                side="left", fill="y"
+            )
+
+        self._label = ctk.CTkLabel(
+            bubble, text=text, fg_color="transparent",
+            text_color=self.style.text,
+            wraplength=theme.WRAP_BASE,
+            justify=self.style.justify,
+            anchor=self.style.anchor,
+            padx=theme.SPACE_3, pady=theme.SPACE_2,
+            font=(theme.FONT_SANS, theme.FONT_BODY),
+        )
+        self._label.pack(fill="x")
+        self.bubble = self._label
+
+        # Timestamp chip: monospace, faint, never competing with the text.
+        tag = "YOU" if role == "user" else ("ZAYTOON" if role == "assistant" else role.upper())
+        chip = ctk.CTkLabel(
+            outer, text=f"{tag}  {self.timestamp}",
+            font=(theme.FONT_MONO, 9),
+            text_color=theme.TEXT_FAINT,
+            anchor="e" if self.style.align == "right" else "w",
+        )
+        chip.pack(anchor="e" if self.style.align == "right" else "w",
+                  padx=(theme.SPACE_6, 0) if self.style.align == "right" else (theme.SPACE_5, 0))
 
     def set_text(self, text: str) -> None:
         self._label.configure(text=text)
 
+    def get_text(self) -> str:
+        return str(self._label.cget("text"))
+
+    def set_wraplength(self, wrap: int) -> None:
+        """Re-flow the text to the container's current width."""
+        self._label.configure(wraplength=wrap)
+
 
 class ChatPanel(ctk.CTkToplevel):
-    """Expanded window: transcript, composer, approvals, status bar."""
+    """The expanded window: header, core, transcript, side panel, composer."""
 
     def __init__(
         self,
@@ -77,12 +230,14 @@ class ChatPanel(ctk.CTkToplevel):
         on_collapse=None,
         on_confirm=None,
         on_quit=None,
+        on_settings=None,
+        config=None,
     ) -> None:
         super().__init__(master)
         self.title("Zaytoon AI")
         self.geometry(f"{width}x{height}")
-        self.configure(fg_color=theme.BG)
-        self.minsize(420, 380)
+        self.configure(fg_color=theme.BG0)
+        self.minsize(MIN_WIDTH, MIN_HEIGHT)
 
         self._on_send = on_send
         self._on_mic_toggle = on_mic_toggle
@@ -90,168 +245,263 @@ class ChatPanel(ctk.CTkToplevel):
         self._on_collapse = on_collapse
         self._on_confirm = on_confirm
         self._on_quit = on_quit
+        self._on_settings = on_settings
+        self._config = config
+        self._initial_width = int(width)
 
         self._rows: list[MessageRow] = []
         self._streaming: MessageRow | None = None
-        self._pending_confirmation: str | None = None
+        self._pending_confirmation: dialogs.ConfirmationState | None = None
+        self._dialog: dialogs.ConfirmationDialog | None = None
+        self._settings_dialog = None
+        self._wrap = 0
+        self._plan: LayoutPlan | None = None
+        self._side_enabled = True
         self.mic_on = False
+        self.busy = False
 
         self._build()
         self._bind_keys()
 
     # -- construction -----------------------------------------------------
     def _build(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(BODY_COLUMN, weight=1)
+        self.grid_rowconfigure(BODY_ROW, weight=1)
 
         self._build_header()
 
-        # Transcript
-        self.transcript = ctk.CTkScrollableFrame(self, fg_color=theme.BG, corner_radius=0)
-        self.transcript.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
-        self.transcript.grid_columnconfigure(0, weight=1)
+        # Body: activity strip over the three-column content row.
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=BODY_ROW, column=BODY_COLUMN, sticky="nsew",
+                  padx=theme.SPACE_3, pady=(0, 0))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(1, weight=1)
+        self._body = body
 
+        self.activity = ActivityFeed(body)
+        self.activity.grid(row=0, column=0, sticky="ew", pady=(0, theme.SPACE_2))
+        # Gridded once (so its options are remembered) and then hidden: the
+        # feed appears only when the turn has something to report.
+        self.activity.grid_remove()
+
+        content = ctk.CTkFrame(body, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew")
+        self._content = content
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)  # the transcript grows
+
+        # col 0: the reactive core (dropped when narrow)
+        self.core = CoreCanvas(content)
+        self.core.grid(row=0, column=0, sticky="n", padx=(0, theme.SPACE_3))
+
+        # col 1: the transcript
+        self.transcript = ctk.CTkScrollableFrame(
+            content, fg_color=theme.BG1, corner_radius=theme.RADIUS_PANEL,
+            border_width=1, border_color=theme.HAIRLINE,
+        )
+        self.transcript.grid(row=0, column=1, sticky="nsew")
+        self.transcript.grid_columnconfigure(0, weight=1)
+        self.transcript.bind("<Configure>", self._on_transcript_configure)
+
+        # col 2: the telemetry side panel
+        self.side = SidePanel(content)
+        self.side.grid(row=0, column=2, sticky="nsew", padx=(theme.SPACE_3, 0))
+
+        self._build_quick_actions()
         self._build_composer()
         self._build_status_bar()
+        self._apply_layout(self._window_width())
 
     def _build_header(self) -> None:
-        """Identity block plus window controls, on a hairline-ruled header."""
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
-        header.grid_columnconfigure(0, weight=1)
+        # Wrapped so the hairline sits *under* the bar at any window height
+        # instead of at one magic pady (two widgets in one grid cell overlap).
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.grid(row=HEADER_ROW, column=BODY_COLUMN, sticky="ew",
+                  padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
+        wrap.grid_columnconfigure(0, weight=1)
 
-        # Identity mark: a framed "Z" plus the wordmark, matching the web
-        # header's square badge + letterspaced identity.
-        badge = ctk.CTkFrame(header, width=28, height=28, fg_color=theme.RAISED,
-                             border_width=1, border_color=theme.EDGE_STRONG,
-                             corner_radius=theme.RADIUS)
-        badge.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(
-            badge, text="Z", width=28, height=28, font=("Consolas", 15, "bold"),
-            text_color=theme.CYAN_CORE,
-        ).place(relx=0.5, rely=0.5, anchor="center")
-
-        titles = ctk.CTkFrame(header, fg_color="transparent")
-        titles.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        ctk.CTkLabel(
-            titles, text="Z A Y T O O N", anchor="w",
-            font=("Consolas", 13, "bold"), text_color=theme.CYAN_CORE,
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            titles, text="TACTICAL COMMAND INTERFACE", anchor="w",
-            font=("Consolas", 8), text_color=theme.TEXT_MUTED,
-        ).pack(anchor="w")
-
-        # 1px rule under the header, the web's panel divider.
-        ctk.CTkFrame(self, height=1, fg_color=theme.EDGE_FAINT,
-                     corner_radius=0).grid(row=0, column=0, sticky="sew", padx=16,
-                                           pady=(52, 0))
-
-        self.collapse_btn = ctk.CTkButton(
-            header, text="—", width=32, height=26, corner_radius=theme.RADIUS,
-            fg_color=theme.RAISED, hover_color=theme.EDGE,
-            border_width=1, border_color=theme.EDGE,
-            text_color=theme.TEXT_DIM, command=self._emit(self._on_collapse),
+        self.header = HeaderBar(
+            wrap,
+            on_settings=self.open_settings,
+            on_minimize=self._win_minimize,
+            on_maximize=self._win_maximize,
+            on_close=self._emit(self._on_collapse) if self._on_collapse else self._emit(self._on_quit),
+            on_toggle_side=self.toggle_side,
         )
-        self.collapse_btn.grid(row=0, column=2, padx=(8, 6))
+        self.header.pack(fill="x")
+        tk.Frame(wrap, height=1, bg=theme.HAIRLINE).pack(fill="x", pady=(theme.SPACE_2, 0))
 
-        self.quit_btn = ctk.CTkButton(
-            header, text="✕", width=32, height=26, corner_radius=theme.RADIUS,
-            fg_color=theme.RAISED, hover_color=theme.DANGER,
-            border_width=1, border_color=theme.EDGE,
-            text_color=theme.TEXT_DIM, command=self._emit(self._on_quit),
-        )
-        self.quit_btn.grid(row=0, column=3)
+    def _build_quick_actions(self) -> None:
+        quick = ctk.CTkFrame(self, fg_color="transparent")
+        quick.grid(row=QUICK_ROW, column=BODY_COLUMN, sticky="ew",
+                   padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
+        ctk.CTkLabel(
+            quick, text=theme.letterspace("QUICK"), anchor="w",
+            font=(theme.FONT_MONO, theme.FONT_SECTION, "bold"),
+            text_color=theme.TEXT_FAINT,
+        ).pack(side="left", padx=(0, theme.SPACE_2))
+        for text, message in QUICK_ACTIONS:
+            ctk.CTkButton(
+                quick, text=text, height=22,
+                corner_radius=theme.RADIUS_CONTROL,
+                fg_color=theme.BG2, hover_color=theme.HAIRLINE,
+                border_width=1, border_color=theme.HAIRLINE,
+                text_color=theme.TEXT_MUTE,
+                font=(theme.FONT_MONO, theme.FONT_SECTION),
+                command=lambda m=message: self._quick(m),
+            ).pack(side="left", padx=(0, theme.SPACE_2))
 
     def _build_composer(self) -> None:
-        """Command console: prompt glyph, input, mic, stop, send."""
-        console = ctk.CTkFrame(self, fg_color=theme.DEEP, corner_radius=theme.RADIUS,
-                               border_width=1, border_color=theme.EDGE)
-        console.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        console = ctk.CTkFrame(
+            self, fg_color=theme.BG1, corner_radius=theme.RADIUS_PANEL,
+            border_width=1, border_color=theme.HAIRLINE,
+        )
+        console.grid(row=COMPOSER_ROW, column=BODY_COLUMN, sticky="ew",
+                     padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
         console.grid_columnconfigure(1, weight=1)
+        self._console = console
 
-        # Prompt glyph: the desktop equivalent of the web console's ">".
         ctk.CTkLabel(
-            console, text=">", width=18, font=("Consolas", 14, "bold"),
+            console, text=">", width=16,
+            font=(theme.FONT_MONO, theme.FONT_BODY, "bold"),
             text_color=theme.CYAN,
-        ).grid(row=0, column=0, padx=(10, 0))
+        ).grid(row=0, column=0, padx=(theme.SPACE_2, 0))
 
         self.entry = ctk.CTkEntry(
             console,
             placeholder_text="ENTER COMMAND…",
-            fg_color="transparent",
-            border_width=0,
-            text_color=theme.TEXT,
-            font=("Consolas", 12),
-            height=42,
+            fg_color=theme.BG2,
+            border_width=1, border_color=theme.HAIRLINE,
+            text_color=theme.TEXT_BASE,
+            placeholder_text_color=theme.TEXT_FAINT,
+            font=(theme.FONT_MONO, theme.FONT_BODY),
+            height=theme.ENTRY_H,
+            corner_radius=theme.RADIUS_CONTROL,
         )
-        self.entry.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
+        self.entry.grid(row=0, column=1, sticky="ew", padx=(theme.SPACE_2, 0),
+                        pady=theme.SPACE_2)
         self.entry.bind("<Return>", self._handle_return)
         self.entry.bind("<Shift-Return>", lambda _e: "break")
 
-        # Square hairline-framed controls. The mic is a drawn glyph rather than
-        # an emoji so it matches the web's outline icon set and renders the
-        # same on every machine.
-        self.send_btn = ctk.CTkButton(
-            console, text="SEND", width=76, height=42, corner_radius=theme.RADIUS,
-            fg_color="#0A2A3A", hover_color="#12455E",
-            border_width=1, border_color=theme.EDGE,
-            text_color=theme.CYAN, font=("Consolas", 10, "bold"),
-            command=self._submit,
-        )
-        self.send_btn.grid(row=0, column=2, padx=(8, 0), pady=4)
+        self.mic_btn = self._control("MIC", self._emit(self._on_mic_toggle), column=2)
+        self.send_btn = self._control("SEND", self._submit, column=3, primary=True)
+        self.stop_btn = self._control("STOP", self._emit(self._on_interrupt), column=4)
+        self._paint_stop()
 
-        self.mic_btn = ctk.CTkButton(
-            console, text="●", width=42, height=42, corner_radius=theme.RADIUS,
-            fg_color=theme.RAISED, hover_color=theme.EDGE,
-            border_width=1, border_color=theme.EDGE,
-            text_color=theme.TEXT_MUTED, font=("Consolas", 13),
-            command=self._emit(self._on_mic_toggle),
+    def _control(self, text, command, *, column: int, primary: bool = False):
+        button = ctk.CTkButton(
+            self._console, text=text, width=64 if primary else 56,
+            height=theme.ENTRY_H,
+            corner_radius=theme.RADIUS_CONTROL,
+            fg_color=theme.tint(theme.CYAN, 0.12, theme.BG1) if primary else theme.BG2,
+            hover_color=theme.HAIRLINE,
+            border_width=1,
+            border_color=theme.BORDER_STRONG if primary else theme.HAIRLINE,
+            text_color=theme.CYAN if primary else theme.TEXT_MUTE,
+            font=(theme.FONT_MONO, theme.FONT_SECTION, "bold"),
+            command=command,
         )
-        self.mic_btn.grid(row=0, column=3, padx=(8, 0), pady=4)
-
-        self.stop_btn = ctk.CTkButton(
-            console, text="■", width=42, height=42, corner_radius=theme.RADIUS,
-            fg_color=theme.RAISED, hover_color=theme.DANGER,
-            border_width=1, border_color=theme.EDGE,
-            text_color=theme.TEXT_MUTED, font=("Consolas", 11),
-            command=self._emit(self._on_interrupt),
-        )
-        self.stop_btn.grid(row=0, column=4, padx=(6, 4), pady=4)
+        button.grid(row=0, column=column, padx=(theme.SPACE_2, theme.SPACE_2),
+                    pady=theme.SPACE_2)
+        return button
 
     def _build_status_bar(self) -> None:
-        """Telemetry strip: LED, state word, and a hint field."""
-        bar = ctk.CTkFrame(self, fg_color="transparent", height=26)
-        bar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 10))
+        bar = ctk.CTkFrame(self, fg_color="transparent", height=theme.STATUS_HEIGHT)
+        bar.grid(row=STATUS_ROW, column=BODY_COLUMN, sticky="ew",
+                 padx=theme.SPACE_3, pady=(theme.SPACE_2, theme.SPACE_2))
         bar.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkFrame(bar, height=1, fg_color=theme.EDGE_FAINT,
-                     corner_radius=0).grid(row=0, column=0, columnspan=3,
-                                           sticky="ew", pady=(0, 6))
+        tk.Frame(bar, height=1, bg=theme.HAIRLINE).grid(
+            row=0, column=0, columnspan=3, sticky="ew", pady=(0, 3)
+        )
 
         self.status_dot = ctk.CTkLabel(
-            bar, text="■", width=14, font=("Consolas", 9), text_color=theme.TEXT_MUTED
+            bar, text="●", width=14, font=(theme.FONT_MONO, 9),
+            text_color=theme.TEXT_FAINT,
         )
         self.status_dot.grid(row=1, column=0, sticky="w")
-
         # The glyph is a second channel so state is not colour-only.
         self.status_label = ctk.CTkLabel(
-            bar, text="READY", anchor="w", font=("Consolas", 10, "bold"),
-            text_color=theme.TEXT_DIM,
+            bar, text="READY", anchor="w",
+            font=(theme.FONT_MONO, theme.FONT_SECTION, "bold"),
+            text_color=theme.TEXT_BASE,
         )
-        self.status_label.grid(row=1, column=1, sticky="w")
-
+        self.status_label.grid(row=1, column=1, sticky="w", padx=(theme.SPACE_1, 0))
         self.hint_label = ctk.CTkLabel(
-            bar, text="", anchor="e", font=("Consolas", 9), text_color=theme.TEXT_MUTED
+            bar, text="", anchor="e",
+            font=(theme.FONT_MONO, theme.FONT_SECTION),
+            text_color=theme.TEXT_FAINT,
         )
         self.hint_label.grid(row=1, column=2, sticky="e")
 
     def _bind_keys(self) -> None:
         self.bind("<Escape>", lambda _e: self._emit(self._on_collapse)())
+        self.bind("<Configure>", self._on_resize)
 
+    # -- layout -----------------------------------------------------------
+    def _on_resize(self, event) -> None:
+        """Re-plan the column set when the *window* width changes.
+
+        Bound on the toplevel, so it also fires for every child's
+        ``<Configure>`` (the toplevel is in each child's bindtags); those are
+        filtered out here.
+        """
+        if event.widget is not self:
+            return
+        self._apply_layout(event.width)
+
+    def _on_transcript_configure(self, event) -> None:
+        wrap = compute_wrap(event.width)
+        if wrap == self._wrap:
+            return
+        self._wrap = wrap
+        for row in self._rows:
+            row.set_wraplength(wrap)
+        if self._streaming is not None:
+            self._streaming.set_wraplength(wrap)
+
+    def _window_width(self) -> int:
+        """Current width, falling back to the configured one while unmapped."""
+        width = self.winfo_width()
+        return int(width) if width > 1 else self._initial_width
+
+    def _apply_layout(self, width: int) -> None:
+        if width <= 1:
+            width = self._initial_width
+        plan = layout_plan(width, self._side_enabled)
+        compact = int(width) < COMPACT_WIDTH
+        if plan == self._plan and compact == self.header.compact:
+            return
+        self._plan = plan
+        self.header.set_compact(compact)
+
+        # Core column: widget and its minsize appear/disappear together, since
+        # a grid column with a minsize reserves space even when empty.
+        self._content.grid_columnconfigure(0, minsize=plan.core_width, weight=0)
+        if plan.core:
+            self.core.grid()
+        else:
+            self.core.grid_remove()
+
+        self._content.grid_columnconfigure(2, minsize=plan.side_width, weight=0)
+        if plan.side:
+            self.side.grid()
+        else:
+            self.side.grid_remove()
+
+    def toggle_side(self) -> None:
+        """Collapse/expand the side panel, remembering the choice."""
+        self._side_enabled = not self._side_enabled
+        self._plan = None  # force re-plan
+        self._apply_layout(self._window_width())
+
+    @property
+    def side_enabled(self) -> bool:
+        return self._side_enabled
+
+    # -- callbacks --------------------------------------------------------
     @staticmethod
     def _emit(callback):
-        """Wrap a callback so a ``False`` return is harmless in Tk commands."""
+        """Wrap a callback so a ``None`` return is harmless in Tk commands."""
         if callback is None:
             return lambda: None
 
@@ -259,6 +509,25 @@ class ChatPanel(ctk.CTkToplevel):
             callback()
 
         return wrapper
+
+    # -- window controls --------------------------------------------------
+    def _win_minimize(self) -> None:
+        try:
+            self.iconify()
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    def _win_maximize(self) -> None:
+        """Toggle the window manager's zoom; refuse politely if it will not."""
+        try:
+            self.state("normal" if self.state() == "zoomed" else "zoomed")
+        except tk.TclError:  # pragma: no cover - WM without zoom
+            pass
+
+    def show(self) -> None:
+        """Present the window (the ``--panel`` start path calls this)."""
+        self.deiconify()
+        self.lift()
 
     # -- input ------------------------------------------------------------
     def _handle_return(self, _event=None) -> str:
@@ -272,51 +541,133 @@ class ChatPanel(ctk.CTkToplevel):
         self.entry.delete(0, "end")
         self._on_send(text)
 
+    def _quick(self, message: str) -> None:
+        if self._on_send is not None:
+            self._on_send(message)
+
     def set_busy(self, busy: bool) -> None:
-        """Disable input while a turn is in flight, so replies cannot interleave."""
-        self.entry.configure(state="disabled" if busy else "normal")
-        self.send_btn.configure(state="disabled" if busy else "normal")
+        """Disable input while a turn is in flight — but never the STOP key."""
+        self.busy = bool(busy)
+        state = "disabled" if busy else "normal"
+        try:
+            self.entry.configure(state=state)
+            self.send_btn.configure(state=state)
+        except tk.TclError:  # pragma: no cover - destroyed mid-turn
+            pass
+        self._paint_stop()
+
+    def _paint_stop(self) -> None:
+        """STOP reads as *available* when idle and *urgent* during a turn."""
+        active = self.busy
+        self.stop_btn.configure(
+            fg_color=theme.tint(theme.RED, 0.24, theme.BG1) if active else theme.BG2,
+            border_color=theme.RED if active else theme.HAIRLINE,
+            text_color=theme.RED if active else theme.TEXT_FAINT,
+        )
 
     def set_mic(self, on: bool) -> None:
-        """Record the mic state with glyph, colour and frame -- three channels.
-
-        The button previously swapped between two emoji. An emoji is a
-        pictograph, not an instrument glyph, it renders differently per
-        machine, and it was the only thing indicating that a live microphone
-        was open. The recording state is now a filled dot in the success hue
-        inside a lit frame, matching the web console's REC indicator.
-        """
+        """Record the mic state with glyph, colour and frame — three channels."""
         self.mic_on = on
         self.mic_btn.configure(
-            text="●" if on else "○",
-            text_color=theme.GREEN if on else theme.TEXT_MUTED,
-            fg_color="#062A1C" if on else theme.RAISED,
-            border_color=theme.SUCCESS if on else theme.EDGE,
+            text="MIC" if not on else "REC",
+            text_color=theme.GREEN if on else theme.TEXT_MUTE,
+            fg_color=theme.tint(theme.GREEN, 0.12, theme.BG1) if on else theme.BG2,
+            border_color=theme.GREEN if on else theme.HAIRLINE,
         )
+        self.header.set_mic(on)
+
+    # -- header / side panel ---------------------------------------------
+    def set_connection(self, value: str) -> None:
+        self.header.set_connection(value)
+
+    def set_model(self, name: str | None) -> None:
+        self.header.set_model(name)
+        self.side.set_model(name or "")
+
+    def set_task(self, intent: str, status: str) -> None:
+        self.side.set_task(intent, status)
+
+    def set_tools(self, names: list[str]) -> None:
+        self.side.set_tools(names)
+
+    def set_system(self, cpu: str, ram: str) -> None:
+        self.side.set_system(cpu, ram)
+
+    def set_actions(self, items: list[str]) -> None:
+        self.side.set_actions(items)
+
+    def set_processes(self, items: list[str]) -> None:
+        self.side.set_processes(items)
+
+    def open_settings(self) -> None:
+        """Env-backed configuration view. One instance at a time."""
+        if self._settings_dialog is not None:
+            try:
+                if self._settings_dialog.winfo_exists():
+                    self._settings_dialog.lift()
+                    return
+            except tk.TclError:  # pragma: no cover
+                pass
+        self._settings_dialog = dialogs.SettingsDialog(self, self._config)
+
+    # -- activity ---------------------------------------------------------
+    def show_plan(self, steps: list[str]) -> None:
+        self.activity.show_plan(steps)
+
+    def tool_started(self, name: str, label: str = "") -> None:
+        self.activity.tool_started(name, label)
+
+    def tool_progress(self, name: str, message: str = "") -> None:
+        self.activity.tool_progress(name, message)
+
+    def tool_finished(self, name: str, success: bool, summary: str = "") -> None:
+        self.activity.tool_finished(name, success, summary)
+
+    def set_typing(self, on: bool) -> None:
+        self.activity.set_typing(on)
 
     # -- transcript -------------------------------------------------------
     def add_message(self, role: str, text: str) -> MessageRow:
+        follow = self._at_bottom()
         row = MessageRow(self.transcript, role, text)
-        row.grid(row=len(self._rows), column=0, sticky="ew", pady=4)
+        row.grid(
+            row=len(self._rows), column=0, sticky="ew",
+            pady=(theme.SPACE_1, theme.SPACE_2),
+        )
+        if self._wrap:
+            row.set_wraplength(self._wrap)
         self._rows.append(row)
-        self._scroll_to_end()
+        if follow:
+            self._scroll_to_end()
         return row
 
-    def append_token(self, token: str) -> None:
+    def append_token(self, token: str, trace_id: str | None = None) -> None:
+        follow = self._at_bottom()
         if self._streaming is None:
             self._streaming = self.add_message("assistant", token)
+            if trace_id:
+                self._streaming.trace_id = trace_id
         else:
-            self._streaming.set_text(self._streaming._label.cget("text") + token)
-            self._scroll_to_end()
+            self._streaming.set_text(self._streaming.get_text() + token)
+            if trace_id:
+                self._streaming.trace_id = trace_id
+            if follow:
+                self._scroll_to_end()
+        self.set_typing(True)
 
-    def set_transcript(self, text: str) -> None:
+    def set_transcript(self, text: str, trace_id: str | None = None) -> None:
         """Replace the streaming bubble with the authoritative final text."""
         if self._streaming is None:
             if text:
                 self._streaming = self.add_message("assistant", text)
+                if trace_id:
+                    self._streaming.trace_id = trace_id
         else:
-            self._streaming.set_text(text or self._streaming._label.cget("text"))
+            self._streaming.set_text(text or self._streaming.get_text())
+            if trace_id:
+                self._streaming.trace_id = trace_id
         self._streaming = None
+        self.set_typing(False)
         self._scroll_to_end()
 
     def clear_transcript(self) -> None:
@@ -324,6 +675,22 @@ class ChatPanel(ctk.CTkToplevel):
             row.destroy()
         self._rows.clear()
         self._streaming = None
+
+    def _at_bottom(self) -> bool:
+        """Should the view follow new content?
+
+        Only when the reader is already at the bottom: yanking the view back
+        down while someone is reading back through history is the classic
+        auto-scroll bug.
+        """
+        try:
+            canvas = getattr(self.transcript, "_parent_canvas", None)
+            if canvas is None:
+                return True
+            _start, end = canvas.yview()
+            return float(end) >= 0.98
+        except (AttributeError, tk.TclError, TypeError):  # pragma: no cover
+            return True
 
     def _scroll_to_end(self) -> None:
         # The canvas only exists after the widget has been laid out once.
@@ -339,94 +706,80 @@ class ChatPanel(ctk.CTkToplevel):
 
     # -- status -----------------------------------------------------------
     def set_status(self, status: str, language: str = "en") -> None:
-        """Update the telemetry strip from the shared state vocabulary.
+        """Legacy entry point: a raw HUD status string."""
+        self.set_ui_state(states.status_to_state(status), language)
 
-        Word, glyph and colour are set together. The glyph is not decoration:
-        it is the channel that keeps the state legible when colour alone would
-        not be enough.
+    def set_ui_state(self, state: UiState, language: str = "en", tool: str | None = None,
+                     text: str | None = None) -> None:
+        """Update the status line, header pill and core from one state.
+
+        Word, glyph and colour are set together: the glyph is the channel that
+        keeps state legible when colour alone would not be enough. ``text``
+        lets the caller pass the label the state machine already resolved
+        (some states have a bespoke one — "Generating response…" while tokens
+        stream) instead of re-deriving a generic label here.
         """
-        word = theme.status_text(status, language)
-        color = theme.state_hue(status)
-        glyph = theme.state_glyph(status)
-
-        self.status_label.configure(text=word, text_color=color)
-        self.status_dot.configure(text=glyph, text_color=color)
+        text = text or states.label(state, tool, language)
+        color = states.accent(state)
+        self.status_label.configure(text=text.upper(), text_color=color)
+        self.status_dot.configure(text=states.STATE_GLYPH[state], text_color=color)
+        self.header.set_state(state, text)
+        self.core.set_state(state)
 
     def set_hint(self, text: str) -> None:
         self.hint_label.configure(text=text)
 
     # -- human-in-the-loop ------------------------------------------------
     def show_confirmation(self, payload: dict) -> None:
-        """Render a ``require_confirmation`` request and wait for a click."""
-        self._pending_confirmation = payload.get("request_id")
+        """Open the approval modal for a ``require_confirmation`` request."""
         self.dismiss_confirmation()
+        state = dialogs.ConfirmationState(payload)
+        if not state.request_id:
+            # A request with no id cannot be answered; refuse to pretend.
+            return
+        self._pending_confirmation = state
+        self._dialog = dialogs.ConfirmationDialog(self, payload, self._deliver)
+        self.set_ui_state(UiState.AWAITING_CONFIRM, tool=None)
 
-        card = ctk.CTkFrame(self, fg_color=theme.RAISED, corner_radius=theme.RADIUS,
-                            border_width=1, border_color=theme.WARNING)
-        card.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
-        card.grid_columnconfigure(0, weight=1)
-        self._confirmation_card = card
-
-        action = payload.get("action", "tool")
-        summary = payload.get("summary") or payload.get("text") or action
-        reasons = payload.get("reasons") or []
-        level = payload.get("level", "high")
-
-        ctk.CTkLabel(
-            card, text="▲  AWAIT CONFIRM",
-            font=("Consolas", 12, "bold"), text_color=theme.WARNING, anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
-
-        ctk.CTkLabel(
-            card, text=str(summary), text_color=theme.TEXT, anchor="w",
-            font=("Segoe UI", 12), wraplength=640, justify="left",
-        ).grid(row=1, column=0, sticky="w", padx=14)
-
-        if reasons:
-            ctk.CTkLabel(
-                card, text="RISK: " + ", ".join(str(r) for r in reasons),
-                text_color=theme.TEXT_MUTED, anchor="w", font=("Consolas", 9),
-                wraplength=640, justify="left",
-            ).grid(row=2, column=0, sticky="w", padx=14, pady=(2, 0))
-
-        buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.grid(row=3, column=0, sticky="e", padx=12, pady=(8, 12))
-        ctk.CTkButton(
-            buttons, text="DENY", width=92, height=32, corner_radius=theme.RADIUS,
-            fg_color="#2A0C14", hover_color=theme.DANGER,
-            border_width=1, border_color=theme.DANGER,
-            text_color=theme.DANGER, font=("Consolas", 10, "bold"),
-            command=lambda: self._resolve_confirmation(False),
-        ).grid(row=0, column=0, padx=(0, 8))
-        ctk.CTkButton(
-            buttons, text=f"APPROVE ({str(level).upper()})", width=150, height=32,
-            corner_radius=theme.RADIUS,
-            fg_color="#062A1C", hover_color=theme.SUCCESS,
-            border_width=1, border_color=theme.SUCCESS,
-            text_color=theme.SUCCESS, font=("Consolas", 10, "bold"),
-            command=lambda: self._resolve_confirmation(True),
-        ).grid(row=0, column=1)
-
-        self.set_status("awaiting_confirmation")
-        card.focus_set()
-        card.lift()
-        card.after(50, lambda: card.focus_force())
-
-    def _resolve_confirmation(self, approved: bool) -> None:
-        request_id, self._pending_confirmation = self._pending_confirmation, None
-        self.dismiss_confirmation()
-        if request_id and self._on_confirm is not None:
+    def _deliver(self, payload: dict) -> None:
+        """Hand one built ``tool_confirm`` payload to the app layer."""
+        self._pending_confirmation = None
+        self._dialog = None
+        if self._on_confirm is None:
+            return
+        request_id = str(payload.get("request_id") or "")
+        approved = bool(payload.get("approved"))
+        if request_id:
             self._on_confirm(request_id, approved)
 
+    def resolve_confirmation(self, resolved: bool) -> None:
+        """The backend reported the outcome of this request."""
+        if self._pending_confirmation is not None:
+            self._pending_confirmation.mark_resolved()
+        dialog = self._dialog
+        if dialog is not None:
+            try:
+                if resolved:
+                    dialog.mark_resolved()
+                else:
+                    self.dismiss_confirmation()
+            except tk.TclError:  # pragma: no cover - already gone
+                pass
+
     def dismiss_confirmation(self) -> None:
-        card = getattr(self, "_confirmation_card", None)
-        if card is not None:
-            card.destroy()
-            self._confirmation_card = None
+        self._pending_confirmation = None
+        dialog, self._dialog = self._dialog, None
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except tk.TclError:  # pragma: no cover
+                pass
 
     @property
     def awaiting_confirmation(self) -> bool:
-        return self._pending_confirmation is not None
+        if self._pending_confirmation is None:
+            return False
+        return self._pending_confirmation.active
 
     # -- reminders ----------------------------------------------------------
     def show_reminders(self, reminders: list[dict]) -> None:
@@ -446,4 +799,4 @@ class ChatPanel(ctk.CTkToplevel):
         """Remove a reminder from the transcript by its ID."""
         # Since reminders are added as system messages, we can't easily remove
         # a specific one without tracking. For now, add a confirmation message.
-        self.add_message("system", f"✅ Reminder #{reminder_id} completed.")
+        self.add_message("system", f"Reminder #{reminder_id} completed.")

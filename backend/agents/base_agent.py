@@ -5,7 +5,8 @@ from typing import Dict, Any, List, Optional, Callable
 
 import httpx
 
-from config import TIER_FAST, TIER_REASONING, config
+from config import TIER_FAST, config
+from common.reporting import client_error, redact
 from services.completion_validator import CHAT_CONTRACT, CompletionContract
 from services.llm_client import LLMClient, LLMError, get_llm_client
 
@@ -85,12 +86,27 @@ class BaseAgent(ABC):
     # Error formatting (kept so user-facing strings stay consistent)
     # ------------------------------------------------------------------
     def _format_error(self, exc: Exception) -> str:
+        """What the user sees when the model layer gave up.
+
+        Two shapes on purpose: an ``LLMError`` is an *expected*, well-understood
+        outcome (every free model was rate-limited or refused) and the operator
+        detail in ``attempts`` is useful, so it is kept — after
+        :func:`common.reporting.redact` has removed anything credential-shaped.
+        Anything else is an unanticipated exception, and the user gets a fixed
+        bilingual sentence rather than ``str(exc)``.
+        """
         if isinstance(exc, LLMError):
-            return (
-                f"{self.agent_name}: All model providers failed. "
-                f"Last error: {exc.attempts[-1].detail if exc.attempts else exc}"
-            )
-        return f"{self.agent_name}: {exc}"
+            detail = ""
+            if exc.attempts:
+                detail = redact(str(exc.attempts[-1].detail))
+            text = f"{self.agent_name}: All model providers failed."
+            if detail:
+                text += f" Last error: {detail}"
+            return text
+        return client_error(
+            exc, operation="complete", component=self.agent_name,
+            language=getattr(self, "language", "en"),
+        )
 
     async def call_api(
         self,

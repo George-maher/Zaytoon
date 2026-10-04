@@ -90,13 +90,21 @@ class EventType(str, Enum):
     INTENT = "intent"
     TOKEN = "token"
     MESSAGE = "message"
+    #: Sent by some turns in place of/in addition to ``message``; it carries the
+    #: same final content, so it is treated as the end of a stream.
+    MESSAGE_DONE = "message_done"
     SUBTITLE = "subtitle"
+    PLAN = "plan"
+    TOOL_STARTED = "tool_started"
+    TOOL_PROGRESS = "tool_progress"
+    TOOL_FINISHED = "tool_finished"
     STT_RESULT = "stt_result"
     AUDIO_START = "audio_start"
     AUDIO_CHUNK = "audio_chunk"
     WAKE_WORD = "wake_word"
     REQUIRE_CONFIRMATION = "require_confirmation"
     CONFIRMATION_RESULT = "confirmation_result"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
     REMINDER = "reminder"
     REMINDER_LIST = "reminder_list"
@@ -112,6 +120,8 @@ KNOWN_STATUSES = frozenset(
         "connected",
         "disconnected",
         "thinking",
+        "planning",
+        "transcribing",
         "speaking",
         "listening",
         "done",
@@ -132,6 +142,16 @@ class ServerEvent:
     def text(self) -> str:
         content = self.data.get("content")
         return content if isinstance(content, str) else ""
+
+    @property
+    def trace_id(self) -> str | None:
+        """Correlation ID for request tracing."""
+        return self.data.get("trace_id")
+
+    @property
+    def response_id(self) -> str | None:
+        """Response ID for stream correlation."""
+        return self.data.get("response_id")
 
     @classmethod
     def parse(cls, raw: str | bytes) -> "ServerEvent | None":
@@ -169,4 +189,26 @@ class ServerEvent:
     @property
     def is_final(self) -> bool:
         """True on the frame that completes a streamed reply."""
-        return self.type in (EventType.MESSAGE, EventType.ERROR)
+        return self.type in (EventType.MESSAGE, EventType.MESSAGE_DONE, EventType.ERROR)
+
+    # -- convenience readers for the activity feed -------------------------
+    @property
+    def plan_steps(self) -> list[str]:
+        """``plan`` frame -> the ordered step list (never raises)."""
+        if self.type is not EventType.PLAN:
+            return []
+        raw = self.data.get("steps")
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(step) for step in raw if str(step).strip()]
+
+    @property
+    def tool_name(self) -> str:
+        name = self.data.get("name")
+        return str(name) if name else "tool"
+
+    @property
+    def tool_label(self) -> str:
+        """Human label for a tool row — falls back to the tool's own name."""
+        text = self.data.get("label") or self.data.get("message") or ""
+        return str(text) or self.tool_name

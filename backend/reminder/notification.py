@@ -3,6 +3,8 @@ import logging
 from datetime import datetime
 from typing import Optional, Callable, Any
 
+from common.reporting import safe_error
+
 logger = logging.getLogger("Zaytoon.NotificationManager")
 
 
@@ -49,7 +51,9 @@ class NotificationManager:
                     any_success = True
             except Exception as e:
                 results[name] = False
-                logger.warning(f"Notification channel '{name}' failed: {e}")
+                safe_error(
+                    e, operation=f"notify.{name}", component="NotificationManager"
+                )
 
         if not any_success:
             logger.error(f"All notification channels failed for reminder #{reminder_id}")
@@ -65,7 +69,7 @@ class NotificationManager:
             await self._broadcast_callback(payload)
             return True
         except Exception as e:
-            logger.warning(f"Broadcast notification failed: {e}")
+            safe_error(e, operation="notify.broadcast", component="NotificationManager")
             return False
 
     async def _send_webhook(self, payload: dict) -> bool:
@@ -85,7 +89,10 @@ class NotificationManager:
             logger.debug("httpx not available for webhook notification")
             return False
         except Exception as e:
-            logger.warning(f"Webhook notification failed: {e}")
+            # A webhook URL often *is* a credential (Discord/Slack tokens live
+            # in the path), and httpx puts the URL in its error text — so this
+            # goes through redaction, not `str(e)`.
+            safe_error(e, operation="notify.webhook", component="NotificationManager")
             return False
 
     async def _send_console(self, payload: dict) -> bool:

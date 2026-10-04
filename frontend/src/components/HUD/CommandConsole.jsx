@@ -1,12 +1,13 @@
 import { memo } from "react";
+import StatusLine from "../StatusLine";
 
 /**
  * CommandConsole — the bottom command region.
  *
  * Composes the existing InputBar (which owns all keyboard and voice
  * behaviour, and carries the accessible labels the tests assert) with the
- * system dock. It adds framing only: a command prompt glyph, a live
- * transcription strip, and the system control group.
+ * system dock. It adds framing only: a command prompt glyph, the live status
+ * line, a transcription strip, and the system control group.
  *
  * There is exactly one microphone in the product. It lives in the InputBar,
  * because that is where the recording state and the permission request are;
@@ -22,6 +23,8 @@ function CommandConsole({
   voiceMode,
   isListening,
   subtitle,
+  statusText,
+  statusTone,
   InputBar,
   BottomDock,
   onStop,
@@ -40,15 +43,20 @@ function CommandConsole({
         </span>
       </header>
 
-      <div className="p-2 flex flex-col gap-2">
+      <div className="flex flex-col" style={{ gap: "var(--space-3)", padding: "var(--space-3)" }}>
+        {/* What the engine is doing right now, announced politely. */}
+        <StatusLine text={statusText} language={language} tone={statusTone} />
+
         {/* Live transcription strip. Only while the user is actually being
             heard, so it cannot be mistaken for a response. */}
         {(isListening || (voiceMode && subtitle)) && (
           <div
-            className="flex items-center gap-2 px-2 py-1"
+            className="flex items-center"
             style={{
-              border: "1px solid var(--hud-edge-faint)",
-              background: "rgba(0, 229, 255, 0.04)",
+              gap: "var(--space-2)",
+              padding: "var(--space-1) var(--space-3)",
+              border: "var(--border-w) solid var(--hud-edge-faint)",
+              background: "color-mix(in srgb, var(--hud-cyan) 4%, transparent)",
             }}
             aria-live="polite"
           >
@@ -58,18 +66,18 @@ function CommandConsole({
             </span>
             <span
               className="truncate text-right flex-1"
-              style={{ fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--hud-text-dim)" }}
+              style={{ fontFamily: "var(--font-mono)", fontSize: "var(--font-sm)", color: "var(--hud-text-dim)" }}
             >
               {subtitle || (ar ? "تحدث الآن…" : "speak now…")}
             </span>
           </div>
         )}
 
-        <div className="flex items-stretch gap-2">
+        <div className="flex items-stretch" style={{ gap: "var(--space-3)" }}>
           {/* Prompt glyph. Decorative: the field itself carries the label. */}
           <span
-            className="self-center select-none pl-1"
-            style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--hud-cyan)" }}
+            className="self-center select-none"
+            style={{ paddingInlineStart: "var(--space-1)", fontFamily: "var(--font-mono)", fontSize: "var(--font-md)", color: "var(--hud-cyan)" }}
             aria-hidden="true"
           >
             &gt;

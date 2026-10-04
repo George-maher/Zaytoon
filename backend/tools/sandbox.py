@@ -19,9 +19,8 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional
 
 # Characters the Windows/POSIX shells treat as syntax rather than data.
 SHELL_METACHARACTERS = frozenset("&|<>^;`$!*?()[]{}~'\"\n\r\t")
@@ -34,9 +33,6 @@ FORBIDDEN_IN_COMMAND = frozenset("%!")
 
 # Command separators that let an attacker append a second command.
 COMMAND_SEPARATORS = re.compile(r"[&|;<>`\n\r]|\$\(|\|\|")
-
-# Windows executable / path suffix, e.g. ".exe", ".bat", ".ps1".
-_EXECUTABLE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,6}$")
 
 # Suffixes that must never be executed as an application target.
 BLOCKED_EXECUTABLE_SUFFIXES = frozenset(
@@ -146,16 +142,6 @@ def has_shell_metachars(value: str) -> bool:
     return any(ch in SHELL_METACHARACTERS for ch in str(value))
 
 
-def assert_no_shell_metachars(value: str, field: str = "value") -> str:
-    """Return ``value`` unchanged, or raise :class:`SecurityError`."""
-    if has_shell_metachars(value):
-        raise SecurityError(
-            f"Refusing to run: {field} contains shell metacharacters "
-            f"({sorted(set(str(value)) & SHELL_METACHARACTERS)}): {value!r}"
-        )
-    return str(value)
-
-
 def split_command(command: str) -> List[str]:
     """Tokenise a command and reject anything with shell syntax.
 
@@ -213,20 +199,6 @@ def validate_app_target(target: Optional[str]) -> Optional[str]:
     return text
 
 
-def resolve_executable(name: str, extra_dirs: Optional[Sequence[str]] = None) -> Optional[str]:
-    """Resolve an executable name via PATH plus optional extra directories."""
-    if not name:
-        return None
-    found = shutil.which(name)
-    if found:
-        return found
-    for directory in extra_dirs or ():
-        candidate = os.path.join(directory, name)
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
 def sanitize_app_name(app: str) -> str:
     """Normalise an LLM-supplied application name to a bare identifier.
 
@@ -248,13 +220,6 @@ def sanitize_app_name(app: str) -> str:
             f"Refusing to act on: '{text}' is a script, not an application"
         )
     return text
-
-
-def is_executable_like(value: str) -> bool:
-    """True when the value already looks like a path to a program."""
-    if not value:
-        return False
-    return bool(_EXECUTABLE_SUFFIX.search(value)) or os.path.sep in value
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +310,3 @@ def assert_sendkeys_keys(keys: str) -> str:
     so escaping them here would break the very shortcuts the caller asked for.
     """
     return _validate_sendkeys_payload(keys)
-
-
-def unique(values: Iterable[str]) -> List[str]:
-    """Order-preserving de-duplication."""
-    seen = set()
-    out = []
-    for v in values:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out

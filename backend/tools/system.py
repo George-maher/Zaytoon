@@ -14,7 +14,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from typing import Any, Dict, List
 

@@ -5,9 +5,14 @@ the window background is set to a single sentinel colour and
 ``-transparentcolor`` makes exactly that colour invisible. Everything drawn on
 the canvas therefore has to avoid the sentinel.
 
-The orb reacts to two inputs: the backend ``status`` (colour and pulse) and the
-microphone RMS level (a reactive ring), so it visibly answers both the
-assistant's state and whether it is hearing the user.
+The orb is the *same* assistant as the in-panel core, not a second one:
+
+* it resolves its state through ``states.status_to_state``, so both views name
+  the current state the same way;
+* it draws with ``core.draw_core``, the shared renderer;
+* it drives itself with ``core.AnimationLoop`` — **one** cancellable ``after()``
+  chain, started for an active state and cancelled outright for idle/offline,
+  so an idle orb costs no timer at all.
 """
 
 from __future__ import annotations
@@ -17,23 +22,19 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from . import theme
+from . import states, theme
+from .core import AnimationLoop, draw_core
+from .states import UiState
 
 #: Sentinel colour made fully transparent by ``-transparentcolor``.
 TRANSPARENT_KEY = "#000001"
 
 
 def _rate_to_speed(rate: float) -> float:
-    """Convert a state's sweep period (seconds/rev) into a pulse increment.
+    """Legacy helper kept for callers outside the shell.
 
-    A period of ``p`` seconds should complete one cycle in ``p``, and
-    ``_tick`` integrates ``speed`` radians per frame at 30fps, so
-    ``speed = 2*pi / (p * 30)``.
-
-    ``rate`` of 0 (offline) stops the animation outright. Idle keeps the shared
-    table's 12s period, which is a breath slow enough to read as "present but
-    not working" rather than as activity -- the previous code stopped idle
-    completely, which made a healthy-but-waiting assistant look dead.
+    A state's sweep period (seconds/rev) becomes a pulse increment at 30fps:
+    ``speed = 2*pi / (p * 30)``. A ``rate`` of 0 means "no sweep".
     """
     if rate <= 0:
         return 0.0
@@ -57,7 +58,7 @@ class OrbWindow(ctk.CTkToplevel):
         self.resizable(False, False)
 
         # Colour-key transparency plus always-on-top, applied after the window
-        # exists because both are no-ops on an unmapped window.
+        # exists because both are a no-op on an unmapped window.
         self.after(10, self._apply_window_attributes)
 
         self.canvas = tk.Canvas(
@@ -76,10 +77,14 @@ class OrbWindow(ctk.CTkToplevel):
         self.status = "disconnected"
         self.level = 0.0
         self.hovered = False
-        self._pulse = 0.0
-        self._pulse_speed = 0.0
-        self._running = False
+        self._state = states.status_to_state(self.status)
+        self._phase = 0.0
         self._visible = True
+        self._interval_ms = theme.FRAME_MS
+        self._loop = AnimationLoop(
+            self.after, self.after_cancel, self._on_frame,
+            interval_ms=self._interval_ms,
+        )
 
     # -- window management ------------------------------------------------
     def _apply_window_icon(self) -> None:
@@ -155,7 +160,7 @@ class OrbWindow(ctk.CTkToplevel):
         self.hide() if self._visible else self.show()
 
     def destroy_safely(self) -> None:
-        self._running = False
+        self._loop.stop()
         try:
             self.destroy()
         except tk.TclError:  # pragma: no cover
@@ -166,16 +171,32 @@ class OrbWindow(ctk.CTkToplevel):
         if self._on_click is not None:
             self._on_click()
 
-    def set_status(self, status: str) -> None:
-        if status != self.status:
-            self.status = status
-            # Pulse rate is derived from the shared state's sweep period, so
-            # the orb is busy *proportionally*: thinking breathes about twice
-            # as fast as speaking, and idle holds still. Previously every
-            # active state used the same 0.09, which made "thinking" and
-            # "running a tool" indistinguishable on the one element the user
-            # is most likely to be looking at.
-            self._pulse_speed = _rate_to_speed(theme.state_rate(status))
+    # -- state ------------------------------------------------------------
+    @property
+    def ui_state(self) -> UiState:
+        """The state the orb is showing, resolved through the shared mapper."""
+        return self._state
+
+    def set_status(self, status) -> None:
+        """Accepts a HUD status string or a :class:`UiState`.
+
+        The transition drives the animation: an active state starts the one
+        loop, idle/offline **cancels** it. That is deliberate — a permanently
+        scheduled 30fps callback is exactly the cost the redesign removes.
+        """
+        if isinstance(status, UiState):
+            state = status
+            raw = states.orb_status(state)
+        else:
+            raw = str(status)
+            state = states.status_to_state(raw)
+        changed = state is not self._state or raw != self.status
+        self.status = raw
+        if state is not self._state:
+            self._state = state
+            self._phase = 0.0
+        if changed:
+            self._loop.set_mode(self._state)
             self.render()
 
     def set_level(self, level: float) -> None:
@@ -189,79 +210,74 @@ class OrbWindow(ctk.CTkToplevel):
 
     # -- animation --------------------------------------------------------
     def start(self, fps: int = 30) -> None:
-        if self._running:
-            return
-        self._running = True
-        self._tick(fps)
+        """Enable animation for the current state.
+
+        For an idle/offline orb this schedules **nothing** — ``set_mode``
+        refuses to start a loop for a static state, which is the point.
+        """
+        self._interval_ms = max(16, 1000 // max(1, fps))
+        self._loop.interval_ms = self._interval_ms
+        self._loop.set_mode(self._state)
 
     def stop(self) -> None:
-        self._running = False
+        self._loop.stop()
 
-    def _tick(self, fps: int) -> None:
-        if not self._running:
-            return
-        self._pulse = (self._pulse + self._pulse_speed) % (math.pi * 2)
+    @property
+    def animating(self) -> bool:
+        return self._loop.running
+
+    def _on_frame(self) -> None:
+        # Phase advances on wall time, so the sweep keeps its period even if
+        # frames are dropped.
+        period = theme.state_rate(self.status) or 1.0
+        self._phase = (self._phase + (2 * math.pi) * (self._interval_ms / 1000.0) / period) % (2 * math.pi)
         self.render()
-        try:
-            self.after(max(16, 1000 // fps), self._tick, fps)
-        except tk.TclError:  # pragma: no cover - window destroyed
-            self._running = False
 
     # -- drawing ----------------------------------------------------------
     def render(self) -> None:
         if not self.winfo_exists():
             return
-        c = self.canvas
-        c.delete("all")
-        size = self._size
-        cx = cy = size / 2
+        canvas = self.canvas
+        try:
+            width = canvas.winfo_width() or self._size
+            height = canvas.winfo_height() or self._size
+        except tk.TclError:  # pragma: no cover
+            return
+
+        # The orb is the one element allowed a bloom: a stippled halo behind
+        # the shared core renderer, in this state's glow colours.
+        canvas.delete("all")
         inner, outer = theme.orb_colors(self.status)
-
-        breathe = 0.5 + 0.5 * math.sin(self._pulse)
-        base = size * 0.30 * (1.0 + 0.035 * breathe + 0.05 * self.level)
-
-        # Outer halo, brightening with input level.
-        halo = c.create_oval(
-            cx - base * 1.34, cy - base * 1.34,
-            cx + base * 1.34, cy + base * 1.34,
+        cx, cy = width / 2.0, height / 2.0
+        radius = min(width, height) * 0.42
+        halo = canvas.create_oval(
+            cx - radius, cy - radius, cx + radius, cy + radius,
             fill=outer, outline="",
         )
-        c.itemconfig(halo, stipple="gray50")
+        canvas.itemconfig(halo, stipple="gray50")
 
-        # Mid ring.
-        c.create_oval(
-            cx - base * 1.12, cy - base * 1.12,
-            cx + base * 1.12, cy + base * 1.12,
-            fill=inner, outline=theme.ACCENT_DIM, width=1,
+        draw_core(
+            canvas, width, height,
+            state=self._state, phase=self._phase, level=self.level,
+            hovered=self.hovered,
         )
 
-        # Core.
-        core = base * (0.86 + 0.10 * self.level)
-        c.create_oval(
+        # The inner glow tints the core without changing the shared geometry.
+        core = radius * 0.52
+        glow = canvas.create_oval(
             cx - core, cy - core, cx + core, cy + core,
-            fill=inner, outline=theme.ACCENT if self.status in theme.ACTIVE_STATES else theme.BORDER,
-            width=2,
+            fill=inner, outline="",
         )
+        canvas.itemconfig(glow, stipple="gray50")
+        # Re-draw the centre marker over the glow so it stays crisp.
+        arm = core * 0.28
+        color = states.accent(self._state)
+        canvas.create_line(cx - arm, cy, cx + arm, cy, fill=color, width=1)
+        canvas.create_line(cx, cy - arm, cx, cy + arm, fill=color, width=1)
 
-        # A crisp highlight sells the "holographic" read.
-        gloss = base * 0.34
-        c.create_oval(
-            cx - gloss * 0.9, cy - gloss * 1.25,
-            cx + gloss * 0.9, cy - gloss * 0.2,
-            fill=theme.TEXT, outline="",
-        )
-        c.itemconfig(c.find_withtag("all")[-1], stipple="gray75")
-
-        if self.hovered:
-            ring = base * 1.5
-            c.create_oval(
-                cx - ring, cy - ring, cx + ring, cy + ring,
-                outline=theme.ACCENT, width=1,
+        if self._state is UiState.OFFLINE:
+            label = canvas.create_text(
+                cx, cy + radius * 1.05, text="offline",
+                fill=theme.TEXT_FAINT, font=(theme.FONT_MONO, 9),
             )
-
-        if self.status == "disconnected":
-            label = c.create_text(
-                cx, cy + base * 1.9, text="offline",
-                fill=theme.TEXT_MUTED, font=("Segoe UI", 9),
-            )
-            c.itemconfig(label, stipple="gray50")
+            canvas.itemconfig(label, stipple="gray50")

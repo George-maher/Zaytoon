@@ -55,8 +55,8 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
     <Panel title={ar ? "حالة النظام" : "SYSTEM STATUS"} code="SYS" led accent={health ? "var(--hud-cyan)" : "var(--hud-red)"}>
       {error && (
         <div
-          className="hud-tele__v mb-1 text-left"
-          style={{ color: "var(--hud-red)", fontSize: 9 }}
+          className="hud-tele__v text-left"
+          style={{ color: "var(--hud-red)", fontSize: "var(--font-sm)", marginBottom: "var(--space-1)" }}
           role="alert"
         >
           {ar ? "تعذر الاتصال بالخدمة" : "BACKEND UNREACHABLE"}
@@ -68,7 +68,7 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
         value={health ? (ar ? "متصل" : "ONLINE") : (ar ? "مقطوع" : "DOWN")}
         tone={health ? "ok" : "error"}
       />
-      <div className="hud-rule my-1" />
+      <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow
         label={ar ? "النموذج" : "MODEL"}
         value={llm.primary_model || "—"}
@@ -83,10 +83,10 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
         label={ar ? "السلسلة" : "CHAIN"}
         value={Array.isArray(llm.chain) ? `${llm.chain.length} ${ar ? "نموذج" : "models"}` : "—"}
       />
-      <div className="hud-rule my-1" />
+      <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow label="STT" value={voice.stt ? (ar ? "جاهز" : "READY") : (ar ? "غير متاح" : "N/A")} tone={voice.stt ? "ok" : "warn"} />
       <TelemetryRow label="TTS" value={voice.tts ? (ar ? "جاهز" : "READY") : (ar ? "غير متاح" : "N/A")} tone={voice.tts ? "ok" : "warn"} />
-      <div className="hud-rule my-1" />
+      <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow
         label={ar ? "الصندوق" : "SANDBOX"}
         value={safety.enabled ? (ar ? "مفعّل" : "ARMED") : (ar ? "معطّل" : "OFF")}
@@ -103,7 +103,7 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
           : "—"}
         title={Array.isArray(safety.always_confirm) ? safety.always_confirm.join(", ") : undefined}
       />
-      <div className="hud-rule my-1" />
+      <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow
         label={ar ? "الأدوات" : "TOOLS"}
         value={typeof totalTools === "number" ? totalTools : "—"}
@@ -119,7 +119,7 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
           />
         ) : null,
       )}
-      <div className="hud-rule my-1" />
+      <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow label={ar ? "الطلبات" : "REQS"} value={metrics.requests ?? "—"} />
       <TelemetryRow label={ar ? "زمن" : "LATENCY"} value={fmtLatency(metrics.avg_latency_ms)} />
       <TelemetryRow

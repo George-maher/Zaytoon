@@ -1,5 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import useWebSocket from "./hooks/useWebSocket";
+import { statusLabel } from "./lib/statusLabels";
 import AICore from "./components/hud/AICore";
 import SystemStatus from "./components/hud/SystemStatus";
 import MissionStatus from "./components/hud/MissionStatus";
@@ -59,19 +60,25 @@ function useWide() {
 function RailTabs({ tabs, active, onSelect, language }) {
   const ar = language === "ar";
   return (
-    <div className="flex gap-1 px-1 pt-1" role="tablist" aria-label={ar ? "اللوحات" : "Panels"}>
+    <div
+      className="flex"
+      style={{ gap: "var(--space-1)", padding: "var(--space-1) var(--space-2) 0" }}
+      role="tablist"
+      aria-label={ar ? "اللوحات" : "Panels"}
+    >
       {tabs.map((t) => (
         <button
           key={t.id}
           role="tab"
           aria-selected={active === t.id}
           onClick={() => onSelect(t.id)}
-          className="hud-micro px-2 py-1 transition-colors"
+          className="hud-micro transition-colors"
           style={{
+            padding: "var(--space-1) var(--space-3)",
             color: active === t.id ? "var(--hud-cyan)" : "var(--hud-text-mute)",
-            border: "1px solid",
+            border: "var(--border-w) solid",
             borderColor: active === t.id ? "var(--hud-edge-strong)" : "var(--hud-edge-faint)",
-            background: active === t.id ? "rgba(0, 229, 255, 0.06)" : "transparent",
+            background: active === t.id ? "color-mix(in srgb, var(--hud-cyan) 6%, transparent)" : "transparent",
           }}
         >
           {t.label}
@@ -83,11 +90,11 @@ function RailTabs({ tabs, active, onSelect, language }) {
 
 export default memo(function App() {
   const {
-    messages, isConnected, isTyping, status, language, setLanguage,
+    messages, isConnected, everConnected, isTyping, status, language, setLanguage,
     subtitle, voiceMode, awaitingCommand, isListening, isSpeaking, reminders,
-    sendMessage, sendReminderCmd, refreshReminders, stopAudio, clearChat,
+    sendMessage, sendReminderCmd, refreshReminders, clearChat,
     startVoiceMode, stopVoiceMode, pendingConfirmation, respondToConfirmation,
-    speakingVoice, plan, activeTool, activity, intent,
+    speakingVoice, plan, activeTool, activity, intent, requestStop,
   } = useWebSocket();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -99,6 +106,36 @@ export default memo(function App() {
     () => resolveState({ isConnected, pendingConfirmation, awaitingCommand, isListening, isTyping, isSpeaking, status }),
     [isConnected, pendingConfirmation, awaitingCommand, isListening, isTyping, isSpeaking, status],
   );
+
+  // One derived sentence for "what is happening now" — shown under the
+  // console (aria-live) and reused by the transcript's typing indicator, so
+  // the two can never disagree. Pure and precedence-tested in
+  // lib/statusLabels.test.js.
+  const statusText = useMemo(() => {
+    const last = messages[messages.length - 1];
+    const streaming = Boolean(last && last.role === "assistant" && last.streaming);
+    return statusLabel({
+      connected: isConnected,
+      everConnected,
+      status,
+      intent,
+      plan,
+      activeTool,
+      streaming,
+      isSpeaking,
+      isTyping,
+      pendingConfirmation,
+      language,
+    });
+  }, [messages, isConnected, everConnected, status, intent, plan, activeTool, isSpeaking, isTyping, pendingConfirmation, language]);
+
+  // Hue for the line: amber while blocked on a person, red without a link,
+  // cyan while the system is simply working.
+  const statusTone = pendingConfirmation
+    ? "warn"
+    : !isConnected
+      ? "danger"
+      : "accent";
 
   // Global text direction. Message content is still detected per-message,
   // because one session can contain both scripts.
@@ -138,13 +175,21 @@ export default memo(function App() {
   const ar = language === "ar";
 
   const leftRail = (
-    <div data-enter="left" className="flex flex-col gap-2 overflow-y-auto p-2 min-h-0">
+    <div
+      data-enter="left"
+      className="flex flex-col overflow-y-auto min-h-0"
+      style={{ gap: "var(--space-3)", padding: "var(--space-3)" }}
+    >
       <SystemStatus language={language} />
     </div>
   );
 
   const rightRail = (
-    <div data-enter="right" className="flex flex-col gap-2 overflow-y-auto p-2 min-h-0">
+    <div
+      data-enter="right"
+      className="flex flex-col overflow-y-auto min-h-0"
+      style={{ gap: "var(--space-3)", padding: "var(--space-3)" }}
+    >
       <MissionStatus
         intent={intent}
         state={state}
@@ -177,26 +222,35 @@ export default memo(function App() {
 
       {/* ---------------------------------------------------------------- */}
       <header
-        className="flex-none flex items-center justify-between px-3 py-2"
-        style={{ borderBottom: "1px solid var(--hud-edge-faint)", background: "rgba(3, 7, 13, 0.7)" }}
+        className="flex-none flex items-center justify-between"
+        style={{
+          padding: "var(--space-2) var(--space-4)",
+          borderBottom: "var(--border-w) solid var(--hud-edge-faint)",
+          background: "color-mix(in srgb, var(--bg0) 70%, transparent)",
+        }}
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center min-w-0" style={{ gap: "var(--space-3)" }}>
           <span
-            className="flex items-center justify-center w-7 h-7 flex-none"
-            style={{ border: "1px solid var(--hud-edge-strong)", background: "rgba(0, 229, 255, 0.06)" }}
+            className="flex items-center justify-center flex-none"
+            style={{
+              width: 24,
+              height: 24,
+              border: "var(--border-w) solid var(--hud-edge-strong)",
+              background: "color-mix(in srgb, var(--hud-cyan) 6%, transparent)",
+            }}
             aria-hidden="true"
           >
-            <span className="hud-identity" style={{ fontSize: 12, letterSpacing: 0 }}>Z</span>
+            <span className="hud-identity" style={{ fontSize: "var(--font-md)", letterSpacing: 0 }}>Z</span>
           </span>
           <div className="min-w-0">
             <h1 className="hud-identity">ZAYTOON</h1>
-            <p className="hud-micro truncate" style={{ fontSize: 7 }}>
+            <p className="hud-micro truncate" style={{ fontSize: "var(--font-xs)" }}>
               {ar ? "واجهة الأوامر" : "TACTICAL COMMAND INTERFACE"}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-none">
+        <div className="flex items-center flex-none" style={{ gap: "var(--space-2)" }}>
           <ReminderPanel
             reminders={reminders}
             onRefresh={refreshReminders}
@@ -215,7 +269,7 @@ export default memo(function App() {
           <>
             <aside
               className="flex-none w-[268px] flex flex-col overflow-hidden"
-              style={{ borderInlineEnd: "1px solid var(--hud-edge-faint)" }}
+              style={{ borderInlineEnd: "var(--border-w) solid var(--hud-edge-faint)" }}
               aria-label={ar ? "معلومات النظام" : "System information"}
             >
               {leftRail}
@@ -223,7 +277,7 @@ export default memo(function App() {
 
             <aside
               className="flex-none w-[300px] flex flex-col overflow-hidden"
-              style={{ borderInlineStart: "1px solid var(--hud-edge-faint)" }}
+              style={{ borderInlineStart: "var(--border-w) solid var(--hud-edge-faint)" }}
               aria-label={ar ? "حالة المهمة" : "Mission state"}
             >
               {rightRail}
@@ -235,7 +289,7 @@ export default memo(function App() {
         {!wide && (
           <div
             className="flex-none w-full max-h-[34vh] flex flex-col overflow-hidden"
-            style={{ borderBottom: "1px solid var(--hud-edge-faint)" }}
+            style={{ borderBottom: "var(--border-w) solid var(--hud-edge-faint)" }}
           >
             <RailTabs
               language={language}
@@ -254,10 +308,16 @@ export default memo(function App() {
 
         {/* Core column. Never removed at any width. */}
         <section className="flex-1 flex flex-col min-w-0 min-h-0">
-          <div data-enter="center" className="flex-1 flex items-center justify-center min-h-0 py-2">
+          <div
+            data-enter="center"
+            className="flex-1 flex items-center justify-center min-h-0"
+            style={{ padding: "var(--space-3) 0" }}
+          >
             <AICore
               state={state}
-              size={300}
+              /* The core must never be the reason a 360px viewport scrolls:
+                 at phone widths it steps down from 260 to 180. */
+              size={wide ? 260 : 180}
               language={language}
               speakingVoice={speakingVoice}
             />
@@ -265,8 +325,8 @@ export default memo(function App() {
 
           <div
             data-enter="center"
-            className="flex-none flex flex-col min-h-0 mx-auto w-full max-w-3xl px-3"
-            style={{ maxHeight: "42vh" }}
+            className="flex-none flex flex-col min-h-0 mx-auto w-full max-w-3xl"
+            style={{ maxHeight: "42vh", padding: "0 var(--space-4)" }}
           >
             <div className="hud-panel hud-bracket flex-1 flex flex-col min-h-0">
               <header className="hud-panel-head">
@@ -277,8 +337,12 @@ export default memo(function App() {
                 {messages.length > 0 && (
                   <button
                     onClick={clearChat}
-                    className="hud-micro px-1.5 py-0.5"
-                    style={{ border: "1px solid var(--hud-edge-faint)", color: "var(--hud-text-dim)" }}
+                    className="hud-micro"
+                    style={{
+                      padding: "var(--space-1) var(--space-2)",
+                      border: "var(--border-w) solid var(--hud-edge-faint)",
+                      color: "var(--hud-text-dim)",
+                    }}
                     title={ar ? "مسح" : "Clear"}
                   >
                     {ar ? "مسح" : "CLR"}
@@ -290,11 +354,16 @@ export default memo(function App() {
                 isTyping={isTyping}
                 subtitle={subtitle}
                 language={language}
+                statusText={statusText}
               />
             </div>
           </div>
 
-          <div data-enter="center" className="flex-none w-full max-w-3xl mx-auto px-3 pb-3 pt-2">
+          <div
+            data-enter="center"
+            className="flex-none w-full max-w-3xl mx-auto"
+            style={{ padding: "var(--space-3) var(--space-4) var(--space-4)" }}
+          >
             <CommandConsole
               InputBar={InputBar}
               BottomDock={BottomDock}
@@ -306,7 +375,9 @@ export default memo(function App() {
               voiceMode={voiceMode}
               isListening={isListening}
               subtitle={subtitle}
-              onStop={stopAudio}
+              statusText={statusText}
+              statusTone={statusTone}
+              onStop={requestStop}
               onSettingsToggle={() => setSettingsOpen((v) => !v)}
               settingsOpen={settingsOpen}
               onLanguageToggle={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}

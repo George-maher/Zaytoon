@@ -1,11 +1,11 @@
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional, Callable, Any
+from typing import Optional
 
 from reminder.service import ReminderService
 from reminder.notification import NotificationManager
-from reminder.models import ReminderData, ReminderStatus
+from reminder.models import ReminderData
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.Scheduler.Manager")
 
@@ -49,7 +49,9 @@ class SchedulerManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Scheduler check error: %s", e)
+                # The loop must survive a bad tick: one failed check would
+                # otherwise kill scheduling silently until the next restart.
+                safe_error(e, operation="scheduler.check", component="SchedulerManager")
             await asyncio.sleep(self._check_interval)
 
     async def _fire_reminder(self, reminder: ReminderData):
@@ -66,7 +68,10 @@ class SchedulerManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("Reminder fire attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES, e)
+                safe_error(
+                    e, operation="reminder.fire", component="SchedulerManager",
+                    detail=f"attempt {attempt + 1}/{MAX_RETRIES}",
+                )
 
             if attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAYS[attempt] if attempt < len(RETRY_DELAYS) else 30

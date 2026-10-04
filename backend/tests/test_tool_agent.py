@@ -14,7 +14,6 @@ command must be rejected — so they are now asserted through
 import pytest
 
 from agents.tool_agent import ToolAgent
-from tools.safety import ConfirmationManager
 
 
 class _Approve:

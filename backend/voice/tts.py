@@ -5,6 +5,7 @@ from collections import OrderedDict
 from typing import Optional, AsyncGenerator, List
 
 from voice import routing
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.Voice.TTS")
 
@@ -177,7 +178,7 @@ class TextToSpeech:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"TTS synthesis error: {e}")
+            safe_error(e, operation="tts.synthesize", component="voice.tts")
             return None
 
     async def stream_synthesize(
@@ -218,7 +219,7 @@ class TextToSpeech:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"TTS stream error: {e}")
+            safe_error(e, operation="tts.stream", component="voice.tts")
 
     async def synthesize_ssml(
         self,
@@ -251,7 +252,7 @@ class TextToSpeech:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"TTS SSML error: {e}")
+            safe_error(e, operation="tts.ssml", component="voice.tts")
             return None
 
     # ------------------------------------------------------------------

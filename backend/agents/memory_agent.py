@@ -1,11 +1,13 @@
 import os
-import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import aiosqlite
+
+from common.concurrency import ReentrantAsyncLock
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.MemoryAgent")
 
@@ -23,12 +25,40 @@ class MemoryAgent:
         os.makedirs(db_dir, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        #: Serialises writes. aiosqlite runs each connection on its own thread,
+        #: and two coroutines interleaving `execute`/`commit` on one connection
+        #: can commit a half-written pair. Every mutation takes this lock. It
+        #: is re-entrant so a writer may call another writer
+        #: (`get_due_reminders` completes *and* re-schedules) without
+        #: deadlocking against itself.
+        self._write_lock = ReentrantAsyncLock()
+        #: Serialises *connection creation*. Two coroutines could both observe
+        #: `self._db is None`, both call `aiosqlite.connect`, and one handle
+        #: would silently replace the other — a leaked connection and a split
+        #: view of the schema. Batched tool calls made that race real.
+        self._connect_lock = asyncio.Lock()
         self._initialized = False
 
     async def _get_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            self._db = await aiosqlite.connect(self.db_path)
-            self._db.row_factory = aiosqlite.Row
+        if self._db is not None:
+            return self._db
+        async with self._connect_lock:
+            if self._db is None:
+                db = await aiosqlite.connect(self.db_path)
+                db.row_factory = aiosqlite.Row
+                # Increment G: WAL lets the reader (context lookup) and the
+                # writer (store_message) stop fighting over the single file
+                # lock, and busy_timeout turns "database is locked" from an
+                # immediate crash into a bounded wait. Both are no-ops on a
+                # database that cannot take them, so this never makes an
+                # existing setup worse.
+                try:
+                    await db.execute("PRAGMA journal_mode=WAL")
+                    await db.execute("PRAGMA busy_timeout=5000")
+                    await db.execute("PRAGMA synchronous=NORMAL")
+                except aiosqlite.Error as e:
+                    safe_error(e, operation="pragma", component="MemoryAgent")
+                self._db = db
         return self._db
 
     async def _ensure_initialized(self):
@@ -88,13 +118,21 @@ class MemoryAgent:
     async def store_message(
         self, role: str, content: str, language: str = "en", session_id: str = "default"
     ) -> None:
-        await self._ensure_initialized()
-        db = await self._get_db()
-        await db.execute(
-            "INSERT INTO conversations (role, content, language, session_id) VALUES (?, ?, ?, ?)",
-            (role, content, language, session_id),
-        )
-        await db.commit()
+        """Persist one turn. Best-effort: annotating a conversation must never
+        be the reason the conversation fails, so a write error is reported as
+        one structured line and swallowed.
+        """
+        try:
+            await self._ensure_initialized()
+            async with self._write_lock:
+                db = await self._get_db()
+                await db.execute(
+                    "INSERT INTO conversations (role, content, language, session_id) VALUES (?, ?, ?, ?)",
+                    (role, content, language, session_id),
+                )
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - memory is best-effort
+            safe_error(e, operation="store_message", component="MemoryAgent")
 
     async def get_recent_context(
         self, limit: int = 6, session_id: str = "default"
@@ -124,44 +162,58 @@ class MemoryAgent:
             return row["summary"] if row else None
 
     async def summarize_and_prune(self, session_id: str = "default"):
-        await self._ensure_initialized()
-        db = await self._get_db()
-        async with db.execute(
-            "SELECT COUNT(*) as cnt FROM conversations WHERE session_id = ?",
-            (session_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row or row["cnt"] < 20:
-                return
+        """Roll old turns into one line, then delete them.
 
-        async with db.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
-            (session_id, 10),
-        ) as cursor:
-            old = await cursor.fetchall()
+        The read and the (potentially slow) summariser deliberately run
+        *outside* the write lock — holding a lock across an LLM call would
+        stall every other writer for seconds. Only the INSERT/DELETE pair is
+        serialised, which is the part that must not interleave.
+        """
+        try:
+            await self._ensure_initialized()
+            db = await self._get_db()
+            async with db.execute(
+                "SELECT COUNT(*) as cnt FROM conversations WHERE session_id = ?",
+                (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row or row["cnt"] < 20:
+                    return
 
-        lines = [f"{r['role']}: {r['content'][:100]}" for r in old]
-        text = " | ".join(lines)
+            async with db.execute(
+                "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
+                (session_id, 10),
+            ) as cursor:
+                old = await cursor.fetchall()
 
-        summary = await self._summarize(text)
-        logger.info("Summarised %d messages for %s: %r", len(old), session_id, summary)
+            lines = [f"{r['role']}: {r['content'][:100]}" for r in old]
+            text = " | ".join(lines)
 
-        await db.execute(
-            "INSERT INTO context_summary (summary, session_id) VALUES (?, ?)",
-            (summary, session_id),
-        )
-        async with db.execute(
-            "SELECT id FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
-            (session_id, 10),
-        ) as cursor:
-            old_ids = [r["id"] for r in await cursor.fetchall()]
-        if old_ids:
-            placeholders = ",".join("?" for _ in old_ids)
-            await db.execute(
-                f"DELETE FROM conversations WHERE id IN ({placeholders})",
-                old_ids,
-            )
-        await db.commit()
+            summary = await self._summarize(text)
+            logger.info("Summarised %d messages for %s: %r", len(old), session_id, summary)
+
+            async with self._write_lock:
+                db = await self._get_db()
+                await db.execute(
+                    "INSERT INTO context_summary (summary, session_id) VALUES (?, ?)",
+                    (summary, session_id),
+                )
+                async with db.execute(
+                    "SELECT id FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
+                    (session_id, 10),
+                ) as cursor:
+                    old_ids = [r["id"] for r in await cursor.fetchall()]
+                if old_ids:
+                    placeholders = ",".join("?" for _ in old_ids)
+                    await db.execute(
+                        f"DELETE FROM conversations WHERE id IN ({placeholders})",
+                        old_ids,
+                    )
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - fire-and-forget by design
+            # This runs as a bare `asyncio.create_task`, where an escaping
+            # exception is reported to nobody. Catch it here or it is lost.
+            safe_error(e, operation="summarize_and_prune", component="MemoryAgent")
 
     async def _summarize(self, text: str) -> str:
         """Compress old turns into one line, best-effort.
@@ -185,7 +237,13 @@ class MemoryAgent:
                 return summary
             logger.info("Summariser returned nothing usable: %r", summary[:80])
         except Exception as e:
-            logger.warning("Summariser unavailable (%s); using extract fallback", e)
+            # `component` carries the word "Summariser" because the regression
+            # this reports was a *silent* failure — `test_fallback_is_logged_
+            # not_silent` asserts the name appears in the log.
+            safe_error(
+                e, operation="summarize", component="MemoryAgent.Summariser",
+                detail="using the extract fallback",
+            )
 
         return self._extract_summary(text)
 
@@ -236,11 +294,15 @@ class MemoryAgent:
 
     async def clear_memory(self, session_id: str = "default") -> None:
         await self._ensure_initialized()
-        db = await self._get_db()
-        await db.execute(
-            "DELETE FROM conversations WHERE session_id = ?", (session_id,)
-        )
-        await db.commit()
+        try:
+            async with self._write_lock:
+                db = await self._get_db()
+                await db.execute(
+                    "DELETE FROM conversations WHERE session_id = ?", (session_id,)
+                )
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - reported, never leaked
+            safe_error(e, operation="clear_memory", component="MemoryAgent")
 
     async def add_reminder(
         self,
@@ -259,13 +321,21 @@ class MemoryAgent:
         except ValueError:
             return {"error": "Invalid date/time format. Use YYYY-MM-DD HH:MM:SS"}
 
-        db = await self._get_db()
-        cursor = await db.execute(
-            "INSERT INTO reminders (title, description, remind_time, recurring, session_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (title, description, utc_time, recurring, session_id),
-        )
-        await db.commit()
+        try:
+            async with self._write_lock:
+                db = await self._get_db()
+                cursor = await db.execute(
+                    "INSERT INTO reminders (title, description, remind_time, recurring, session_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (title, description, utc_time, recurring, session_id),
+                )
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - reported, never leaked
+            # Returning a failure is the honest answer: the caller (and the
+            # panel built on it) must not be told a reminder exists when the
+            # insert never committed.
+            safe_error(e, operation="add_reminder", component="MemoryAgent")
+            return {"error": "The reminder could not be saved."}
         return {
             "id": cursor.lastrowid,
             "title": title,
@@ -296,20 +366,30 @@ class MemoryAgent:
         never performed. The row count is the only honest answer.
         """
         await self._ensure_initialized()
-        db = await self._get_db()
-        cursor = await db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
-        await db.commit()
+        try:
+            async with self._write_lock:
+                db = await self._get_db()
+                cursor = await db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - reported, never leaked
+            safe_error(e, operation="delete_reminder", component="MemoryAgent")
+            return False
         return cursor.rowcount > 0
 
     async def complete_reminder(self, reminder_id: int) -> bool:
         """Mark a reminder completed. Returns whether a row was updated."""
         await self._ensure_initialized()
-        db = await self._get_db()
-        cursor = await db.execute(
-            "UPDATE reminders SET status = 'completed' WHERE id = ?",
-            (reminder_id,),
-        )
-        await db.commit()
+        try:
+            async with self._write_lock:
+                db = await self._get_db()
+                cursor = await db.execute(
+                    "UPDATE reminders SET status = 'completed' WHERE id = ?",
+                    (reminder_id,),
+                )
+                await db.commit()
+        except Exception as e:  # noqa: BLE001 - reported, never leaked
+            safe_error(e, operation="complete_reminder", component="MemoryAgent")
+            return False
         return cursor.rowcount > 0
 
     async def get_due_reminders(self) -> List[Dict[str, Any]]:

@@ -60,7 +60,7 @@ export default memo(function InputBar({
     const form = formRef.current;
     if (!form) return;
     form.style.borderColor = on ? "var(--hud-edge-strong)" : "var(--hud-edge)";
-    form.style.boxShadow = on ? "0 0 16px rgba(0, 229, 255, 0.10)" : "inset 0 1px 0 rgba(0, 229, 255, 0.05)";
+    form.style.boxShadow = on ? "0 0 12px color-mix(in srgb, var(--hud-cyan) 8%, transparent)" : "inset 0 1px 0 color-mix(in srgb, var(--hud-cyan) 4%, transparent)";
   };
 
   return (
@@ -69,9 +69,9 @@ export default memo(function InputBar({
       onSubmit={handleSubmit}
       className="flex items-center"
       style={{
-        background: "rgba(3, 7, 13, 0.72)",
-        border: "1px solid var(--hud-edge)",
-        boxShadow: "inset 0 1px 0 rgba(0, 229, 255, 0.05)",
+        background: "color-mix(in srgb, var(--bg0) 72%, transparent)",
+        border: "var(--border-w) solid var(--hud-edge)",
+        boxShadow: "inset 0 1px 0 color-mix(in srgb, var(--hud-cyan) 4%, transparent)",
         transition: "border-color 120ms ease-out, box-shadow 120ms ease-out",
       }}
     >
@@ -82,14 +82,15 @@ export default memo(function InputBar({
           maxLength={8000}
           aria-label={language === "ar" ? "رسالتك" : "Your message"}
           placeholder={language === "ar" ? "اكتب أمراً…" : "ENTER COMMAND…"}
-          className="w-full px-3 py-2.5 outline-none"
+          className="w-full outline-none"
           style={{
+            padding: "var(--space-3) var(--space-4)",
             background: "transparent",
             border: "none",
             color: "var(--hud-text)",
             caretColor: "var(--hud-cyan)",
             fontFamily: "var(--font-mono)",
-            fontSize: 12,
+            fontSize: "var(--font-lg)",
             letterSpacing: "0.02em",
           }}
           dir={language === "ar" ? "rtl" : "ltr"}
@@ -106,12 +107,14 @@ export default memo(function InputBar({
                dock's duplicate mic was removed. The control must persist
                across the state change it controls. */
             onClick={() => (voiceMode ? onVoiceStop?.() : onVoiceStart?.())}
-            className="absolute top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center transition-all"
+            className="absolute top-1/2 -translate-y-1/2 flex items-center justify-center transition-all"
             style={{
+              width: "var(--ctl-size)",
+              height: "var(--ctl-size)",
               color: voiceMode ? "var(--hud-green)" : "var(--hud-text-mute)",
-              insetInlineEnd: "0.3rem",
-              background: voiceMode ? "rgba(0, 255, 156, 0.1)" : "transparent",
-              border: `1px solid ${voiceMode ? "rgba(0,255,156,0.35)" : "var(--hud-edge-faint)"}`,
+              insetInlineEnd: "var(--space-2)",
+              background: voiceMode ? "color-mix(in srgb, var(--hud-green) 10%, transparent)" : "transparent",
+              border: `var(--border-w) solid ${voiceMode ? "color-mix(in srgb, var(--hud-green) 35%, transparent)" : "var(--hud-edge-faint)"}`,
             }}
             title={language === "ar" ? "إدخال صوتي مباشر" : "Direct voice input"}
             aria-label={language === "ar" ? "تفعيل الصوت" : "Activate voice mode"}
@@ -130,29 +133,35 @@ export default memo(function InputBar({
       <button
         type="submit"
         disabled={!isConnected}
-        className="px-4 py-2.5 font-mono font-bold transition-all disabled:opacity-25 flex-none"
+        className="font-mono font-bold transition-all disabled:opacity-25 flex-none"
         style={{
-          background: "rgba(0, 229, 255, 0.08)",
+          padding: "var(--space-3) var(--space-5)",
+          background: "color-mix(in srgb, var(--hud-cyan) 8%, transparent)",
           color: "var(--hud-cyan)",
-          border: "1px solid var(--hud-edge)",
+          border: "var(--border-w) solid var(--hud-edge)",
           borderInlineStartColor: "var(--hud-edge-faint)",
-          fontSize: 10,
+          fontSize: "var(--font-md)",
           letterSpacing: "0.18em",
-          textShadow: "0 0 10px var(--hud-glow-soft)",
+          textShadow: "0 0 8px var(--hud-glow-soft)",
         }}
         onMouseEnter={(e) => {
           if (!isConnected) return;
-          e.currentTarget.style.background = "rgba(0, 229, 255, 0.16)";
+          e.currentTarget.style.background = "color-mix(in srgb, var(--hud-cyan) 16%, transparent)";
         }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(0, 229, 255, 0.08)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--hud-cyan) 8%, transparent)"; }}
       >
         {language === "ar" ? "إرسال" : "SEND"}
       </button>
 
       {voiceMode && (
         <span
-          className="font-mono flex-none px-2"
-          style={{ color: "var(--hud-green)", fontSize: 8, letterSpacing: "0.18em" }}
+          className="font-mono flex-none"
+          style={{
+            padding: "0 var(--space-3)",
+            color: "var(--hud-green)",
+            fontSize: "var(--font-sm)",
+            letterSpacing: "0.18em",
+          }}
           role="status"
         >
           <span aria-hidden="true">●</span> REC

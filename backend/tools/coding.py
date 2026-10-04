@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop
 from tools.sandbox import resolve_workspace

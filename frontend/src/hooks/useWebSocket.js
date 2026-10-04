@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { clientMsgId } from "../lib/ids";
 
 const WS_URL = (() => {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -13,6 +14,20 @@ const WS_URL = (() => {
 })();
 
 let _msgId = 0;
+
+/**
+ * Simple content hash for deduplication fallback when response_id is missing
+ * or when the same content arrives with a different response_id.
+ */
+function contentHash(text) {
+  let hash = 0;
+  const str = text.trim().toLowerCase();
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0; // Convert to 32bit integer
+  }
+  return hash.toString(36);
+}
 
 /**
  * Statuses the backend emits. Anything else is coerced to a real one so a
@@ -39,6 +54,22 @@ const KNOWN_STATUSES = new Set([
 /** Fallback for a status we do not recognise. */
 const FALLBACK_STATUS = "thinking";
 
+/**
+ * The client's own clock reading for a message.
+ *
+ * This is a *receipt* stamp taken when the message is created here — the
+ * user hits Enter, or the first token of a reply lands — not a time invented
+ * for content that never carried one. A server-supplied `msg.ts` still takes
+ * precedence where one exists (see ChatMessage).
+ */
+function clockTime() {
+  try {
+    return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return "";
+  }
+}
+
 export function normalizeStatus(status) {
   return KNOWN_STATUSES.has(status) ? status : FALLBACK_STATUS;
 }
@@ -48,6 +79,10 @@ export default function useWebSocket() {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
+  // Once this session has had a live socket, a drop is a *re*-connection.
+  // The status line needs the difference: "Connecting…" on first attempt,
+  // "Reconnecting…" when a working link went away.
+  const [everConnected, setEverConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [status, setStatus] = useState("disconnected");
   const [intent, setIntent] = useState(null);
@@ -63,6 +98,8 @@ export default function useWebSocket() {
   const [plan, setPlan] = useState([]);
   const [activeTool, setActiveTool] = useState(null);
   const [activity, setActivity] = useState([]);
+  // Track current trace for correlation
+  const [currentTraceId, setCurrentTraceId] = useState(null);
 
   const wsRef = useRef(null);
   const activeVoiceRef = useRef(null);
@@ -71,15 +108,25 @@ export default function useWebSocket() {
   const mediaStreamRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const audioChunksRef = useRef([]);
+  // The utterance currently being played. It used to be a local inside the
+  // audio_end branch, so nothing could stop a voice that had already started —
+  // the STOP control only flipped the flags while the audio kept talking.
+  const audioPlayerRef = useRef(null);
   const voiceModeRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isProcessingRef = useRef(false);
   const renderedResponseIds = useRef(new Set());
+  const renderedContentHashes = useRef(new Set());
   const unsentSpeechRef = useRef(false);
   const confirmationRef = useRef(null);
+  // Tools currently in flight, name → display label. See `tool_started`.
+  const runningToolsRef = useRef(new Map());
 
   const addMessage = useCallback((role, content, meta = {}) => {
-    setMessages((prev) => [...prev, { id: ++_msgId, role, content, ...meta }]);
+    setMessages((prev) => [
+      ...prev,
+      { id: ++_msgId, role, content, ts: meta.ts ?? clockTime(), ...meta },
+    ]);
   }, []);
 
   /**
@@ -99,9 +146,40 @@ export default function useWebSocket() {
   }, []);
 
   const stopAudio = useCallback(() => {
+    // Silence the playing utterance itself, not just the flags. Releasing the
+    // blob URL here matters: once the handlers are detached the browser will
+    // never call onended, so nothing else would revoke it.
+    const player = audioPlayerRef.current;
+    if (player) {
+      audioPlayerRef.current = null;
+      try {
+        player.audio.pause();
+      } catch (e) {}
+      player.audio.onended = null;
+      player.audio.onerror = null;
+      try {
+        URL.revokeObjectURL(player.url);
+      } catch (e) {}
+    }
+    // Discard chunks of the in-flight utterance: a late `audio_end` must not
+    // assemble the response the user just stopped.
+    audioChunksRef.current = [];
     setIsSpeaking(false);
     isSpeakingRef.current = false;
+    setIsTyping(false);
     isProcessingRef.current = false;
+  }, []);
+
+  /**
+   * The tool the HUD should call "active": the first one still running.
+   *
+   * Deliberately not "the last one that finished clears everything" — with
+   * more than one tool in flight, a finish for A must not blank the display
+   * of B. Returns null only when nothing is running.
+   */
+  const nextRunningTool = useCallback(() => {
+    const first = runningToolsRef.current.entries().next();
+    return first.done ? null : { name: first.value[0], label: first.value[1] };
   }, []);
 
   const connectWebSocket = useCallback(() => {
@@ -110,6 +188,7 @@ export default function useWebSocket() {
 
     socket.onopen = () => {
       setIsConnected(true);
+      setEverConnected(true);
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
@@ -129,6 +208,12 @@ export default function useWebSocket() {
         return;
       }
       if (!data || typeof data !== "object" || !data.type) return;
+      
+      // Track trace_id for correlation
+      if (data.trace_id) {
+        setCurrentTraceId(data.trace_id);
+      }
+      
       switch (data.type) {
         case "status":
           setStatus(normalizeStatus(data.content));
@@ -162,21 +247,40 @@ export default function useWebSocket() {
           setStatus("planning");
           break;
         case "tool_started":
+          // Several tools can be in flight at once (the engine runs them
+          // sequentially, but a progress/finish for one must not clear the
+          // display of another), so "what is running" is a map, and
+          // `activeTool` is derived from it rather than nulled blindly.
+          runningToolsRef.current.set(data.name, data.label || data.name);
           setActiveTool({ name: data.name, label: data.label || data.name });
           setStatus("executing");
           setActivity((prev) => [
             ...prev,
-            { id: `${data.name}-${prev.length}`, kind: "started", name: data.name, label: data.label || data.name },
+            {
+              id: `${data.name}-${prev.length}`,
+              kind: "started",
+              name: data.name,
+              label: data.label || data.name,
+              at: Date.now(),
+            },
           ]);
           break;
         case "tool_progress":
           setActivity((prev) => [
             ...prev,
-            { id: `${data.name}-${prev.length}`, kind: "progress", name: data.name, message: data.message || "" },
+            {
+              id: `${data.name}-${prev.length}`,
+              kind: "progress",
+              name: data.name,
+              message: data.message || "",
+              at: Date.now(),
+            },
           ]);
           break;
-        case "tool_finished":
-          setActiveTool(null);
+        case "tool_finished": {
+          runningToolsRef.current.delete(data.name);
+          const rest = nextRunningTool();
+          setActiveTool(rest);
           setActivity((prev) => [
             ...prev,
             {
@@ -185,9 +289,14 @@ export default function useWebSocket() {
               name: data.name,
               success: Boolean(data.success),
               summary: (data.summary || "").slice(0, 200),
+              at: Date.now(),
+              // The backend's own measurement when it sends one; otherwise
+              // deriveToolRows falls back to the client-side start stamp.
+              durationMs: typeof data.duration_ms === "number" ? data.duration_ms : undefined,
             },
           ]);
           break;
+        }
         case "stt_result":
           // Whisper's verdict on the input language. Adopt it so the agent
           // prompt and the TTS voice match what was actually spoken.
@@ -201,41 +310,69 @@ export default function useWebSocket() {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (last && last.role === "assistant" && last.streaming) {
-              return [...prev.slice(0, -1), { ...last, content: last.content + data.content }];
+              return [...prev.slice(0, -1), { ...last, content: last.content + data.content, trace_id: data.trace_id }];
             }
             return [
               ...prev,
-              { id: ++_msgId, role: "assistant", content: data.content, streaming: true },
+              {
+                id: ++_msgId,
+                role: "assistant",
+                content: data.content,
+                streaming: true,
+                trace_id: data.trace_id,
+                // Stamp on the first token of the turn: the receipt time of
+                // the reply, not an invented one (see clockTime).
+                ts: clockTime(),
+              },
             ];
           });
           break;
-        case "message":
+        case "message": {
           setIsTyping(false);
           isProcessingRef.current = false;
-          if (data.response_id && renderedResponseIds.current.has(data.response_id)) break;
-          if (data.response_id) renderedResponseIds.current.add(data.response_id);
-          setMessages((prev) => {
-            // Only replace a bubble that is still *streaming*. The final
-            // `message` frame is the authoritative text for the tokens that
-            // preceded it, so it supersedes an in-progress bubble and nothing
-            // else.
-            //
-            // It previously searched for the last assistant message of any
-            // kind, so two consecutive complete replies collapsed into one and
-            // the first was silently lost.
-            const last = prev[prev.length - 1];
-            if (last && last.role === "assistant" && last.streaming) {
+          
+          // Dual-layer deduplication: response_id (primary) + content hash (fallback)
+          const responseId = data.response_id;
+          const contentHashValue = data.content ? contentHash(data.content) : null;
+          
+          const isDuplicate = (responseId && renderedResponseIds.current.has(responseId)) ||
+                             (contentHashValue && renderedContentHashes.current.has(contentHashValue));
+          
+          if (!isDuplicate) {
+            if (responseId) renderedResponseIds.current.add(responseId);
+            if (contentHashValue) renderedContentHashes.current.add(contentHashValue);
+            
+            setMessages((prev) => {
+              // Only replace a bubble that is still *streaming*. The final
+              // `message` frame is the authoritative text for the tokens that
+              // preceded it, so it supersedes an in-progress bubble and nothing
+              // else.
+              //
+              // It previously searched for the last assistant message of any
+              // kind, so two consecutive complete replies collapsed into one and
+              // the first was silently lost.
+              const last = prev[prev.length - 1];
+              if (last && last.role === "assistant" && last.streaming) {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...last, content: data.content, streaming: false, trace_id: data.trace_id },
+                ];
+              }
               return [
-                ...prev.slice(0, -1),
-                { ...last, content: data.content, streaming: false },
+                ...prev,
+                {
+                  id: ++_msgId,
+                  role: "assistant",
+                  content: data.content,
+                  streaming: false,
+                  trace_id: data.trace_id,
+                  ts: clockTime(),
+                },
               ];
-            }
-            return [
-              ...prev,
-              { id: ++_msgId, role: "assistant", content: data.content, streaming: false },
-            ];
-          });
+            });
+          }
           break;
+        }
         case "subtitle":
           setSubtitle((prev) => (prev !== data.content ? data.content : prev));
           break;
@@ -277,19 +414,29 @@ export default function useWebSocket() {
               const blob = new Blob([allBytes], { type: "audio/" + (audioChunksRef.format || "mpeg") });
               const url = URL.createObjectURL(blob);
               const audio = new Audio(url);
+              // Publish the player so the STOP control can reach it.
+              audioPlayerRef.current = { audio, url };
+              const release = () => {
+                if (audioPlayerRef.current?.audio === audio) {
+                  audioPlayerRef.current = null;
+                }
+              };
               audio.onended = () => {
                 URL.revokeObjectURL(url);
+                release();
                 setIsSpeaking(false);
                 isSpeakingRef.current = false;
               };
               audio.onerror = () => {
                 URL.revokeObjectURL(url);
+                release();
                 setIsSpeaking(false);
                 isSpeakingRef.current = false;
                 console.error("Audio playback error");
               };
               audio.play().catch((e) => {
                 console.error("Audio play error:", e);
+                release();
                 setIsSpeaking(false);
                 isSpeakingRef.current = false;
               });
@@ -331,6 +478,25 @@ export default function useWebSocket() {
           setSubtitle("");
           audioChunksRef.current = [];
           isProcessingRef.current = false;
+          // The turn was cancelled, so no `tool_finished` is coming for what
+          // was running. Close those rows out here rather than leaving a
+          // chip that says "Running" forever.
+          if (runningToolsRef.current.size > 0) {
+            const cancelled = [...runningToolsRef.current.keys()];
+            runningToolsRef.current.clear();
+            setActiveTool(null);
+            setActivity((prev) => [
+              ...prev,
+              ...cancelled.map((name, i) => ({
+                id: `${name}-${prev.length + i}-cancelled`,
+                kind: "finished",
+                name,
+                success: false,
+                summary: "stopped",
+                at: Date.now(),
+              })),
+            ]);
+          }
           break;
         case "require_confirmation": {
           // High-risk tool call: the backend is blocked and waiting on us.
@@ -420,7 +586,7 @@ export default function useWebSocket() {
     };
     socket.onerror = () => socket.close();
     wsRef.current = socket;
-  }, [addMessage, isSocketOpen]);
+  }, [addMessage, isSocketOpen, nextRunningTool]);
 
   useEffect(() => {
     connectWebSocket();
@@ -450,17 +616,40 @@ export default function useWebSocket() {
       }
       isProcessingRef.current = true;
       addMessage("user", text);
-      wsRef.current.send(JSON.stringify({ type: "message", message: text }));
+      // client_msg_id: a client-generated id the backend can use to drop a
+      // duplicate send (double Enter, a retry after a flaky reconnect).
+      // Optional server-side — its absence means "nothing to dedupe" — so it
+      // must never block a send.
+      wsRef.current.send(
+        JSON.stringify({ type: "message", message: text, client_msg_id: clientMsgId() }),
+      );
       setIsTyping(true);
     },
     [addMessage, isSocketOpen],
   );
 
+  /** Low-level frame only. Voice mode uses this to cut off a turn that is
+   *  still speaking; the STOP button wants that *plus* local silencing, so it
+   *  goes through `requestStop` below. */
   const sendInterrupt = useCallback(() => {
     if (isSocketOpen()) {
       wsRef.current.send(JSON.stringify({ type: "interrupt" }));
     }
   }, [isSocketOpen]);
+
+  /**
+   * The STOP control, in one place.
+   *
+   * Both halves are required: silence whatever is playing *here*, and ask the
+   * backend to cancel the in-flight turn (`interrupt` -> `state.cancel()` kills
+   * the LLM task and the TTS task, then the server acks with `interrupted`).
+   * The button previously called `stopAudio` alone, so it only flipped flags —
+   * the audio kept talking and the backend kept generating.
+   */
+  const requestStop = useCallback(() => {
+    stopAudio();
+    sendInterrupt();
+  }, [stopAudio, sendInterrupt]);
 
   // Human-in-the-loop: approve or deny a blocked high-risk tool call.
   const respondToConfirmation = useCallback(
@@ -752,16 +941,19 @@ if (rms > threshold) {
   const clearChat = useCallback(() => {
     setMessages([]);
     renderedResponseIds.current.clear();
+    renderedContentHashes.current.clear();
     // Progress is per-turn, so clearing the transcript clears it too.
     setPlan([]);
     setActiveTool(null);
     setActivity([]);
+    runningToolsRef.current.clear();
   }, []);
 
   return {
     messages,
     setMessages,
     isConnected,
+    everConnected,
     isTyping,
     status,
     intent,
@@ -782,11 +974,13 @@ if (rms > threshold) {
     sendReminderCmd,
     refreshReminders,
     stopAudio,
+    requestStop,
     clearChat,
     startVoiceMode,
     stopVoiceMode,
     addMessage,
     respondToConfirmation,
     cancelPendingConfirmation,
+    currentTraceId,
   };
 }

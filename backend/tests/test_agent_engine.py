@@ -916,3 +916,160 @@ class TestEventBus:
         assert AgentEventType.RESPONSE_CHUNK not in STATUS_EVENTS
         assert AgentEventType.THINKING in STATUS_EVENTS
         assert AgentEventType.TOOL_STARTED in STATUS_EVENTS
+
+
+class TestExpectToolNudge:
+    """A first-attempt prose reply to a routed *tool* request.
+
+    Live regression: the Arabic request "كم الساعة دلوقتي" was routed to the
+    tool agent and answered with the template ``الساعة الآن هي: [أكتب الوقت
+    الحالي]`` — no tool, a placeholder, delivered as the answer. The nudge gives
+    the model exactly one corrective round, then accepts prose either way.
+    """
+
+    PLACEHOLDER = "الساعة الآن هي: [أكتب الوقت الحالي]"
+
+    async def test_a_placeholder_triggers_a_nudge_then_the_tool_runs(self, registry):
+        llm = ScriptedLLM([
+            self.PLACEHOLDER,
+            '{"action": "get_time"}',
+            "الساعة ٣ العصر.",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "كم الساعة دلوقتي", language="ar", expect_tool=True
+        )
+
+        assert result.tool_calls == ["get_time"]
+        assert result.text == "الساعة ٣ العصر."
+        assert self.PLACEHOLDER not in result.text
+        assert llm.calls == 3
+        # The nudge went to the model, not the user: the second request must
+        # carry it as an instruction.
+        nudged = "\n".join(
+            m["content"] for m in llm.requests[1] if m["role"] == "user"
+        )
+        assert "get_time" in nudged
+
+    async def test_prose_twice_then_honest_refusal(self, registry):
+        """Two ignored nags, then refusal — prose is never the third answer.
+
+        The model used to be allowed to repeat itself into delivery; a live
+        run delivered ``الساعة الآن هي: 12:34:56`` (wrong) that way.
+        """
+        from agents.engine import _NO_TOOL_TAKEN
+
+        llm = ScriptedLLM([
+            "I do not need a tool for this.",
+            "Still prose, still no tool.",
+            "Third time's the charm, still prose.",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "hello", language="en", expect_tool=True
+        )
+
+        assert result.text == _NO_TOOL_TAKEN["en"]
+        assert result.stopped_reason == "no_tool_taken"
+        assert llm.calls == 3  # nag, final nag, refusal — no fourth call
+        assert any("no tool call" in e for e in result.errors)
+        # Both nags went to the model, in order: format, then insistence.
+        first_nag = "\n".join(
+            m["content"] for m in llm.requests[1] if m["role"] == "user"
+        )
+        second_nag = "\n".join(
+            m["content"] for m in llm.requests[2] if m["role"] == "user"
+        )
+        assert "get_time" in first_nag
+        assert "final attempt" in second_nag.lower()
+
+    async def test_without_the_flag_prose_is_accepted_immediately(self, registry):
+        llm = ScriptedLLM(["Plain prose answer."])
+        result = await AgentEngine(llm, registry).run("hello")
+
+        assert result.text == "Plain prose answer."
+        assert llm.calls == 1
+
+    async def test_the_nudge_does_not_fire_once_a_tool_has_run(self, registry):
+        """Later-iteration prose is a summary, not a skipped tool."""
+        llm = ScriptedLLM([
+            '{"action": "get_time"}',
+            "Done — the tool ran.",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "run it", language="en", expect_tool=True
+        )
+
+        assert result.tool_calls == ["get_time"]
+        assert result.text == "Done — the tool ran."
+        assert llm.calls == 2
+
+
+class TestPlaceholderIsNeverTheAnswer:
+    """``[أكتب الوقت الحالي]`` is a form to fill in, not a reply."""
+
+    PH = "الساعة الآن هي: [أكتب الوقت الحالي]"
+
+    def test_detector(self):
+        from agents.engine import is_placeholder_reply
+
+        assert is_placeholder_reply(self.PH) is True
+        assert is_placeholder_reply("Fill in [write your name here]") is True
+        assert is_placeholder_reply("See [docs] for details") is False
+        assert is_placeholder_reply("The time is 3pm") is False
+        assert is_placeholder_reply("") is False
+
+    async def test_repeated_placeholders_without_a_tool_are_refused(self, registry):
+        from agents.engine import _NO_TOOL_TAKEN
+
+        bus, seen = collector()
+        llm = ScriptedLLM([self.PH, self.PH, self.PH])
+        result = await AgentEngine(llm, registry).run(
+            "كم الساعة دلوقتي", language="ar", bus=bus, expect_tool=True
+        )
+
+        # Two nudges happened, then the prose was refused outright.
+        assert llm.calls == 3
+        assert result.text == _NO_TOOL_TAKEN["ar"]
+        assert self.PH not in result.text
+        assert result.stopped_reason == "no_tool_taken"
+        assert any("no tool call" in e for e in result.errors)
+        # The refusal is surfaced as an error event, not a silent swap.
+        assert any(e.type is AgentEventType.ERROR for e in seen)
+
+    async def test_a_placeholder_summary_gets_one_corrective_round(self, registry):
+        """The tool ran, but the summary is a template — nudge, then accept."""
+        llm = ScriptedLLM([
+            '{"action": "get_time"}',
+            "الوقت: [أكتب الوقت هنا]",
+            "الساعة ٣ الظهر.",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "كم الساعة", language="ar", expect_tool=True
+        )
+
+        assert result.tool_calls == ["get_time"]  # the work happened
+        assert result.text == "الساعة ٣ الظهر."
+        assert "[أكتب" not in result.text
+        assert llm.calls == 3
+        # The second round was told to stop templating.
+        nudged = "\n".join(
+            m["content"] for m in llm.requests[2] if m["role"] == "user"
+        )
+        assert "قالب" in nudged
+
+    async def test_a_repeated_placeholder_summary_is_refused(self, registry):
+        """Two placeholder summaries: report the failure, ship no template."""
+        from agents.engine import _MALFORMED_REPLY
+
+        llm = ScriptedLLM([
+            '{"action": "get_time"}',
+            "الوقت: [أكتب الوقت هنا]",
+            "الوقت: [اكتب الوقت]",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "كم الساعة", language="ar", expect_tool=True
+        )
+
+        assert result.tool_calls == ["get_time"]
+        assert result.text == _MALFORMED_REPLY["ar"]
+        assert "[أكتب" not in result.text and "[اكتب" not in result.text
+        assert any("placeholder" in e for e in result.errors)

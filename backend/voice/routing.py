@@ -18,7 +18,6 @@ logger = logging.getLogger("Zaytoon.Voice.Routing")
 # Language codes used across the app.
 LANG_AR = "ar"
 LANG_EN = "en"
-SUPPORTED_LANGUAGES = (LANG_AR, LANG_EN)
 
 
 @dataclass(frozen=True)
@@ -92,10 +91,6 @@ def normalize_language(language: Optional[str]) -> str:
     return DEFAULT_LANGUAGE
 
 
-def is_supported(language: Optional[str]) -> bool:
-    return normalize_language(language) in VOICE_PROFILES
-
-
 def get_profile(language: Optional[str]) -> VoiceProfile:
     """Return the :class:`VoiceProfile` for a language, defaulting to English."""
     return VOICE_PROFILES[normalize_language(language)]
@@ -114,10 +109,6 @@ def voice_chain(language: Optional[str]) -> List[str]:
         if candidate not in chain:
             chain.append(candidate)
     return chain
-
-
-def locale_for(language: Optional[str]) -> str:
-    return get_profile(language).locale
 
 
 def ssml_lang_for(language: Optional[str]) -> str:

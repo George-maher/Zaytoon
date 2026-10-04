@@ -145,6 +145,8 @@ describe("App runtime", () => {
     expect(screen.getAllByText(/^MSN$/)).toHaveLength(1);
     // The tabbed drawer must not also be present at this width.
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    // Full-size core: the shrink to 180px is the phone's, not ours.
+    expect(screen.getByRole("img", { name: /ai core/i }).style.width).toBe("260px");
   });
 
   it("collapses the rails into one tabbed drawer at narrow width", async () => {
@@ -170,6 +172,77 @@ describe("App runtime", () => {
     // The core and the console survive the collapse.
     expect(screen.getByRole("img", { name: /ai core/i })).toBeInTheDocument();
     expect(screen.getByText(/command console/i)).toBeInTheDocument();
+  });
+
+  it("keeps the whole deck usable in a 360-430px phone viewport", async () => {
+    // Narrow means narrow: same jsdom matchMedia pin as the drawer test, i.e.
+    // the layout a 360px phone gets. Nothing about the collapse may cost the
+    // user the input, the transcript or the console -- and the core must step
+    // down in size rather than be the reason the page scrolls sideways.
+    global.matchMedia = vi.fn((q) => ({
+      matches: false,
+      media: q,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+    }));
+    window.matchMedia = global.matchMedia;
+    await act(async () => { render(<App />); });
+
+    // The core shrinks from 260px (desktop) to 180px at phone widths.
+    const core = screen.getByRole("img", { name: /ai core/i });
+    expect(core.style.width).toBe("180px");
+
+    // Every load-bearing region is present...
+    expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
+    expect(screen.getByText(/transcript/i)).toBeInTheDocument();
+    expect(screen.getByText(/command console/i)).toBeInTheDocument();
+    expect(screen.getByTitle("CONF")).toBeInTheDocument();
+    expect(screen.getByTitle("STOP")).toBeInTheDocument();
+
+    // ...exactly once each: the drawer renders one rail, not a second deck.
+    expect(screen.getAllByRole("img", { name: /ai core/i })).toHaveLength(1);
+    expect(screen.getAllByLabelText(/your message/i)).toHaveLength(1);
+    expect(screen.getAllByText(/command console/i)).toHaveLength(1);
+    expect(screen.getAllByText(/system status/i)).toHaveLength(1);
+    expect(screen.getByRole("tablist")).toBeInTheDocument();
+  });
+
+  it("announces what the engine is doing on the status line", async () => {
+    // The line is derived from live hook state (lib/statusLabels), shown under
+    // the console as a polite live region, and reused by the transcript's
+    // typing indicator — so the two can never disagree.
+    await act(async () => { render(<App />); });
+    await waitFor(() => expect(FakeSocket.last.readyState).toBe(1));
+    const ws = FakeSocket.last;
+
+    // Open socket, no server status yet: the stale initial "disconnected"
+    // must read as Ready, not as a phantom reconnect.
+    expect(screen.getAllByText("Ready").length).toBeGreaterThan(0);
+
+    await act(async () => { ws.emit({ type: "plan", steps: ["Create the folder", "Write the file"] }); });
+    expect(screen.getAllByText("Planning…").length).toBeGreaterThan(0);
+    expect(screen.getByText("Create the folder")).toBeInTheDocument();
+
+    await act(async () => { ws.emit({ type: "status", content: "thinking" }); });
+    expect(screen.getAllByText("Thinking…").length).toBeGreaterThan(0);
+
+    // A pending human approval outranks every working state.
+    await act(async () => {
+      ws.emit({
+        type: "require_confirmation",
+        request_id: "cfm_status",
+        action: "file_write",
+        params: { path: "a.txt" },
+        level: "HIGH",
+        reasons: ["writes a file"],
+        summary: "Write a.txt",
+        text: "Write a.txt?",
+        session_id: "s1",
+      });
+    });
+    expect(screen.getAllByText("Waiting for your approval…").length).toBeGreaterThan(0);
   });
 
   it("sends a typed message over the socket", async () => {
@@ -359,5 +432,80 @@ describe("App runtime", () => {
       expect(document.documentElement.getAttribute("dir")).toBe("rtl"),
     );
     expect(document.documentElement.getAttribute("lang")).toBe("ar");
+  });
+});
+
+
+describe("STOP control", () => {
+  let consoleErrors;
+
+  beforeEach(() => {
+    stubBrowserApis();
+    consoleErrors = [];
+    vi.spyOn(console, "error").mockImplementation((...a) => consoleErrors.push(a.join(" ")));
+    global.WebSocket = FakeSocket;
+    FakeSocket.last = null;
+    global.matchMedia = vi.fn((q) => ({
+      matches: /min-width:\s*1280px/.test(q),
+      media: q,
+      addEventListener() {},
+      removeEventListener() {},
+      addListener() {},
+      removeListener() {},
+    }));
+    window.matchMedia = global.matchMedia;
+    global.Audio = class {
+      constructor() { this.src = ""; }
+      play() { return Promise.resolve(); }
+      pause() {}
+    };
+    global.URL.createObjectURL = () => "blob:stub";
+    global.URL.revokeObjectURL = () => {};
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ root: "C:/ws", available: true, enforced: true, entries: [] }),
+    }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("cancels the in-flight turn on the wire and unlocks the input", async () => {
+    // The full path the STOP button is supposed to take: dock -> App -> hook
+    // -> WebSocket. Before it was wired, the button only cleared local flags
+    // and the backend kept generating.
+    await act(async () => { render(<App />); });
+    await waitFor(() => FakeSocket.last && FakeSocket.last.readyState === 1);
+    const socket = FakeSocket.last;
+    const sent = (type) => socket.sent.filter((m) => m.type === type);
+
+    const input = screen.getByLabelText(/your message/i);
+    fireEvent.change(input, { target: { value: "what time is it" } });
+    fireEvent.submit(input.closest("form"));
+    expect(sent("message")).toHaveLength(1);
+
+    // Latched while the backend works: a second send is refused.
+    fireEvent.change(input, { target: { value: "and again" } });
+    fireEvent.submit(input.closest("form"));
+    expect(sent("message")).toHaveLength(1);
+
+    fireEvent.click(screen.getByTitle("STOP"));
+
+    // The backend is asked to cancel the turn...
+    expect(sent("interrupt")).toEqual([{ type: "interrupt" }]);
+    // ...and the input is usable again immediately, before the ack lands.
+    fireEvent.change(input, { target: { value: "hello there" } });
+    fireEvent.submit(input.closest("form"));
+    expect(sent("message")).toHaveLength(2);
+
+    // The server ack resets the transient state.
+    act(() => socket.emit({ type: "interrupted" }));
+    expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
+
+    const fatal = consoleErrors.filter((e) =>
+      /Uncaught|Cannot read|is not a function|undefined is not/i.test(e)
+    );
+    expect(fatal).toEqual([]);
   });
 });

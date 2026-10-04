@@ -1,6 +1,5 @@
 import pytest
 
-from agents.base_agent import BaseAgent
 from agents.fast_agent import FastAgent
 from agents.code_agent import CodeAgent
 from agents.planner_agent import PlannerAgent

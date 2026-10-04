@@ -42,7 +42,9 @@ function Panel({
           {trailing}
         </header>
       )}
-      <div className={bodyClassName || "p-2"}>{children}</div>
+      {/* Body inset is a density token, not a per-panel choice: the rhythm
+          of every module comes from the same scale. */}
+      <div className={bodyClassName} style={{ padding: "var(--space-3)" }}>{children}</div>
     </section>
   );
 }

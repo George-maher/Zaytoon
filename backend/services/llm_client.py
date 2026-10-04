@@ -36,7 +36,6 @@ import asyncio
 import itertools
 import json
 import logging
-import re
 import time
 import uuid
 from collections import defaultdict
@@ -46,6 +45,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 import httpx
 
 from config import (
+    PROVIDER_OLLAMA,
     PROVIDER_OPENROUTER,
     TIER_FALLBACK,
     TIER_FAST,
@@ -94,19 +94,6 @@ class LLMRequestError(LLMError):
 
 class LLMResponseError(LLMError):
     """The upstream response was not a well-formed completion."""
-
-
-class LLMContractError(LLMResponseError):
-    """A well-formed completion that does not satisfy the request.
-
-    The distinction matters: a malformed body suggests the provider is broken,
-    whereas a valid body that answers the wrong question suggests the *model* is
-    unfit, and the only remedy is a different free model.
-    """
-
-    def __init__(self, message: str, verdict: str = ""):
-        super().__init__(message)
-        self.verdict = verdict
 
 
 class AllModelsUnavailableError(LLMError):
@@ -644,6 +631,340 @@ class LLMClient:
             return max(self.provider_cooldown, config.LLM_RATE_LIMIT_COOLDOWN)
         return self.provider_cooldown
 
+    # ------------------------------------------------------------------
+    # Ollama (local) path — same contract, same budget, no cloud
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _using_ollama() -> bool:
+        return config.PROVIDER == PROVIDER_OLLAMA
+
+    def _ollama(self):
+        """The shared Ollama HTTP client for the configured endpoint."""
+        from services.ollama_client import get_ollama_client
+
+        return get_ollama_client(config.OLLAMA_BASE_URL, config.OLLAMA_TIMEOUT)
+
+    @staticmethod
+    def _ollama_options(max_tokens: int, temperature: float) -> Dict[str, Any]:
+        return {"num_predict": max_tokens, "temperature": temperature}
+
+    async def _complete_ollama(
+        self,
+        messages: List[Dict[str, Any]],
+        tier: str,
+        max_tokens: int,
+        temperature: float,
+        tools: Optional[List[Dict[str, Any]]],
+        retries: Optional[int],
+        contract: CompletionContract,
+        extract: Optional[Callable[[str], Any]],
+        rid: str,
+    ) -> str:
+        """Non-streaming local completion under the same contract + budget."""
+        # ``tier`` may arrive as ``None`` (the engine has no tier to offer when
+        # its LLM client carries none), and the OpenRouter ``build_chain``
+        # normalises it the same way — defaulting to FAST rather than quietly
+        # escalating a tool turn to the big general model on CPU.
+        tier = tier if tier in (TIER_FAST, TIER_REASONING, TIER_FALLBACK) else TIER_FAST
+        attempts: List[AttemptRecord] = []
+        required = list(contract.required_capabilities)
+        model = config.ollama_model_for_tier(tier)
+        label = f"ollama:{model}"
+        client = self._ollama()
+        budget = _AttemptBudget(self.max_attempts)
+        retries_allowed = max(1, self.max_retries if retries is None else retries)
+        reachable = False
+
+        for _ in range(retries_allowed):
+            number = budget.take()
+            if number is None:
+                break
+            started = time.monotonic()
+            try:
+                content = await client.chat(
+                    messages, model=model, stream=False, tools=tools,
+                    options=self._ollama_options(max_tokens, temperature),
+                )
+                reachable = True
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as e:
+                elapsed = int((time.monotonic() - started) * 1000)
+                status = e.response.status_code
+                try:
+                    body = (e.response.text or "")[:400]
+                except Exception:  # pragma: no cover - defensive
+                    body = ""
+                if status == 404 or "not found" in body.lower():
+                    # Never auto-download: tell the operator the exact command.
+                    raise AllModelsUnavailableError(
+                        f"MODEL NOT INSTALLED: {model!r} is not available at "
+                        f"{config.OLLAMA_BASE_URL}. Install it with "
+                        f"`ollama pull {model}` and try again "
+                        "(Zaytoon never downloads models on its own).",
+                        attempts,
+                    ) from e
+                record = AttemptRecord(
+                    label, "ollama", model, self._classify_status(status),
+                    status, body, elapsed, attempt=number, request_id=rid,
+                    required_capabilities=required,
+                    fallback_reason=f"HTTP_{status}",
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record(record.outcome, elapsed)
+                self._health(model).record_failure(
+                    self._cooldown_for(record.outcome), body
+                )
+                break
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                elapsed = int((time.monotonic() - started) * 1000)
+                detail = (
+                    f"Ollama is not reachable at {config.OLLAMA_BASE_URL}: {e}. "
+                    "Start it with `ollama serve`."
+                )
+                record = AttemptRecord(
+                    label, "ollama", model, "connect_error", None, detail,
+                    elapsed, attempt=number, request_id=rid,
+                    required_capabilities=required,
+                    fallback_reason="CONNECT_ERROR",
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record("connect_error", elapsed)
+                self._health(model).record_failure(self.provider_cooldown, detail)
+                break
+            except httpx.TimeoutException:
+                elapsed = int((time.monotonic() - started) * 1000)
+                record = AttemptRecord(
+                    label, "ollama", model, "timeout", None, "timeout", elapsed,
+                    attempt=number, request_id=rid,
+                    required_capabilities=required, fallback_reason="TIMEOUT",
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record("timeout", elapsed)
+                self._health(model).record_failure(self.provider_cooldown, "timeout")
+                break
+            except Exception as e:
+                elapsed = int((time.monotonic() - started) * 1000)
+                record = AttemptRecord(
+                    label, "ollama", model, "error", None, str(e), elapsed,
+                    attempt=number, request_id=rid,
+                    required_capabilities=required, fallback_reason="ERROR",
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record("error", elapsed)
+                self._health(model).record_failure(self.provider_cooldown, str(e))
+                break
+
+            elapsed = int((time.monotonic() - started) * 1000)
+            verdict = validate_completion(content, contract, extract=extract)
+            if not verdict.ok:
+                record = AttemptRecord(
+                    label, "ollama", model, OUTCOME_INVALID, 200, verdict.detail,
+                    elapsed, attempt=number, request_id=rid,
+                    validation=verdict.verdict,
+                    required_capabilities=required,
+                    tool_called=(
+                        getattr(verdict.tool_calls[0], "name", "")
+                        if verdict.tool_calls else ""
+                    ),
+                    fallback_reason=verdict.verdict,
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record_invalid(verdict.verdict)
+                self._health(model).record_failure(
+                    self.provider_cooldown, verdict.verdict
+                )
+                break
+
+            self._health(model).record_success()
+            self.metrics.record_success(model, elapsed)
+            record = AttemptRecord(
+                label, "ollama", model, "ok", 200, latency_ms=elapsed,
+                attempt=number, request_id=rid, validation=verdict.verdict,
+                required_capabilities=required,
+                tool_called=(
+                    getattr(verdict.tool_calls[0], "name", "")
+                    if verdict.tool_calls else ""
+                ),
+            )
+            self._log_attempt(record)
+            attempts.append(record)
+            return content
+
+        if not reachable and attempts and attempts[0].outcome == "connect_error":
+            raise AllModelsUnavailableError(attempts[0].detail, attempts)
+        raise AllModelsUnavailableError(
+            f"Local model {model!r} failed "
+            f"({len(attempts)} attempts): {self._summarise(attempts)}",
+            attempts,
+        )
+
+    async def _stream_ollama(
+        self,
+        messages: List[Dict[str, Any]],
+        on_delta: Optional[Callable[[str], Awaitable[None]]],
+        tier: str,
+        max_tokens: int,
+        temperature: float,
+        tools: Optional[List[Dict[str, Any]]],
+        retries: Optional[int],
+        contract: CompletionContract,
+        extract: Optional[Callable[[str], Any]],
+        rid: str,
+    ) -> str:
+        """Streaming local completion; identical semantics to the SSE path."""
+        tier = tier if tier in (TIER_FAST, TIER_REASONING, TIER_FALLBACK) else TIER_FAST
+        attempts: List[AttemptRecord] = []
+        required = list(contract.required_capabilities)
+        model = config.ollama_model_for_tier(tier)
+        label = f"ollama:{model}"
+        client = self._ollama()
+        budget = _AttemptBudget(self.max_attempts)
+        attempts_allowed = max(1, self.max_retries if retries is None else retries)
+        emitted = False
+        last_partial = ""
+        reachable = False
+
+        for _ in range(attempts_allowed):
+            number = budget.take()
+            if number is None:
+                break
+            full = ""
+            started = time.monotonic()
+            try:
+                stream = await client.chat(
+                    messages, model=model, stream=True, tools=tools,
+                    options=self._ollama_options(max_tokens, temperature),
+                )
+                async for delta in stream:
+                    full += delta
+                    emitted = True
+                    last_partial = full
+                    if on_delta:
+                        await on_delta(delta)
+                reachable = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                elapsed = int((time.monotonic() - started) * 1000)
+                kind = "error"
+                detail = str(e)
+                if isinstance(e, httpx.HTTPStatusError):
+                    status = e.response.status_code
+                    if status == 404:
+                        raise AllModelsUnavailableError(
+                            f"MODEL NOT INSTALLED: {model!r} is not available at "
+                            f"{config.OLLAMA_BASE_URL}. Install it with "
+                            f"`ollama pull {model}` and try again "
+                            "(Zaytoon never downloads models on its own).",
+                            attempts,
+                        ) from e
+                    kind = self._classify_status(status)
+                    detail = self._human_error(status, detail)
+                elif isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+                    kind = "connect_error"
+                    detail = (
+                        f"Ollama is not reachable at {config.OLLAMA_BASE_URL}: {e}. "
+                        "Start it with `ollama serve`."
+                    )
+                elif isinstance(e, httpx.TimeoutException):
+                    kind = "timeout"
+                    detail = "timeout"
+                record = AttemptRecord(
+                    label, "ollama", model, kind, None, detail, elapsed,
+                    attempt=number, request_id=rid,
+                    required_capabilities=required, fallback_reason=kind.upper(),
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record(kind, elapsed)
+                self._health(model).record_failure(
+                    self._cooldown_for(kind), detail
+                )
+                if emitted:
+                    # Text is already on screen: never stream a second copy.
+                    logger.warning(
+                        "LLM STREAM BROKE after first token on %s; "
+                        "recovering with a blocking call", model,
+                    )
+                    try:
+                        return await self.complete(
+                            messages, tier=tier, max_tokens=max_tokens,
+                            temperature=temperature, tools=tools,
+                            contract=contract, extract=extract, request_id=rid,
+                        )
+                    except LLMError:
+                        return last_partial
+                break
+
+            if not full:
+                elapsed = int((time.monotonic() - started) * 1000)
+                attempts.append(
+                    AttemptRecord(
+                        label, "ollama", model, "malformed", 200,
+                        "stream completed with no content", elapsed,
+                        attempt=number, request_id=rid,
+                        required_capabilities=required,
+                    )
+                )
+                self.metrics.record("malformed", elapsed)
+                self._health(model).record_failure(
+                    self.provider_cooldown, "empty_stream"
+                )
+                continue
+
+            elapsed = int((time.monotonic() - started) * 1000)
+            verdict = validate_completion(full, contract, extract=extract)
+            if not verdict.ok:
+                record = AttemptRecord(
+                    label, "ollama", model, OUTCOME_INVALID, 200, verdict.detail,
+                    elapsed, attempt=number, request_id=rid,
+                    validation=verdict.verdict, required_capabilities=required,
+                    fallback_reason=verdict.verdict,
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                self.metrics.record_invalid(verdict.verdict)
+                self._health(model).record_failure(
+                    self.provider_cooldown, verdict.verdict
+                )
+                if emitted:
+                    # The streamed bubble is already on screen; a blocking
+                    # recovery replaces it via the WebSocket `message` frame.
+                    try:
+                        return await self.complete(
+                            messages, tier=tier, max_tokens=max_tokens,
+                            temperature=temperature, tools=tools,
+                            contract=contract, extract=extract, request_id=rid,
+                        )
+                    except LLMError:
+                        return last_partial
+                break
+
+            self._health(model).record_success()
+            self.metrics.record_success(model, elapsed)
+            attempts.append(
+                AttemptRecord(
+                    label, "ollama", model, "ok", 200, latency_ms=elapsed,
+                    attempt=number, request_id=rid, validation=verdict.verdict,
+                    required_capabilities=required,
+                )
+            )
+            return full
+
+        if not reachable and attempts and attempts[0].outcome == "connect_error":
+            raise AllModelsUnavailableError(attempts[0].detail, attempts)
+        raise AllModelsUnavailableError(
+            f"Local model {model!r} failed while streaming "
+            f"({len(attempts)} attempts): {self._summarise(attempts)}",
+            attempts,
+        )
+
     async def complete(
         self,
         messages: List[Dict[str, Any]],
@@ -669,6 +990,11 @@ class LLMClient:
         """
         attempts: List[AttemptRecord] = []
         rid = request_id or uuid.uuid4().hex[:12]
+        if self._using_ollama():
+            return await self._complete_ollama(
+                messages, tier, max_tokens, temperature, tools,
+                retries, contract, extract, rid,
+            )
         required = list(contract.required_capabilities)
         chain = self.build_chain(tier, required)
         budget = _AttemptBudget(self.max_attempts)
@@ -913,6 +1239,11 @@ class LLMClient:
         """
         attempts: List[AttemptRecord] = []
         rid = request_id or uuid.uuid4().hex[:12]
+        if self._using_ollama():
+            return await self._stream_ollama(
+                messages, on_delta, tier, max_tokens, temperature, tools,
+                retries, contract, extract, rid,
+            )
         required = list(contract.required_capabilities)
         chain = self.build_chain(tier, required)
         budget = _AttemptBudget(self.max_attempts)

@@ -96,7 +96,24 @@ def is_allowed_model(model: str) -> bool:
 
 # The single supported provider. Local model execution has been removed.
 PROVIDER_OPENROUTER = "openrouter"
-VALID_PROVIDERS = (PROVIDER_OPENROUTER,)
+PROVIDER_OLLAMA = "ollama"
+VALID_PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_OLLAMA)
+
+
+# ---------------------------------------------------------------------------
+# AI Provider Configuration
+# ---------------------------------------------------------------------------
+# Default to Ollama for local-first operation
+AI_PROVIDER: str = _env_str("AI_PROVIDER", "ollama")
+
+# Ollama configuration
+OLLAMA_BASE_URL: str = _env_str("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_TIMEOUT: float = _env_float("OLLAMA_TIMEOUT", 120.0)
+
+# Ollama model roles (user can override with any valid model tags)
+OLLAMA_GENERAL_MODEL: str = _env_str("OLLAMA_GENERAL_MODEL", "qwen3.5:9b")
+OLLAMA_CODING_MODEL: str = _env_str("OLLAMA_CODING_MODEL", "qwen2.5-coder:7b")
+OLLAMA_FAST_MODEL: str = _env_str("OLLAMA_FAST_MODEL", "qwen2.5-coder:3b")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +169,6 @@ class NoCapableModelError(RuntimeError):
 TIER_FAST = "fast"
 TIER_REASONING = "reasoning"
 TIER_FALLBACK = "fallback"
-VALID_TIERS = (TIER_FAST, TIER_REASONING, TIER_FALLBACK)
 
 
 class Config:
@@ -215,8 +231,15 @@ class Config:
         "OPENROUTER_APP_TITLE", "Zaytoon AI Assistant"
     )
 
-    #: The only provider. Local model execution (Ollama/Llama) has been removed.
-    PROVIDER: str = PROVIDER_OPENROUTER
+    #: Active provider: "ollama" or "openrouter"
+    PROVIDER: str = AI_PROVIDER
+
+    # Ollama settings
+    OLLAMA_BASE_URL: str = OLLAMA_BASE_URL
+    OLLAMA_TIMEOUT: float = OLLAMA_TIMEOUT
+    OLLAMA_GENERAL_MODEL: str = OLLAMA_GENERAL_MODEL
+    OLLAMA_CODING_MODEL: str = OLLAMA_CODING_MODEL
+    OLLAMA_FAST_MODEL: str = OLLAMA_FAST_MODEL
 
     LLM_TIMEOUT: float = _env_float("LLM_TIMEOUT", 120.0)
     #: Per-model transport retries. ``OPENROUTER_MAX_ATTEMPTS`` is the separate,
@@ -257,13 +280,37 @@ class Config:
         """True when we have what we need to call OpenRouter at all."""
         return bool(self.OPENROUTER_API_KEY)
 
+    @property
+    def provider_ready(self) -> bool:
+        """True when the *active* provider can serve requests.
+
+        Ollama needs no credentials — only a reachable endpoint — so this is
+        what ``/health`` should report, while ``llm_configured`` keeps its
+        OpenRouter-specific meaning for the free-model policy checks.
+        """
+        if self.PROVIDER == PROVIDER_OLLAMA:
+            return True
+        return bool(self.OPENROUTER_API_KEY)
+
     def model_for_tier(self, tier: str) -> str:
-        """Resolve the model id for a given capability tier."""
+        """Resolve the OpenRouter model id for a given capability tier."""
         if tier == TIER_REASONING:
             return self.OPENROUTER_REASONING_MODEL
         if tier == TIER_FALLBACK:
             return self.OPENROUTER_FALLBACK_MODEL
         return self.OPENROUTER_PRIMARY_MODEL
+
+    def ollama_model_for_tier(self, tier: str) -> str:
+        """Resolve the local Ollama model for a given capability tier.
+
+        ``reasoning``/``fallback`` both map to the coding model: there is no
+        separate local reasoning model unless the operator configures one.
+        """
+        if tier == TIER_FAST:
+            return self.OLLAMA_FAST_MODEL
+        if tier in (TIER_REASONING, TIER_FALLBACK):
+            return self.OLLAMA_CODING_MODEL
+        return self.OLLAMA_GENERAL_MODEL
 
     @property
     def free_fallback_models(self) -> list[str]:
@@ -340,25 +387,38 @@ class Config:
 
         Never includes the API key, in whole or in part.
         """
-        return {
+        base = {
             "provider": self.PROVIDER,
             "free_only": self.LLM_REQUIRE_FREE_MODELS,
-            "configured": self.llm_configured,
-            "base_url": self.LLM_API_URL,
-            "primary_model": self.OPENROUTER_PRIMARY_MODEL,
-            "reasoning_model": self.OPENROUTER_REASONING_MODEL,
-            "fallback_model": self.OPENROUTER_FALLBACK_MODEL,
-            "fallback_pool": self.free_fallback_models,
-            "max_attempts": self.OPENROUTER_MAX_ATTEMPTS,
-            "allowed_models": sorted(ALLOWED_FREE_MODELS),
-            "rejected_models": self.validate_free_models(),
-            "excluded_by_policy": [FREE_ROUTER_ENDPOINT],
-            "capabilities": {
-                model: spec_for(model).to_dict()
-                for model in sorted(ALLOWED_FREE_MODELS)
-                if spec_for(model)
-            },
+            "configured": self.provider_ready,
         }
+        
+        if self.PROVIDER == PROVIDER_OLLAMA:
+            base.update({
+                "base_url": self.OLLAMA_BASE_URL,
+                "general_model": self.OLLAMA_GENERAL_MODEL,
+                "coding_model": self.OLLAMA_CODING_MODEL,
+                "fast_model": self.OLLAMA_FAST_MODEL,
+                "timeout": self.OLLAMA_TIMEOUT,
+            })
+        else:
+            base.update({
+                "base_url": self.LLM_API_URL,
+                "primary_model": self.OPENROUTER_PRIMARY_MODEL,
+                "reasoning_model": self.OPENROUTER_REASONING_MODEL,
+                "fallback_model": self.OPENROUTER_FALLBACK_MODEL,
+                "fallback_pool": self.free_fallback_models,
+                "max_attempts": self.OPENROUTER_MAX_ATTEMPTS,
+                "allowed_models": sorted(ALLOWED_FREE_MODELS),
+                "rejected_models": self.validate_free_models(),
+                "excluded_by_policy": [FREE_ROUTER_ENDPOINT],
+                "capabilities": {
+                    model: spec_for(model).to_dict()
+                    for model in sorted(ALLOWED_FREE_MODELS)
+                    if spec_for(model)
+                },
+            })
+        return base
 
     # ------------------------------------------------------------------
     # Server / storage

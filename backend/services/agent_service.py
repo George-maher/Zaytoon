@@ -10,6 +10,7 @@ from reminder.service import ReminderService
 from reminder.notification import NotificationManager
 from tools.executor import ToolExecutor
 from tools.safety import RiskAssessor, RiskLevel
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.AgentService")
 
@@ -113,7 +114,10 @@ class AgentService:
         try:
             schedule_data = await self.scheduler_llm.parse_schedule(message, [], language=language)
         except Exception as e:
-            logger.error(f"Scheduler LLM parse error: {e}")
+            safe_error(
+                e, operation="schedule.parse", component="AgentService",
+                detail="falling back to the raw message",
+            )
             schedule_data = {"action": "create", "title": message}
 
         if parsed_time is None and schedule_data.get("datetime"):
@@ -183,7 +187,10 @@ class AgentService:
                 replacement = f"[{action.upper()}: {summary}]"
                 result_text = result_text.replace(raw, replacement, 1)
             except (json.JSONDecodeError, Exception) as e:
-                result_text = result_text.replace(raw, f"[ERROR: {e}]", 1)
+                # Test-only path, but the placeholder is shaped like user-facing
+                # text: report the type, not `str(e)`.
+                kind = type(e).__name__
+                result_text = result_text.replace(raw, f"[ERROR: {kind}]", 1)
         return result_text
 
     async def _is_approved(
@@ -204,7 +211,11 @@ class AgentService:
         try:
             return bool(await manager.request(action, params))
         except Exception as e:
-            logger.error("Confirmation channel failed for %s: %s", action, e)
+            # Fail closed; the detail goes to the log, redacted.
+            safe_error(
+                e, operation="confirmation", component="AgentService",
+                detail=f"for {action}",
+            )
             return False
 
     def _extract_id(self, schedule_data: dict, message: str) -> Optional[int]:

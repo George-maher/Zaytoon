@@ -17,24 +17,108 @@ from __future__ import annotations
 import itertools
 import logging
 import queue
+import threading
 import time
 from enum import Enum
 
 import customtkinter as ctk
 
-from . import protocol, theme
+from . import protocol, states
 from .audio import AudioPlayer, MicrophoneCapture
 from .backend import BackendProcess
 from .client import BackendClient
 from .hotkeys import HotkeyManager, format_hotkey
 from .orb import OrbWindow
 from .panel import ChatPanel
+from .sidepanel import (
+    SystemSampler,
+    fetch_json,
+    format_percent,
+    parse_audit,
+    parse_model,
+    parse_processes,
+    parse_tools,
+)
 from .tray import TrayIcon
 
 logger = logging.getLogger(__name__)
 
 #: How often the UI drains the event queue, in milliseconds.
 TICK_MS = 30
+
+#: How often the worker refreshes the optional REST snapshots, in seconds.
+SNAPSHOT_INTERVAL = 10.0
+
+#: Newest actions kept in the side panel.
+MAX_RECENT_ACTIONS = 8
+
+
+class TelemetryWorker(threading.Thread):
+    """Everything network-y or OS-y that the shell needs to *display*.
+
+    REST calls (``/tools``, ``/health``, ``/audit``, ``/processes``) and the
+    ctypes CPU/RAM sampling all run here, never on the Tk thread, and every
+    result is pushed back through the app's own event queue as a
+    ``("telemetry", {...})`` tuple — the same queue the WebSocket client uses,
+    so there is exactly one path into widget code.
+
+    Missing endpoints are normal: ``fetch_json`` returns ``None``, the parsers
+    return an empty list, and the panel shows ``—`` or hides the card.
+    """
+
+    def __init__(self, base_url: str, events: queue.Queue, *, sampler=None) -> None:
+        super().__init__(name="zaytoon-telemetry", daemon=True)
+        self.base_url = str(base_url).rstrip("/")
+        self.events = events
+        self.sampler = sampler or SystemSampler()
+        self._stop = threading.Event()
+        self._want_snapshot = threading.Event()
+        self._have_model = False
+        self._next_optional = 0.0
+
+    # -- control ----------------------------------------------------------
+    def stop(self) -> None:
+        self._stop.set()
+
+    def request_snapshot(self) -> None:
+        """Ask for the tools/model snapshot (called on connect)."""
+        self._want_snapshot.set()
+
+    # -- loop -------------------------------------------------------------
+    def run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception:  # pragma: no cover - a worker must not die
+                logger.exception("telemetry tick failed")
+            self._stop.wait(0.5)
+
+    def _tick(self) -> None:
+        if self.sampler.due():
+            self._emit({"system": self.sampler.sample()})
+
+        if self._want_snapshot.is_set():
+            tools = fetch_json(f"{self.base_url}/tools")
+            if tools is not None:
+                self._want_snapshot.clear()
+                self._emit({"tools": parse_tools(tools)})
+            health = fetch_json(f"{self.base_url}/health")
+            if health is not None:
+                model = parse_model(health)
+                if model:
+                    self._have_model = True
+                    self._emit({"model": model})
+
+        now = time.monotonic()
+        if now >= self._next_optional:
+            self._next_optional = now + SNAPSHOT_INTERVAL
+            self._emit({
+                "audit": parse_audit(fetch_json(f"{self.base_url}/audit")),
+                "processes": parse_processes(fetch_json(f"{self.base_url}/processes")),
+            })
+
+    def _emit(self, data: dict) -> None:
+        self.events.put(("telemetry", data))
 
 
 class Mode(str, Enum):
@@ -54,6 +138,17 @@ class ZaytoonApp:
         self.language = "en"
         self._ids = itertools.count(1)
         self._status_from_voice: str | None = None
+
+        #: One state machine feeding the header pill, the core and the status
+        #: line (see ``app/states.py``).
+        self.tracker = states.StateTracker()
+        #: The last resolved state, so a caller can read it without re-deriving.
+        self.ui_state = states.UiState.OFFLINE
+        #: Newest-first log of finished tool calls for the side panel.
+        self.recent_actions: list[str] = []
+        self.model_name = ""
+        #: Worker thread: REST snapshots + CPU/RAM sampling (never the Tk thread).
+        self.telemetry = TelemetryWorker(f"http://{config.backend_addr}", self.events)
 
         # customtkinter 6 removed the bundled named colour themes, so only the
         # appearance mode is set; every colour is supplied explicitly in theme.py.
@@ -86,8 +181,13 @@ class ZaytoonApp:
             on_collapse=self.toggle_mode,
             on_confirm=self.respond_to_confirmation,
             on_quit=self.quit,
+            on_settings=self.show_settings,
+            config=config,
         )
         self._position_panel()
+        self._panel_positioned = True
+        self._panel_saved_geometry: str | None = None
+        self._panel_saved_state: str | None = None
         self.panel.withdraw()
         self.panel.protocol("WM_DELETE_WINDOW", self.toggle_mode)
 
@@ -98,6 +198,7 @@ class ZaytoonApp:
         self._register_hotkeys()
         self.start_backend()
         self.client.start()
+        self.telemetry.start()
         self.player = self._open_player()
 
         self.orb.set_status("connected")
@@ -140,6 +241,7 @@ class ZaytoonApp:
         logger.info("shutting down")
         self.hotkeys.unregister_all()
         self.tray.stop()
+        self.telemetry.stop()
         self.orb.stop()
         if self.mic is not None:
             self.mic.stop()
@@ -212,6 +314,15 @@ class ZaytoonApp:
 
     def _enter_orb(self) -> None:
         self.mode = Mode.ORB
+        # Remember how the user left the panel. On Windows ``withdraw`` drops
+        # both the geometry and a maximized state, and the old code re-ran
+        # _position_panel() on every return, so a resized or maximized panel
+        # snapped back to the default box each time it was hidden.
+        try:
+            self._panel_saved_geometry = self.panel.geometry()
+            self._panel_saved_state = self.panel.state()
+        except Exception:  # pragma: no cover - Tk already torn down
+            pass
         self.panel.withdraw()
         self.orb.recenter(self.config.screen_margin)
         self.orb.show()
@@ -219,8 +330,22 @@ class ZaytoonApp:
     def _enter_panel(self) -> None:
         self.mode = Mode.PANEL
         self.orb.hide()
-        self._position_panel()
+        if self._panel_positioned:
+            # Position once, at startup; afterwards restore what the user had.
+            if self._panel_saved_geometry:
+                try:
+                    self.panel.geometry(self._panel_saved_geometry)
+                except Exception:  # pragma: no cover
+                    pass
+        else:
+            self._position_panel()
+            self._panel_positioned = True
         self.panel.deiconify()
+        if self._panel_saved_state == "zoomed":
+            try:
+                self.panel.state("zoomed")
+            except Exception:  # pragma: no cover - WM refused the request
+                pass
         self.panel.lift()
         self.panel.attributes("-topmost", True)
         self.panel.after(200, lambda: self.panel.attributes("-topmost", self.config.always_on_top))
@@ -252,11 +377,24 @@ class ZaytoonApp:
             pass
         finally:
             if not self.shutting_down:
+                self._poll_audio()
                 self._poll_mic()
                 try:
                     self.root.after(TICK_MS, self._pump)
                 except Exception:  # pragma: no cover - Tk shutting down
                     pass
+
+    def _poll_audio(self) -> None:
+        """Track whether TTS is actually leaving the speaker.
+
+        Cheap enough for every tick (a flag read), and it is what makes the
+        ``SPEAKING`` state mean *speaking* rather than *some status frame said
+        so a moment ago*.
+        """
+        playing = self.player is not None and self.player.playing
+        if playing != self.tracker.inputs.speaking:
+            self.tracker.set_speaking(playing)
+            self._refresh_state()
 
     def _handle(self, item) -> None:
         if isinstance(item, tuple):
@@ -282,6 +420,8 @@ class ZaytoonApp:
                 self.client.stop()
                 self.start_backend()
                 self.client.start()
+            elif kind == "telemetry":
+                self._apply_telemetry(value)
             return
 
         if isinstance(item, protocol.ServerEvent):
@@ -289,50 +429,113 @@ class ZaytoonApp:
 
     # -- server events ----------------------------------------------------
     def _handle_event(self, event: protocol.ServerEvent) -> None:
-        if event.type is protocol.EventType.CONNECTED:
-            self._set_status("connected")
+        """Fold one frame into the tracker, the widgets, and back to a state.
+
+        Every path ends in :meth:`_refresh_state`, so the header pill, the core
+        and the status line can never disagree about what just happened — the
+        previous version re-derived each of them independently from a raw
+        status string and they drifted apart.
+        """
+        self.tracker.on_event(event)
+        try:
+            self._route_event(event)
+        finally:
+            self._refresh_state()
+
+    def _route_event(self, event: protocol.ServerEvent) -> None:
+        etype = event.type
+        if etype is protocol.EventType.CONNECTED:
+            self._set_connection(states.CONNECTION_CONNECTED)
             self._set_hint("")
+            # Clear any pending confirmation state on reconnect. The panel and
+            # the tracker must be cleared together: dismissing only the dialog
+            # left the tracker holding the dead request id, so the header still
+            # read "Awaiting confirmation" for a request the backend has
+            # forgotten.
+            if self.panel.awaiting_confirmation:
+                self.panel.dismiss_confirmation()
+            self.tracker.set_confirmation(None)
+            self.telemetry.request_snapshot()
             return
-        if event.type is protocol.EventType.DISCONNECTED:
-            self._set_status("disconnected")
+        if etype is protocol.EventType.DISCONNECTED:
+            self._set_connection(states.CONNECTION_RECONNECTING)
             self._set_hint("Lost the backend; reconnecting…")
             return
-        if event.type is protocol.EventType.STATUS:
-            self._set_status(event.status or "thinking")
+        if etype is protocol.EventType.STATUS:
+            self.status = event.status or "thinking"
             return
-        if event.type is protocol.EventType.INTENT:
+        if etype is protocol.EventType.INTENT:
             self.language = event.data.get("language") or self.language
+            intent = str(event.data.get("intent") or "")
+            self.panel.set_task(intent, self.status)
             return
-        if event.type is protocol.EventType.TOKEN:
-            self._set_status("speaking")
-            self.panel.append_token(event.text)
+        if etype is protocol.EventType.TOKEN:
+            self.panel.append_token(event.text, trace_id=event.trace_id)
+            self.panel.set_typing(True)
             return
-        if event.type is protocol.EventType.SUBTITLE:
+        if etype is protocol.EventType.SUBTITLE:
             self.panel.set_transcript(event.text)
             return
-        if event.type is protocol.EventType.MESSAGE:
-            self.panel.set_transcript(event.text)
+        if etype is protocol.EventType.PLAN:
+            steps = event.plan_steps
+            if steps:
+                self.panel.show_plan(steps)
+            return
+        if etype is protocol.EventType.TOOL_STARTED:
+            name, label = event.tool_name, event.tool_label
+            self.panel.tool_started(name, label)
+            self._note_action(label or name, ok=True, running=True)
+            return
+        if etype is protocol.EventType.TOOL_PROGRESS:
+            self.panel.tool_progress(event.tool_name, event.tool_label)
+            return
+        if etype is protocol.EventType.TOOL_FINISHED:
+            name = event.tool_name
+            ok = bool(event.data.get("success", True))
+            summary = str(event.data.get("summary") or "")
+            self.panel.tool_finished(name, ok, summary)
+            self._note_action(summary or name, ok=ok)
+            return
+        if etype is protocol.EventType.MESSAGE:
+            self._finish_stream(event.text, event.trace_id)
+            return
+        if etype is protocol.EventType.MESSAGE_DONE:
+            # Some turns end with ``message_done`` alone; it carries the same
+            # final content and must not be dropped on the floor.
+            if event.text:
+                self._finish_stream(event.text, event.trace_id)
+            else:
+                self.panel.set_typing(False)
+                self.panel.set_busy(False)
+            return
+        if etype is protocol.EventType.INTERRUPTED:
             self.panel.set_busy(False)
-            self._set_status("listening" if self.mic is not None else "connected")
+            self.panel.set_typing(False)
+            self.panel.activity.reset()
+            self.status = (
+                "listening" if self.mic is not None
+                else ("connected" if self.client.connected else "disconnected")
+            )
             return
-        if event.type is protocol.EventType.STT_RESULT:
+        if etype is protocol.EventType.STT_RESULT:
             detected = event.data.get("language")
             if detected in ("ar", "en"):
                 self.language = detected
             return
-        if event.type is protocol.EventType.AUDIO_START:
+        if etype is protocol.EventType.AUDIO_START:
             return
-        if event.type is protocol.EventType.AUDIO_CHUNK:
+        if etype is protocol.EventType.AUDIO_CHUNK:
             import base64
 
             try:
-                self.player.play(base64.b64decode(event.data.get("data", "")))
+                if self.player is not None:
+                    self.player.play(base64.b64decode(event.data.get("data", "")))
             except Exception as exc:  # pragma: no cover
                 logger.debug("bad audio chunk: %s", exc)
             return
-        if event.type is protocol.EventType.WAKE_WORD:
+        if etype is protocol.EventType.WAKE_WORD:
             if event.data.get("detected"):
-                self._set_status("awaiting_command")
+                self.status = "awaiting_command"
             else:
                 self.panel.add_message(
                     "system",
@@ -340,35 +543,44 @@ class ZaytoonApp:
                     "say “Zaytoon, what time is it?”.",
                 )
             return
-        if event.type is protocol.EventType.REQUIRE_CONFIRMATION:
+        if etype is protocol.EventType.REQUIRE_CONFIRMATION:
             self.panel.show_confirmation(event.data)
-            self._set_status("awaiting_confirmation")
             return
-        if event.type is protocol.EventType.CONFIRMATION_RESULT:
-            if not event.data.get("resolved", True):
-                self.panel.dismiss_confirmation()
+        if etype is protocol.EventType.CONFIRMATION_RESULT:
+            self.panel.resolve_confirmation(bool(event.data.get("resolved", True)))
             return
-        if event.type is protocol.EventType.ERROR:
+        if etype is protocol.EventType.ERROR:
             self.panel.add_message("error", event.text or "The assistant could not answer.")
             self.panel.set_busy(False)
-            self._set_status("error")
+            self.panel.set_typing(False)
+            self.panel.activity.reset()
             return
-        if event.type is protocol.EventType.REMINDER:
+        if etype is protocol.EventType.REMINDER:
             message = event.data.get("message", "Reminder")
             self.panel.add_message("system", f"⏰ {message}")
             if self.tray.available:
                 self.tray.notify("Zaytoon Reminder", message)
             return
-        if event.type is protocol.EventType.REMINDER_LIST:
+        if etype is protocol.EventType.REMINDER_LIST:
             reminders = event.data.get("reminders", [])
             self.panel.show_reminders(reminders)
             return
-        if event.type is protocol.EventType.REMINDER_DELETED:
+        if etype is protocol.EventType.REMINDER_DELETED:
             self._resolve_reminder(event, "deleted")
             return
-        if event.type is protocol.EventType.REMINDER_DONE:
+        if etype is protocol.EventType.REMINDER_DONE:
             self._resolve_reminder(event, "completed")
             return
+
+    def _finish_stream(self, text: str, trace_id=None) -> None:
+        self.panel.set_transcript(text, trace_id=trace_id)
+        # Explicit rather than relying on set_transcript to do it: the typing
+        # dots belong to the turn, and the turn is over here.
+        self.panel.set_typing(False)
+        self.panel.set_busy(False)
+        self.status = "listening" if self.mic is not None else (
+            "connected" if self.client.connected else "disconnected"
+        )
 
     def _resolve_reminder(self, event, verb: str) -> None:
         """Drop a reminder from the panel, but only if the backend did it.
@@ -387,15 +599,83 @@ class ZaytoonApp:
         self.panel.remove_reminder(reminder_id)
 
     def _set_status(self, status: str) -> None:
+        """Record a raw HUD status and push the derived state to both views."""
         self.status = status
-        self.orb.set_status(status)
-        self.panel.set_status(status, self.language)
+        self.tracker.set_status(status)
+        self._refresh_state()
+
+    def _set_connection(self, value: str) -> None:
+        """Transport-level connection: feeds the tracker and the header pill."""
+        self.tracker.set_connection(value)
+        try:
+            self.panel.set_connection(value)
+        except Exception:  # pragma: no cover - panel half-built
+            pass
+
+    def _refresh_state(self) -> None:
+        """One resolution, three consumers — they cannot drift apart."""
+        state, text = self.tracker.resolve(self.language)
+        self.ui_state = state
+        try:
+            self.orb.set_status(state)
+        except Exception:  # pragma: no cover - orb destroyed mid-quit
+            pass
+        try:
+            self.panel.set_ui_state(
+                state, self.language, self.tracker.inputs.tool, text=text
+            )
+        except Exception:  # pragma: no cover
+            pass
+        self.status = states.orb_status(state)
 
     def _set_hint(self, text: str) -> None:
         try:
             self.panel.set_hint(text)
         except Exception:  # pragma: no cover
             pass
+
+    # -- telemetry ---------------------------------------------------------
+    def _apply_telemetry(self, data: dict) -> None:
+        """Fold a worker snapshot into the side panel. Missing keys are normal."""
+        if not isinstance(data, dict):
+            return
+        system = data.get("system")
+        if isinstance(system, dict):
+            cpu, ram = system.get("cpu"), system.get("ram")
+            self.panel.set_system(
+                format_percent(cpu) if isinstance(cpu, (int, float)) else "—",
+                format_percent(ram) if isinstance(ram, (int, float)) else "—",
+            )
+        if "tools" in data:
+            names = data.get("tools") or []
+            if names:
+                self.panel.set_tools([str(n) for n in names])
+        if data.get("model"):
+            self.model_name = str(data["model"])
+            self.panel.set_model(self.model_name)
+        if "audit" in data:
+            items = data.get("audit") or []
+            if items:
+                self._replace_actions([str(a) for a in items])
+        if "processes" in data:
+            items = data.get("processes") or []
+            if items:
+                self.panel.set_processes([str(p) for p in items])
+
+    def _note_action(self, text: str, *, ok: bool = True, running: bool = False) -> None:
+        """Push one finished (or running) tool row onto the recent-actions log."""
+        if not text:
+            return
+        mark = "…" if running else ("✓" if ok else "✕")
+        self.recent_actions = ([f"{mark} {text}"] + self.recent_actions)[:MAX_RECENT_ACTIONS]
+        self.panel.set_actions(self.recent_actions)
+
+    def _replace_actions(self, items: list[str]) -> None:
+        self.recent_actions = [str(i) for i in items][:MAX_RECENT_ACTIONS]
+        self.panel.set_actions(self.recent_actions)
+
+    def show_settings(self) -> None:
+        self.panel.open_settings()
 
     # -- actions ----------------------------------------------------------
     def send_text(self, text: str) -> None:
@@ -408,6 +688,8 @@ class ZaytoonApp:
             return
         self.panel.add_message("user", text)
         self.panel.set_busy(True)
+        self.tracker.reset_turn()
+        self.panel.activity.reset()
         self._set_status("thinking")
 
     def interrupt(self) -> None:
@@ -418,11 +700,14 @@ class ZaytoonApp:
             self.mic.discard()
         self.panel.set_transcript("")
         self.panel.set_busy(False)
+        self.panel.activity.reset()
+        self.tracker.reset_turn()
         self._set_status("listening" if self.mic is not None else "connected")
 
     def respond_to_confirmation(self, request_id: str, approved: bool) -> None:
+        """One decision per request: the dialog is already gone when we get here."""
         self.client.respond_to_confirmation(request_id, approved)
-        self.panel.set_status("thinking", self.language)
+        self.tracker.set_confirmation(None)
         self._set_status("thinking")
 
     def toggle_mic(self) -> None:
@@ -430,6 +715,7 @@ class ZaytoonApp:
             self.mic.stop()
             self.mic = None
             self.panel.set_mic(False)
+            self.tracker.set_mic(False)
             self._set_status("connected" if self.client.connected else "disconnected")
             self._set_hint("")
             return
@@ -448,6 +734,7 @@ class ZaytoonApp:
             return
         self.mic = mic
         self.panel.set_mic(True)
+        self.tracker.set_mic(True)
         self._set_status("listening")
         self._set_hint("Listening — tap ■ to stop the assistant talking")
 
@@ -461,3 +748,10 @@ class ZaytoonApp:
             self.panel.set_busy(True)
             self._set_status("thinking")
         self.orb.set_level(self.mic.level)
+        # The core reacts to level only while it is actually animating; when the
+        # state is static it drew once and scheduled nothing, so this is a
+        # property write, never a wake-up.
+        try:
+            self.panel.core.set_level(self.mic.level)
+        except Exception:  # pragma: no cover - panel half-built
+            pass

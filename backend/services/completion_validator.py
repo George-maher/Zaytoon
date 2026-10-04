@@ -44,10 +44,9 @@ Two things make it stronger than it sounds:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional
 
 from services.model_registry import CAP_TOOLS
 
@@ -132,6 +131,18 @@ class CompletionContract:
     tools: Mapping[str, ToolShape] = field(default_factory=dict)
     #: Human-readable note, used in logs. Never includes user content.
     label: str = ""
+    #: Let a call naming a tool that does not exist pass validation, so the
+    #: *registry* refuses it with a message the model can correct itself from.
+    #:
+    #: Off by default. The reasoning behind the flag: a wrong tool name is a
+    #: recoverable mistake, and the agent loop is built to feed failures back to
+    #: the model — but a fatal validator verdict happens one layer too early. It
+    #: spends the attempt budget on a slip the loop would have fixed on its next
+    #: iteration, and ends the turn with "all models are unavailable", which
+    #: describes the provider and not what happened. The engine still cannot run
+    #: the call: `ToolRegistry.execute` refuses an unknown tool by name, so this
+    #: trades a dead turn for a corrected one without loosening what can execute.
+    allow_unknown_tools: bool = False
 
     @property
     def required_capabilities(self) -> FrozenSet[str]:
@@ -142,6 +153,7 @@ class CompletionContract:
             "require_tool": self.require_tool,
             "allow_prose": self.allow_prose,
             "known_tools": sorted(self.tools),
+            "allow_unknown_tools": self.allow_unknown_tools,
             "label": self.label,
         }
 
@@ -155,15 +167,45 @@ STREAM_CONTRACT = CompletionContract(allow_prose=True, label="stream")
 
 
 def contract_from_registry(registry: Any, **kwargs) -> CompletionContract:
-    """Build a contract that knows the registry's real tools and schemas."""
+    """Build a contract that knows the registry's real tools and schemas.
+
+    **Aliases are registered too, not just primary names.** The registry already
+    resolves them — ``file_list`` reaches ``file_read`` through
+    ``BaseTool.aliases`` — so a contract built from primary names alone would
+    reject a call the executor would happily run. That is not a theoretical
+    gap: the aliases include names a model reaches for constantly
+    (``list_directory``, ``read_file``), and one live turn was rejected as
+    ``INVALID_TOOL_UNKNOWN`` for calling ``file_list`` while the registry sat
+    there able to serve it.
+
+    The alias maps to the same shape as its primary, so the schema check the
+    model has to satisfy is the one the tool really enforces.
+    """
     tools: Dict[str, ToolShape] = {}
     try:
         for tool in registry.tools():
             shape = ToolShape.from_tool(tool)
             tools[shape.name] = shape
+            for alias in _aliases_of(tool):
+                # A primary name always wins over another tool's alias.
+                tools.setdefault(alias, shape)
     except Exception:
         pass
     return CompletionContract(tools=tools, **kwargs)
+
+
+def _aliases_of(tool: Any) -> List[str]:
+    """The aliases a tool declares, as a plain list of non-empty strings."""
+    getter = getattr(tool, "aliases", None)
+    if getter is None:
+        return []
+    try:
+        aliases = getter() if callable(getter) else getter
+    except Exception:
+        return []
+    if not isinstance(aliases, (list, tuple, set)):
+        return []
+    return [a for a in aliases if isinstance(a, str) and a.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +357,16 @@ class CompletionValidator:
                     False, Verdict.MALFORMED, f"tool-call parser raised: {e}"
                 )
 
-        # A tool call was attempted. It must be a real one.
+        # A tool call was attempted. It must be a real one — unless the caller
+        # opted in to a correction round, in which case the name is passed
+        # through for the registry to refuse with a message the model learns
+        # from. See `CompletionContract.allow_unknown_tools`.
         if calls:
             for call in calls:
                 name = getattr(call, "name", "")
                 if name not in contract.tools:
+                    if contract.allow_unknown_tools:
+                        continue
                     return ValidationResult(
                         False,
                         Verdict.UNKNOWN_TOOL,
@@ -328,6 +375,8 @@ class CompletionValidator:
                     )
                 problem = _check_args(call, contract.tools.get(name))
                 if problem:
+                    if contract.allow_unknown_tools:
+                        continue
                     return ValidationResult(
                         False,
                         Verdict.BAD_ARGS,

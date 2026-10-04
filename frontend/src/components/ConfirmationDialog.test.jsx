@@ -82,24 +82,51 @@ describe('ConfirmationDialog', () => {
     expect(screen.getByText('DANGEROUS')).toBeInTheDocument()
   })
 
-  it('defaults to the confirmation tier when the backend omits it', () => {
+  it('grades the risk from the level when the backend omits the tier', () => {
+    // An unrecognised/absent tier must never downgrade an explicit HIGH level
+    // to "just confirm" — the badge follows the stricter of the two signals.
     const { permission, ...withoutTier } = request
     render(<ConfirmationDialog request={withoutTier} onRespond={vi.fn()} />)
+    expect(screen.getByText('DANGEROUS')).toBeInTheDocument()
+  })
+
+  it('defaults to the confirmation tier when neither field grades higher', () => {
+    const { permission, level, ...bare } = request
+    render(<ConfirmationDialog request={bare} onRespond={vi.fn()} />)
     expect(screen.getByText('CONFIRMATION REQUIRED')).toBeInTheDocument()
   })
 
-  it('responds true on approve', () => {
-    const onRespond = vi.fn()
-    render(<ConfirmationDialog request={request} onRespond={onRespond} />)
-    fireEvent.click(screen.getByText('APPROVE'))
-    expect(onRespond).toHaveBeenCalledWith(true)
+  it('boxes the local-execution header', () => {
+    // A system prompt must be recognisable as Zaytoon's own gate, not as
+    // page content.
+    render(<ConfirmationDialog request={request} onRespond={vi.fn()} />)
+    expect(screen.getByText('ZAYTOON LOCAL EXECUTION')).toBeInTheDocument()
   })
 
-  it('responds false on deny', () => {
+  it('shows the working directory on its own row, left-to-right', () => {
+    render(
+      <ConfirmationDialog
+        request={{
+          ...request,
+          params: { ...request.params, working_directory: 'C:\\work\\demo' },
+        }}
+        onRespond={vi.fn()}
+      />,
+    )
+    expect(screen.getByText('Directory:')).toBeInTheDocument()
+    const path = screen.getByText('C:\\work\\demo')
+    expect(path).toHaveAttribute('dir', 'ltr')
+    // ...and it is not left buried only inside the parameter dump.
+    expect(document.querySelector('pre').textContent).not.toContain('working_directory')
+  })
+
+  it('responds true on allow and false on cancel', () => {
     const onRespond = vi.fn()
     render(<ConfirmationDialog request={request} onRespond={onRespond} />)
-    fireEvent.click(screen.getByText('DENY'))
-    expect(onRespond).toHaveBeenCalledWith(false)
+    fireEvent.click(screen.getByText('ALLOW'))
+    expect(onRespond).toHaveBeenCalledWith(true)
+    fireEvent.click(screen.getByText('CANCEL'))
+    expect(onRespond).toHaveBeenLastCalledWith(false)
   })
 
   it('approves on Enter and denies on Escape', () => {
@@ -124,7 +151,7 @@ describe('ConfirmationDialog', () => {
     )
     expect(screen.getByText('تأكيد مطلوب')).toBeInTheDocument()
     expect(screen.getByText('موافق')).toBeInTheDocument()
-    expect(screen.getByText('رفض')).toBeInTheDocument()
+    expect(screen.getByText('إلغاء')).toBeInTheDocument()
   })
 
   it('keeps the command block left-to-right even in Arabic', () => {

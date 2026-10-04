@@ -5,15 +5,21 @@ function isArabic(text) {
 }
 
 /**
- * A transcript entry, framed as a system transmission rather than a chat
- * bubble.
+ * A transcript entry: a framed transmission, not a rounded chat bubble.
  *
- * Each message carries a 2px accent spine on the side it is anchored to, a
- * monospace source label, and — once a real timestamp exists — a time field.
- * There is no per-message timestamp fabrication: `msg.ts` is only rendered
- * when the backend actually supplied one, because inventing "14:32" on a
- * message that has no clock reading is exactly the sort of invented
- * telemetry this design brief forbids.
+ * - **Side** carries the speaker: the user's message is anchored to the
+ *   composer side, the assistant's to the rail side, each with a 2px accent
+ *   spine that flips with the document in RTL.
+ * - **Timestamp** is `msg.ts` — a receipt stamp taken by the client when the
+ *   message was created or received (see `clockTime` in useWebSocket), or a
+ *   server-supplied one if the backend ever sends it. It is never invented
+ *   for content that has none: the field renders only when present.
+ * - **Streaming** shows a live cursor and a STREAM marker, and gets one
+ *   entrance animation on mount (`hud-msg-enter`) — no per-token animation,
+ *   so a long reply does not flicker as it grows.
+ * - **System notices** (errors, reminders, confirmations) are centred,
+ *   monospace and non-destructive: an error is a strip with a red spine and
+ *   `role="alert"`, not a modal or a red panel that hides the transcript.
  */
 export default memo(function ChatMessage({ msg, language }) {
   const isUser = msg.role === "user";
@@ -22,19 +28,26 @@ export default memo(function ChatMessage({ msg, language }) {
 
   if (isSystem) {
     return (
-      <div className="animate-fade-in flex justify-center">
+      <div className="hud-msg-enter flex justify-center">
         <div
-          className="max-w-[90%] px-3 py-1"
           style={{
-            background: "rgba(6, 17, 26, 0.6)",
-            border: "1px solid var(--hud-edge-faint)",
+            maxWidth: "90%",
+            padding: "var(--space-2) var(--space-4)",
+            background: isError
+              ? "color-mix(in srgb, var(--hud-red) 6%, var(--surface-1))"
+              : "var(--surface-1)",
+            border: "var(--border-w) solid var(--hud-edge-faint)",
             borderInlineStart: `2px solid ${isError ? "var(--hud-red)" : "var(--hud-text-mute)"}`,
           }}
-          role={isError ? "alert" : undefined}
+          role={isError ? "alert" : "note"}
         >
           <p
             className="font-mono"
-            style={{ color: isError ? "var(--hud-red)" : "var(--hud-text-dim)", fontSize: 10, lineHeight: 1.6 }}
+            style={{
+              color: isError ? "var(--hud-red)" : "var(--hud-text-dim)",
+              fontSize: "var(--font-sm)",
+              lineHeight: 1.55,
+            }}
           >
             {msg.content}
           </p>
@@ -45,33 +58,37 @@ export default memo(function ChatMessage({ msg, language }) {
 
   return (
     <div
-      className="animate-fade-in flex"
+      className="hud-msg-enter flex"
       style={{ justifyContent: isUser ? "flex-end" : "flex-start" }}
     >
       <div
-        className="max-w-[85%] px-3 py-2"
-        dir={isArabic(msg.content) ? "rtl" : "ltr"}
         style={{
-          background: isUser ? "rgba(0, 229, 255, 0.045)" : "rgba(3, 7, 13, 0.62)",
-          border: "1px solid var(--hud-edge-faint)",
+          maxWidth: "85%",
+          padding: "var(--space-3) var(--space-4)",
+          background: isUser
+            ? "color-mix(in srgb, var(--hud-cyan) 5%, transparent)"
+            : "var(--surface-1)",
+          border: "var(--border-w) solid var(--hud-edge-faint)",
           // Spine on the anchored side; in RTL that flips with the document.
           borderInlineStart: `2px solid ${isUser ? "var(--hud-cyan)" : "var(--hud-blue)"}`,
           borderInlineEnd: isUser ? "none" : undefined,
           borderInlineStartWidth: 2,
-          boxShadow: msg.streaming ? "0 0 18px rgba(0, 229, 255, 0.06)" : "none",
+          boxShadow: msg.streaming ? "0 0 14px color-mix(in srgb, var(--hud-cyan) 5%, transparent)" : "none",
         }}
+        dir={isArabic(msg.content) ? "rtl" : "ltr"}
       >
         <p
-          className="whitespace-pre-wrap leading-relaxed"
+          className="whitespace-pre-wrap"
           style={{
-            color: isUser ? "var(--hud-text)" : "var(--hud-text)",
+            color: "var(--hud-text)",
             fontFamily: "var(--font-body)",
-            fontSize: 13,
+            fontSize: "var(--font-lg)",
+            lineHeight: 1.55,
           }}
         >
           {msg.content}
           {msg.streaming && (
-            <span className="inline-flex gap-[2px] ml-1.5 align-middle" aria-hidden="true">
+            <span className="inline-flex ml-1 align-middle" style={{ gap: "2px" }} aria-hidden="true">
               {[0, 1, 2].map((i) => (
                 <span
                   key={i}
@@ -82,13 +99,13 @@ export default memo(function ChatMessage({ msg, language }) {
             </span>
           )}
         </p>
-        <div className="flex items-center gap-2 mt-1.5">
+        <div className="flex items-center" style={{ gap: "var(--space-3)", marginTop: "var(--space-2)" }}>
           <span
             className="font-mono"
             style={{
               color: isUser ? "var(--hud-cyan)" : "var(--hud-blue)",
-              fontSize: 8,
-              letterSpacing: "0.18em",
+              fontSize: "var(--font-xs)",
+              letterSpacing: "0.16em",
             }}
           >
             {isUser ? (language === "ar" ? "أنت" : "YOU") : "ZAYTOON"}
@@ -96,13 +113,16 @@ export default memo(function ChatMessage({ msg, language }) {
           {msg.streaming && (
             <span
               className="font-mono"
-              style={{ color: "var(--hud-text-mute)", fontSize: 7, letterSpacing: "0.18em" }}
+              style={{ color: "var(--hud-text-mute)", fontSize: "var(--font-xs)", letterSpacing: "0.16em" }}
             >
               ▍STREAM
             </span>
           )}
           {msg.ts ? (
-            <span className="font-mono ml-auto" style={{ color: "var(--hud-text-mute)", fontSize: 8 }}>
+            <span
+              className="font-mono ml-auto"
+              style={{ color: "var(--hud-text-faint, var(--hud-text-mute))", fontSize: "var(--font-xs)" }}
+            >
               {msg.ts}
             </span>
           ) : null}

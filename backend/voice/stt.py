@@ -3,11 +3,11 @@ import re
 import logging
 import tempfile
 import threading
-import platform
 from dataclasses import dataclass
 from typing import Optional
 
 from voice import routing
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.Voice.STT")
 
@@ -104,8 +104,12 @@ class SpeechToText:
                 self._loading = False
                 return False
             except Exception as e:
-                msg = f"Failed to load Whisper model '{self.model_name}': {e}"
-                logger.error(msg)
+                # `_load_error` is surfaced by `GET /health`, so it goes
+                # through the reporting layer rather than carrying `str(e)`.
+                msg = safe_error(
+                    e, operation="whisper.load", component="voice.stt",
+                    detail=f"model '{self.model_name}'",
+                )
                 self._load_error = msg
                 self._model = None
                 self._loading = False
@@ -197,7 +201,7 @@ class SpeechToText:
             )
 
         except Exception as e:
-            logger.error(f"STT transcription error: {e}")
+            safe_error(e, operation="transcribe", component="voice.stt")
             return TranscriptionResult(
                 "", hint or routing.DEFAULT_LANGUAGE, False
             )

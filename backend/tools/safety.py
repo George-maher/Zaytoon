@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from config import config
+from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.ToolSafety")
 
@@ -123,6 +124,8 @@ _COMPILED_PROTECTED = [re.compile(p, re.IGNORECASE) for p in PROTECTED_PATH_PATT
 READ_ONLY_ACTIONS = {
     "get_time", "system_info", "search_web", "calculator", "file_read",
     "file_list", "get_volume", "screenshot", "list_reminders",
+    # tools/processes.py: inspecting processes Zaytoon started changes nothing.
+    "process_list", "process_logs",
 }
 
 # --------------------------------------------------------------------------
@@ -166,6 +169,14 @@ CONFIRMATION_REQUIRED_ACTIONS = frozenset({
     # dangerous one. The pattern rules still run and still add their reasons on
     # top; this only guarantees a prompt is always shown.
     "system_command", "cmd", "run_shell", "exec", "run_command",
+    # the structured counterpart of `system_command` (tools/local_exec.py):
+    # same sandbox, same gate, so it sits in the same tier. Its aliases are
+    # listed too because `permission_for()` can be handed an alias directly.
+    "execute_local_command", "run_local_command", "exec_local",
+    # background processes (tools/processes.py): starting one runs an arbitrary
+    # command, stopping one kills something the user can see running. Listing and
+    # reading logs stay safe (see READ_ONLY_ACTIONS).
+    "process_start", "process_stop",
     # build/test/lint wrappers, which are arbitrary execution by another name
     "run_npm_script", "run_tests", "run_build", "run_linter",
     # input injection can trigger arbitrary application behaviour
@@ -199,6 +210,41 @@ DANGEROUS_ACTIONS = frozenset({
     "file_delete", "delete_file", "file_remove", "delete_folder", "rmdir",
     "registry_write", "reg_delete", "run_as_admin", "format_disk",
     "run_code",
+    # structured code execution (tools/local_exec.py): identical policy to
+    # `run_code`, and its aliases are listed because `permission_for()` can be
+    # handed an alias directly.
+    "execute_code", "exec_code", "run_snippet",
+})
+
+#: Actions whose parameters contain a single command string judged against
+#: :data:`HIGH_RISK_COMMAND_PATTERNS`. Named once so the tier tables and the
+#: ``assess`` branch cannot drift apart.
+COMMAND_ACTIONS = frozenset({
+    "system_command", "cmd", "run_shell", "exec",
+    "execute_local_command", "run_local_command", "exec_local",
+    # a background process is still an arbitrary command, so its command line
+    # gets the same pattern inspection
+    "process_start",
+})
+
+#: The structured-execution members of :data:`COMMAND_ACTIONS`. These escalate
+#: to DANGEROUS when a pattern matches; ``system_command`` deliberately does
+#: **not**, because its behaviour is pinned by
+#: ``test_pattern_rules_still_layer_on_top`` — the tier of an action is a
+#: property of what it does, and `rm -rf /` arriving through the ordinary
+#: command tool must still be reported as the CONFIRM action it is. The
+#: structured tool advertises its exit code and streams as machine-readable
+#: output, i.e. it is the one built for unattended, repeated use, so a command
+#: that matched a hazard there is labelled for what it is.
+STRUCTURED_EXEC_ACTIONS = frozenset({
+    "execute_local_command", "run_local_command", "exec_local",
+    "process_start",
+})
+
+#: Actions whose parameters contain source code judged against both pattern
+#: tables and the shell-language rule.
+CODE_ACTIONS = frozenset({
+    "run_code", "execute_code", "exec_code", "run_snippet",
 })
 
 
@@ -340,7 +386,7 @@ class RiskAssessor:
                 action, permission, reasons, f"Read-only action: {action}"
             )
 
-        if action_l in ("system_command", "cmd", "run_shell", "exec"):
+        if action_l in COMMAND_ACTIONS:
             command = self._as_text(
                 params.get("command") or params.get("cmd") or params.get("args")
             )
@@ -348,8 +394,13 @@ class RiskAssessor:
                 return self._finalise(action, permission, [], "Empty command")
             reasons.extend(self._command_reasons(command))
             summary = f"Run command: {command.strip()[:200]}"
+            if action_l in STRUCTURED_EXEC_ACTIONS and reasons:
+                # Pattern rules escalate *this* action to DANGEROUS. The gate
+                # fires either way; the label the dialog shows must not claim
+                # "confirm" for a command that matched a hazard.
+                permission = PERMISSION_DANGEROUS
 
-        elif action_l == "run_code":
+        elif action_l in CODE_ACTIONS:
             code = self._as_text(params.get("code"))
             language = self._as_text(params.get("language")).lower()
             if not code.strip():
@@ -547,7 +598,12 @@ class ConfirmationManager:
         except Exception as e:
             self._pending.pop(pending.request_id, None)
             self._last_outcome = self.OUTCOME_ERROR
-            logger.error("Failed to send confirmation request: %s", e)
+            # The failed frame carries the *parameters* being confirmed, so
+            # this is reported through the redacting logger, never `str(e)`.
+            safe_error(
+                e, operation="confirmation.notify", component="ConfirmationManager",
+                detail=f"action={action}",
+            )
             return False
 
         try:

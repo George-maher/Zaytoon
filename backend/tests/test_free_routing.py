@@ -25,7 +25,6 @@ The cases below map onto the required behaviours:
 ===  =========================================================================
 """
 
-import asyncio
 import json
 import time
 
@@ -59,6 +58,7 @@ from services.model_registry import (
     select_models,
 )
 from tools.registry import build_default_registry
+from agents.engine import extract_tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -727,3 +727,84 @@ class TestCompletionValidator:
         assert CompletionContract(require_tool=True).required_capabilities == {
             CAP_TOOLS
         }
+
+
+class TestAliasNamesAreAcceptedByTheContract:
+    """A regression test for a live failure.
+
+    ``file_read`` declares the aliases ``file_list``, ``list_files`` and
+    ``list_directory``, and the registry resolves all of them. A contract built
+    from primary names only rejected those calls as ``INVALID_TOOL_UNKNOWN``,
+    so a model that reached for the obvious name was benned for using a name the
+    executor would have served. The contract has to accept every name the
+    registry accepts.
+    """
+
+    def test_an_alias_is_a_known_tool(self):
+        registry = build_default_registry()
+        contract = contract_from_registry(registry, allow_prose=True)
+        for alias in ("file_list", "list_directory", "read_file", "list_files"):
+            if registry.get(alias) is None:
+                continue  # not an alias in this tree; nothing to assert
+            assert alias in contract.tools, alias
+
+    def test_an_alias_validates_against_the_real_schema(self):
+        registry = build_default_registry()
+        contract = contract_from_registry(registry, allow_prose=True)
+        text = '{"action": "file_list", "params": {"path": "backend"}}'
+        calls, _ = extract_tool_calls(text)
+        result = validate_completion(text, contract, extract=extract_tool_calls)
+        assert result.ok, (result.verdict, result.detail)
+        assert calls[0].name == "file_list"
+
+    def test_a_genuinely_unknown_name_is_still_rejected(self):
+        """The alias fix must not blunt the check it was loosening."""
+        registry = build_default_registry()
+        contract = contract_from_registry(registry, allow_prose=True)
+        text = '{"action": "totally_made_up_tool", "params": {}}'
+        result = validate_completion(text, contract, extract=extract_tool_calls)
+        assert not result.ok
+        assert result.verdict == Verdict.UNKNOWN_TOOL
+
+    def test_a_primary_name_still_wins_over_another_tools_alias(self):
+        registry = build_default_registry()
+        contract = contract_from_registry(registry, allow_prose=True)
+        # `file_read` is a primary name, and it is also listed as an alias of
+        # other tools. Its own schema must be the one the contract enforces.
+        assert contract.tools["file_read"].name == "file_read"
+
+
+class TestUnknownToolIsRecoverableInTheLoop:
+    """A wrong tool name must cost one iteration, not the whole turn.
+
+    Found live: a 3B model invented `file_list`, the validator called the
+    completion invalid, the attempt budget was spent, and the user was told all
+    models were unavailable — a message that describes the provider rather than
+    the mistake. The registry refuses unknown tools by name anyway, so the loop
+    can correct it.
+    """
+
+    def test_the_strict_default_still_rejects(self):
+        """Other callers keep the strict contract; only the engine opts in."""
+        registry = build_default_registry()
+        strict = contract_from_registry(registry, allow_prose=True)
+        text = '{"action": "no_such_tool", "params": {}}'
+        result = validate_completion(text, strict, extract=extract_tool_calls)
+        assert not result.ok
+        assert result.verdict == Verdict.UNKNOWN_TOOL
+
+    def test_the_engine_contract_lets_it_through_for_the_registry_to_refuse(self):
+        engine_contract = contract_from_registry(
+            build_default_registry(), allow_prose=True, allow_unknown_tools=True
+        )
+        text = '{"action": "no_such_tool", "params": {}}'
+        result = validate_completion(text, engine_contract, extract=extract_tool_calls)
+        assert result.ok, (result.verdict, result.detail)
+
+    async def test_the_registry_is_still_what_refuses_the_call(self):
+        """The relaxation moves the refusal, it does not remove it."""
+        from tools.registry import build_default_registry as _build
+
+        result = await _build().execute("no_such_tool", {})
+        assert not result["success"]
+        assert "Unknown tool" in result["error"]

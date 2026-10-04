@@ -16,7 +16,7 @@ const ICONS = [
   {
     id: "lang",
     label: "LANG",
-    icon: <span className="text-[9px] font-display font-bold tracking-wider">AR/EN</span>,
+    icon: <span className="font-display font-bold tracking-wider" style={{ fontSize: "var(--font-sm)" }}>AR/EN</span>,
   },
   {
     id: "settings",
@@ -72,15 +72,18 @@ function BottomDock({
     [onMicToggle, onLanguageToggle, onSettingsToggle, onStop],
   );
 
+  // Palette tokens, not literals: the dock's active state is the same
+  // cyan/green/red the rest of the instrument uses, and the alpha suffixes
+  // become `color-mix` — `${hex}14` cannot be appended to a `var()`.
   const getActiveColor = (id) => {
-    if (id === "mic" && voiceMode) return "#00ff9c";
-    if (id === "settings" && settingsOpen) return "#00ff9c";
-    if (id === "stop" && status === "speaking") return "#ff3b5c";
-    return "#00e5ff";
+    if (id === "mic" && voiceMode) return "var(--hud-green)";
+    if (id === "settings" && settingsOpen) return "var(--hud-green)";
+    if (id === "stop" && status === "speaking") return "var(--hud-red)";
+    return "var(--hud-cyan)";
   };
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center" style={{ gap: "var(--space-1)" }}>
       {ICONS.filter((icon) => !(hideMic && icon.id === "mic")).map((icon) => {
         const color = getActiveColor(icon.id);
         const isActive =
@@ -95,17 +98,21 @@ function BottomDock({
             aria-pressed={isActive}
             /* Square, hairline-framed system controls. No radius on purpose:
                rounded pills read as a consumer app, not as instrumentation. */
-            className="relative w-9 h-9 flex items-center justify-center transition-all duration-200"
+            className="relative flex items-center justify-center transition-all duration-200"
             style={{
-              background: isActive ? `${color}14` : "rgba(6, 17, 26, 0.72)",
-              border: `1px solid ${isActive ? `${color}55` : "var(--hud-edge)"}`,
+              width: "var(--ctl-size)",
+              height: "var(--ctl-size)",
+              background: isActive
+                ? `color-mix(in srgb, ${color} 6%, transparent)`
+                : "color-mix(in srgb, var(--bg1) 72%, transparent)",
+              border: `var(--border-w) solid ${isActive ? `color-mix(in srgb, ${color} 33%, transparent)` : "var(--hud-edge)"}`,
               color: isActive ? color : "var(--hud-text-mute)",
-              boxShadow: isActive ? `0 0 12px ${color}22` : "none",
+              boxShadow: isActive ? `0 0 10px color-mix(in srgb, ${color} 13%, transparent)` : "none",
             }}
             title={icon.label}
           >
             {icon.id === "lang" ? (
-              <span className="text-[9px] font-display font-bold tracking-wider">
+              <span className="font-display font-bold tracking-wider" style={{ fontSize: "var(--font-sm)" }}>
                 {language === "ar" ? "EN" : "AR"}
               </span>
             ) : (

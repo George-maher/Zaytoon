@@ -19,21 +19,28 @@ from services.model_registry import MODEL_REGISTRY
 
 
 class TestProviderIsOpenRouterOnly:
-    def test_provider_constant(self):
-        assert config.PROVIDER == PROVIDER_OPENROUTER
+    def test_provider_default_is_ollama_with_openrouter_available(self):
+        """Ollama is the default provider; OpenRouter remains selectable."""
+        from config import PROVIDER_OLLAMA, VALID_PROVIDERS
 
-    def test_local_model_config_is_gone(self):
-        """Ollama configuration must not exist any more."""
+        assert PROVIDER_OLLAMA == "ollama"
+        assert PROVIDER_OPENROUTER in VALID_PROVIDERS
+        assert PROVIDER_OLLAMA in VALID_PROVIDERS
+        # The default is env-driven and local-first.
+        import os
+
+        assert Config.PROVIDER == os.getenv("AI_PROVIDER", "ollama")
+
+    def test_local_model_config_is_present_again(self):
+        """The Ollama configuration is env-driven and must exist."""
         for attr in (
-            "OLLAMA_BASE_URL", "OLLAMA_MODEL", "OLLAMA_FALLBACK_MODEL",
-            "PRIMARY_PROVIDER",
+            "OLLAMA_BASE_URL", "OLLAMA_GENERAL_MODEL", "OLLAMA_CODING_MODEL",
+            "OLLAMA_FAST_MODEL", "OLLAMA_TIMEOUT",
         ):
+            assert hasattr(Config, attr), f"{attr} missing"
+        # Long-removed legacy names stay gone.
+        for attr in ("OLLAMA_FALLBACK_MODEL", "PRIMARY_PROVIDER"):
             assert not hasattr(config, attr), f"{attr} still present"
-        for prop in (
-            "ollama_api_url", "ollama_generate_url", "ollama_headers",
-            "ollama_openai_api_url", "ollama_model_for_tier",
-        ):
-            assert not hasattr(config, prop), f"{prop} still present"
 
     def test_base_url_is_openrouter_chat_completions(self):
         assert config.LLM_API_URL == (

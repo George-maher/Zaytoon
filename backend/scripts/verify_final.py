@@ -1,5 +1,6 @@
 """Live smoke check: free-only policy + bilingual voice routing + safety gate."""
 
+import asyncio
 import json
 import logging
 import sys
@@ -17,7 +18,11 @@ from services.model_registry import is_free_router, spec_for  # noqa: E402
 from services.completion_validator import validate_completion  # noqa: E402
 from voice import routing  # noqa: E402
 from voice.tts import TextToSpeech  # noqa: E402
-from tools.safety import RiskAssessor  # noqa: E402
+from tools.safety import (  # noqa: E402
+    PERMISSION_CONFIRM,
+    PERMISSION_DANGEROUS,
+    RiskAssessor,
+)
 from tools.sandbox import split_command, SecurityError, is_safe_path  # noqa: E402
 
 ARABIC = "مرحبا يا زيتون، إيه الساعة دلوقتي؟"
@@ -233,6 +238,86 @@ for payload in ("echo a & hostname", "cat x; rm -rf /", "dir > out.txt"):
         check(f"injection {payload!r} blocked", False, "(allowed)")
     except SecurityError:
         check(f"injection {payload!r} blocked", True)
+
+print()
+print("  structured local execution (the two newest tools):")
+# The tier is argument-dependent for execute_local_command: `confirm` for an
+# ordinary command, escalated to `dangerous` when a hazard pattern matches.
+# A regression here would show the user a calm approval dialog for `rm -rf /`.
+for action, params, want in [
+    ("execute_local_command", {"command": "echo hi"}, PERMISSION_CONFIRM),
+    ("execute_local_command", {"command": "rm -rf /"}, PERMISSION_DANGEROUS),
+    ("execute_code", {"code": "print(1)", "language": "python"}, PERMISSION_DANGEROUS),
+]:
+    a = assessor.assess(action, params)
+    check(
+        f"{action} {params['command'] if 'command' in params else 'print(1)'!r} "
+        f"-> {want}",
+        a.permission == want and a.requires_confirmation,
+        f"-> tier={a.permission} {a.reasons[:1]}",
+    )
+
+# system_command's own classification must not have moved when the structured
+# tool was added: a stricter tier on a *different* action is fine, a looser
+# one on this action would be a silent downgrade.
+check(
+    "system_command 'rm -rf /' still gated at its own tier",
+    assessor.assess("system_command", {"command": "rm -rf /"}).permission
+    == PERMISSION_CONFIRM,
+)
+
+# Both tools must actually be in the registry the model is shown, and neither
+# may offer a `shell` switch — the sandbox checks and argv-only exec mean such
+# a flag would add attack surface and nothing else.
+from tools.registry import build_default_registry  # noqa: E402
+
+registry = build_default_registry()
+names = set(registry.list())
+check(
+    "execute_local_command + execute_code are registered",
+    {"execute_local_command", "execute_code"} <= names,
+    f"-> {len(names)} tools",
+)
+for tool_name in ("execute_local_command", "execute_code"):
+    schema = registry.get(tool_name).schema()
+    check(
+        f"{tool_name} offers no shell parameter",
+        "shell" not in (schema.get("properties") or {}),
+        f"-> {sorted((schema.get('properties') or {}))}",
+    )
+
+# The process tools (increment E). The policy that matters is not their tier —
+# the suite checks that — but that starting and stopping ask, and that the
+# registry cannot be used to reach a process Zaytoon did not start.
+check(
+    "process tools are registered",
+    {"process_start", "process_list", "process_logs", "process_stop"} <= names,
+    f"-> {sorted(n for n in names if n.startswith('process_'))}",
+)
+_assessor = RiskAssessor()
+for _action, _params in (
+    ("process_start", {"command": "npm run dev"}),
+    ("process_stop", {"id": "proc_1"}),
+):
+    check(
+        f"{_action} always asks",
+        _assessor.assess(_action, _params).requires_confirmation,
+        f"-> {_assessor.assess(_action, _params).permission}",
+    )
+for _action in ("process_list", "process_logs"):
+    check(
+        f"{_action} never asks",
+        not _assessor.assess(_action, {"id": "proc_1"}).requires_confirmation,
+        "-> inspection is read-only",
+    )
+
+from tools.processes import registry as _proc_registry  # noqa: E402
+
+check(
+    "an untracked process id cannot be stopped",
+    asyncio.run(_proc_registry.stop("proc_never_started")) is None,
+    "-> no kill switch for foreign pids",
+)
 
 print()
 print("  path containment (sibling-prefix escape):")

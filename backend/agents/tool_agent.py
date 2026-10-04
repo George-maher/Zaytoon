@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Callable
 from .base_agent import BaseAgent
 from .engine import AgentEngine
 from .events import AgentEventType, NullBus
+from common.reporting import safe_error
 from tools.registry import ToolRegistry, build_default_registry
 from tools.safety import ConfirmationManager, RiskAssessor, RiskLevel
 
@@ -136,6 +137,11 @@ class ToolAgent(BaseAgent):
             bus=bus,
             approval=self._make_approval(manager, session_id, lang),
             response_id=kwargs.get("response_id", ""),
+            # The router only sends intent=tools here, so a first-attempt prose
+            # reply is worth one corrective round rather than being accepted as
+            # the answer (a placeholder or a guessed fact otherwise reaches the
+            # user verbatim).
+            expect_tool=True,
         )
         return result.text
 
@@ -156,7 +162,10 @@ class ToolAgent(BaseAgent):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error("Confirmation channel failed for %s: %s", tool_name, e)
+                safe_error(
+                    e, operation="confirmation", component="ToolAgent",
+                    detail=f"for {tool_name}",
+                )
                 return self._ERROR.get(language, self._ERROR["en"])
 
             outcome = getattr(manager, "last_outcome", None)
@@ -258,7 +267,10 @@ class ToolAgent(BaseAgent):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Confirmation flow error for %s: %s", tool_name, e)
+            safe_error(
+                e, operation="confirmation", component="ToolAgent",
+                detail=f"for {tool_name}",
+            )
             return _ERROR.get(language, _ERROR["en"])
 
         if approved:

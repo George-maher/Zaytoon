@@ -15,7 +15,6 @@ import asyncio
 import logging
 import os
 import subprocess
-import sys
 from typing import Any, Dict, List
 
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop

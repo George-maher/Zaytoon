@@ -12,7 +12,6 @@ Covers the three defects found in the audit plus the standing sandbox policy:
    allow-list, and app targets were interpolated into ``start "<target>"``.
 """
 
-import asyncio
 import os
 import sys
 from pathlib import Path

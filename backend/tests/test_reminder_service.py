@@ -1,9 +1,9 @@
 import pytest
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock
+from datetime import datetime
+from unittest.mock import AsyncMock
 
 from reminder.service import ReminderService
-from reminder.models import ReminderData, ReminderStatus, RecurrenceType
+from reminder.models import ReminderData, RecurrenceType
 
 
 @pytest.fixture

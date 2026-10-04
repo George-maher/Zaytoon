@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from common.reporting import safe_error
+
 logger = logging.getLogger("Zaytoon.Events")
 
 
@@ -136,8 +138,12 @@ class EventBus:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(
-                    "Event subscriber failed for %s: %s", event_type.value, e
+                # A subscriber is a display, not the turn: it must never be
+                # able to abort the work that produced the event, so the
+                # failure is reported and swallowed.
+                safe_error(
+                    e, operation="emit", component="EventBus",
+                    detail=f"event={event_type.value}",
                 )
 
     async def emit_many(self, events: List[AgentEvent]) -> None:

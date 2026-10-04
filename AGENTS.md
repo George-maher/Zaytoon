@@ -5,7 +5,7 @@
 ```bash
 # Backend (must run from backend/ — sys.path depends on it)
 cd backend
-cp .env.example .env          # then edit OPENROUTER_API_KEY with your key
+cp .env.example .env          # AI_PROVIDER=ollama by default (local, no key)
 .venv\Scripts\activate && pip install -r requirements.txt
 python main.py                # http://127.0.0.1:8000
 
@@ -14,9 +14,11 @@ cd frontend && npm run dev    # http://localhost:5173
 ```
 
 Prerequisites:
-- **OpenRouter API key** — get one at https://openrouter.ai/keys and set it in `.env` as `OPENROUTER_API_KEY`. It is **required**: local model execution has been removed, so with no key the assistant cannot answer.
-- Model chain: `OPENROUTER_PRIMARY_MODEL` (default `qwen/qwen3.8-27b:free`) → `OPENROUTER_FALLBACK_MODEL` (`openrouter/free`). Code/planning/scheduling use `OPENROUTER_REASONING_MODEL` (`thinkingmachines/inkling-small:free`) as the chain head. All three are hard-allow-listed.
-- See "LLM providers" below for the free-model policy and fallback behaviour.
+- **Ollama running locally** (`ollama serve`) with the configured models
+  installed (`ollama pull qwen3.5:9b`, `qwen2.5-coder:7b`, `qwen2.5-coder:3b`).
+  A missing model is reported as `MODEL NOT INSTALLED` with the exact pull
+  command — Zaytoon never downloads a model on its own.
+- **OpenRouter API key** — optional, only when `AI_PROVIDER=openrouter`.
 
 Desktop shell (optional, Python/customTkinter — spawns the backend itself):
 ```bash
@@ -53,6 +55,8 @@ backend/
 ├── domain/models.py        # Enums (Intent, Language, AgentType), dataclasses,
 │                           #   TokenBucketRateLimiter, SessionState, SpokenSentenceTracker
 ├── common/exceptions.py    # ZaytoonError hierarchy
+├── common/reporting.py     # redact() / safe_error() / client_error()
+├── common/audit.py         # execution_audit table + recent/count/clear
 ├── scheduler/              # TimeParser, SchedulerManager
 ├── reminder/               # ReminderService, NotificationManager, ReminderData models
 ├── voice/                  # SpeechToText (faster-whisper), TextToSpeech (edge-tts)
@@ -63,10 +67,12 @@ backend/
 │   ├── sandbox.py          # Unconditional blocks: shell metachars, path containment
 │   └── safety.py           # RiskAssessor + ConfirmationManager (human-in-the-loop)
 ├── memory/                 # ShortTermMemory, UserPreferences
-├── tests/                  # 21 test files, pytest-asyncio
+├── tests/                  # 27 test files, pytest-asyncio
 ├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
 ├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
+├── scripts/verify_execution.py    # Live probe: tools, audit, dedupe, processes
 └── data/zaytoon.db         # SQLite (auto-created by MemoryAgent)
+    data/audit.db           # Execution audit (separate file, see Execution layer)
 frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
 ├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
@@ -91,6 +97,9 @@ tools/
 ├── registry.py      # ToolRegistry: validate -> gate -> execute. THE chokepoint
 ├── filesystem.py    # read, write, list, create_folder, delete, move, search
 ├── terminal.py      # system_command, run_code, type_text/key_press
+├── local_exec.py    # execute_local_command, execute_code (structured results)
+├── processes.py     # process_start/list/logs/stop (tracked background procs)
+├── metrics.py       # ToolMetrics: calls, failures, avg ms, by tool
 ├── applications.py  # open_app, close_app, resolve_windows_app
 ├── system.py        # get_time, system_info, calculator, get_volume, screenshot
 ├── web.py           # search_web, open_url
@@ -104,7 +113,7 @@ tools/
 └── linux.py         # ditto
 ```
 
-30 tools, listed in the agent prompt by generating them from the registry
+36 tools, listed in the agent prompt by generating them from the registry
 rather than hand-maintaining them — the old hard-coded list omitted every tool
 added since, which is how `file_read`/`file_write` came to pre-validate with no
 handler behind them and return `"Unknown action"`.
@@ -136,8 +145,8 @@ registry so the user is not asked twice.
 ## Key quirks
 
 - **Python path**: `backend/api/__init__.py` does `sys.path.insert(0, ...)`. Always `cd backend` first; never run `uvicorn` from repo root.
-- **All agents** go through `services/llm_client.LLMClient`; they never build URLs or pick models themselves. OpenRouter is the only provider, so there is a single endpoint and one SSE parser.
-- **OpenRouter API key is required.** `LLMClient.build_chain()` raises a message telling you to set it when the key is absent — there is no local fallback to degrade to.
+- **All agents** go through `services/llm_client.LLMClient`; they never build URLs or pick models themselves. The provider (`ollama` by default, `openrouter` optional) is chosen once from configuration, so there is a single request path and one contract check.
+- **OpenRouter API key is required only for `AI_PROVIDER=openrouter`.** `LLMClient.build_chain()` raises a message telling you to set it when the key is absent; the Ollama path needs no key at all.
 - **Keyword router**: Fast intent matching via regex before LLM fallback (skips ~80% of LLM router calls).
 - **Rate limiter**: 60 req/min per IP (configurable via `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`). Stale entries cleaned every 5 min.
 - **Session management**: max 100 concurrent sessions; sessions older than 30 min cleaned. WebSocket `"interrupt"` message cancels active response + TTS.
@@ -149,14 +158,26 @@ registry so the user is not asked twice.
 
 ## LLM providers & fallback
 
-**OpenRouter is the only provider, and FREE models are the only models.**
-Local model execution (Ollama, llama.cpp, any on-device GGUF) has been removed:
-nothing is downloaded to or run on the user's machine. Every request goes to
-`https://openrouter.ai/api/v1/chat/completions`.
+**Two providers, one interface. `AI_PROVIDER=ollama` (default) or
+`AI_PROVIDER=openrouter`.**
 
-`services/model_registry.py` owns the free pool and its capabilities.
+- **Ollama (default)** — local inference through `services/ollama_client.py`.
+  No API key. Endpoint and the three tier models are env-configurable
+  (`OLLAMA_BASE_URL`, `OLLAMA_GENERAL_MODEL`, `OLLAMA_CODING_MODEL`,
+  `OLLAMA_FAST_MODEL`). Nothing is ever downloaded automatically: a missing
+  model surfaces as `MODEL NOT INSTALLED: … ollama pull <model>`, and an
+  unreachable daemon surfaces as `… ollama serve`. There is **no silent
+  fallback to OpenRouter** in local-only mode.
+- **OpenRouter (optional)** — the original free-only pool. Its zero-cost
+  policy is unchanged and still enforced before any socket opens.
+
+`services/ai_provider.py` owns the `AIProvider` interface (`OllamaProvider`,
+`OpenRouterProvider`) plus health/status reporting for `GET /settings/ai`.
+`services/model_registry.py` owns the OpenRouter free pool and its capabilities.
 `services/completion_validator.py` owns the contract a completion must satisfy.
-`services/llm_client.py` wires them to the transport.
+`services/llm_client.py` wires them to the transport; both providers run under
+the same attempt budget, and the Ollama path (`_complete_ollama` /
+`_stream_ollama`) validates the contract identically.
 
 ### The invariant
 
@@ -442,18 +463,116 @@ layer.
 understand → audit → steps/code → **verify** → risks — and `PlannerAgent` is
 explicitly told it plans but does not act.
 
+## Execution layer: concurrency, metrics, audit, processes
+
+### Independent tool calls run together; gated ones are barriers
+
+`AgentEngine._run_batch` replaces the old `for call in calls:`. Within one model
+turn it walks the calls and splits them into **runs of consecutive safe-tier
+calls** (concurrent, `asyncio.gather` under `asyncio.Semaphore(4)`) and
+**barriers** — every `confirm`/`dangerous` call runs alone, in the order the
+model wrote it.
+
+The barrier rule is the point, not the parallelism. Outcomes are stored
+positionally, so `observations`, `tool_calls` and `failed_calls` describe the
+sequence the model asked for. If a read were allowed to overtake the
+`create_folder` before it, the observation list would claim the read happened
+after the folder existed while its own text said "not found", and the model
+would reason about an impossible sequence.
+
+`gather` is used **without** `return_exceptions`, so a `CancelledError`
+(interrupt) reaches the children — but each call converts its own exception into
+a structured failure, so one failing tool can never cancel its siblings.
+
+Proven deterministically in `tests/test_parallel_tools.py` (three safe calls
+cost one call's worth of time, the cap, barriers, ordering, failure isolation).
+The live probe cannot prove it: real tools finish in milliseconds.
+
+### Two tool-call dialects that both *benched* a working model
+
+Two live bugs, both found by running it rather than reading it:
+
+- **Aliases were invisible to the contract.** `file_read` declares the aliases
+  `file_list`, `list_files`, `list_directory`, and the registry resolves all of
+  them — but `contract_from_registry` built its tool map from *primary names
+  only*. A model that reached for `file_list` was rejected as
+  `INVALID_TOOL_UNKNOWN`, spending the whole attempt budget on a name the
+  executor would have served. Aliases are now in the contract, mapped to the
+  same shape; a primary name still wins over another tool's alias.
+- **A wrong tool name was fatal to the turn.** The validator's verdict happens
+  one layer *before* the observation loop that exists to correct exactly this.
+  The user got "all available AI models are temporarily unavailable" — a
+  sentence about the provider — for what was a recoverable slip. The engine now
+  builds its contract with `allow_unknown_tools=True`, so the call reaches
+  `ToolRegistry.execute`, which refuses it **by name** and hands the refusal
+  back as an observation the model corrects from. The strict default is
+  unchanged for every other caller, and what can *execute* is unchanged.
+
+### Errors are reported centrally
+
+`common/reporting.py` owns the failure vocabulary: `redact()` (masks key-shaped
+strings and the values of sensitive config), `safe_error()` (one structured log
+line — `ERROR op=… comp=… type=… ts=… msg=…` — plus a safe message) and
+`client_error()` (short bilingual user-facing text). Wired into the WebSocket
+handler, the engine, the registry, memory, scheduler, reminders and voice.
+
+The registry change is the visible one: `validate()` and `execute()` no longer
+echo `str(e)` to the client, which was the one place a traceback fragment, an
+absolute path or a command line could reach the transcript.
+
+### Tracked background processes
+
+`tools/processes.py` exists because a dev server has no deadline and
+`execute_local_command` requires one. **Only processes Zaytoon started are
+tracked**: a pid enters the registry solely because `start()` spawned it,
+nothing is discovered by scanning the process table, and `stop()` refuses an
+unknown id. That refusal is the security property and is the first thing the
+tests assert. Output is captured to a 500-line ring buffer, redacted on the way
+in. REST: `GET /processes`, `GET /processes/{id}/logs`, `POST /processes/{id}/stop`.
+
+### Execution audit log
+
+`common/audit.py` writes one row per tool invocation (tool, command, cwd, risk
+tier, approval decision, success, exit code, duration, error) with everything
+`redact()`ed first. REST: `GET /audit`, `DELETE /audit`.
+
+It has its **own** SQLite file (`data/audit.db`, override with
+`AUDIT_DB_PATH`). The first version shared `zaytoon.db` with the memory agent,
+and clearing the audit page from the UI failed with `database is locked` after
+a 3s busy timeout *and* three retries — the memory agent holds that connection
+open for the life of the process, so the contention was structural, not
+transient. A shared file sounded simpler and was not.
+
+A failing audit write must never break a turn: every function swallows its own
+errors and logs once.
+
+### Duplicate requests are dropped by id, not by text
+
+Content-based duplicate detection cannot catch a resend — the retry arrives
+*before* the first turn produced content to compare. Clients may attach
+`client_msg_id`; the server keeps a per-session, TTL-bounded, cap-bounded set
+and drops a resend **before** it can cancel the in-flight turn. A frame with no
+id behaves exactly as before, so the desktop shell is unaffected.
+
+### Heartbeats and metrics
+
+A tool running longer than `TOOL_HEARTBEAT_S` (2s) emits `tool_progress` from a
+task cancelled in the call's `finally` — a heartbeat that outlives its tool is
+a permanent lie on the wire. `tools/metrics.py` counts calls, failures and
+average duration per tool and appears at `GET /health` under `metrics.tools`.
+
 ## Tests
 
 ```bash
-# backend (1165 tests)
+# backend (1405 tests)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
-# desktop shell (78 tests)
+# desktop shell (476 tests)
 cd desktop
 ..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# frontend (102 tests + lint + build)
+# frontend (221 tests + lint + build)
 cd frontend
 npm run verify          # lint && test && build
 ```
@@ -495,8 +614,21 @@ npm run verify          # lint && test && build
   declares what it requires, aliases resolve), the validate→gate→execute
   ordering, and every new tool against a real temp workspace.
 - `tests/test_api_routes.py` — `/health`, `/tools`, `/settings/workspace`,
-  `/tasks`, `/command/*`. Added after a one-line edit to `health()` removed the
-  `get_llm_client()` call it depends on and nothing caught it.
+  `/tasks`, `/command/*`, `/processes`, `/audit`. Added after a one-line edit to
+  `health()` removed the `get_llm_client()` call it depends on and nothing
+  caught it.
+- `tests/test_parallel_tools.py` — the concurrency contract: cost, cap,
+  barriers, order, failure isolation.
+- `tests/test_tool_heartbeat.py` — `tool_progress` cadence and cancellation.
+- `tests/test_process_manager.py` — ownership first (an untracked id cannot be
+  stopped), then lifecycle truthfulness against real child processes.
+- `tests/test_audit_log.py` — mostly the *failure* path: a broken table, an
+  unwritable path and a lock must never break a turn.
+- `tests/test_request_dedupe.py` — `client_msg_id` scoping, TTL and cap.
+- `python scripts/verify_execution.py` — live probe over the real WebSocket
+  (tool turns, audit attribution, a resent id, the process endpoints). It
+  reports rather than fails on tool overlap and heartbeat cadence: real tools
+  finish in milliseconds, so those two are proven by the suite instead.
 - `tests/test_summarization.py` — guards the abstract-`BaseAgent` silent failure.
 - `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
   the seam both the browser app and the desktop shell depend on.
@@ -510,6 +642,21 @@ npm run verify          # lint && test && build
 
 React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
 `tsconfig.json`; this was a deliberate decision (see "Increment 1.5" below).
+
+- **The state vocabulary is a pure module, not JSX.** `lib/statusLabels.js`
+  derives the status sentence ("Understanding…", "Planning…", "Calling
+  `<tool>`…", "Generating response…", "Speaking…") with a documented precedence
+  order; `StatusLine.jsx` renders it with `role="status"` and
+  `aria-live="polite"`. `lib/toolRows.js` folds activity events into one row per
+  tool invocation, so several concurrent tools display independently with
+  RUNNING/DONE/FAILED chips. `lib/risk.js` maps a permission/level pair to a
+  tone — and an unrecognised value grades **up** to DANGEROUS, never down.
+- **Audit and processes are optional capabilities.** `ExecutionHistory.jsx`
+  treats a 404 as "unavailable" and hides the processes card rather than showing
+  an error, so the page works against a backend that predates the endpoints.
+- **Outbound messages carry `client_msg_id`** (`lib/ids.js`, `crypto.randomUUID`
+  with a manual fallback) so the server can drop a resent frame. A client that
+  omits it behaves exactly as before.
 
 - `src/hooks/useWebSocket.js` — the whole client state machine and the single
   place the WebSocket protocol is implemented. `isSocketOpen()` is the one
@@ -633,6 +780,16 @@ Three properties are load-bearing, and each has a test in
   LLM call while asking for JSON, so `{"action":"open_app","app":"spotify"}` was
   typed out on the user's screen and then overwritten. Keeping private reasoning
   off the wire is now structural rather than a matter of prompt wording.
+- **A routed tool turn refuses prose before it ships.** `ToolAgent` runs the
+  engine with `expect_tool=True`. First prose answer → a call-format nag; second
+  → a final insistence; a third is **replaced** with the honest bilingual
+  `_NO_TOOL_TAKEN` message (`stopped_reason == "no_tool_taken"`) instead of being
+  delivered. This exists because the local 3B model twice ignored the nag and
+  shipped `الساعة الآن هي: [أكتب الوقت الحالي]` (a template) and then
+  `الساعة الآن هي: 12:34:56` (a fabricated time — the real one was 12:57).
+  Unfilled placeholders are likewise never delivered: after a tool has run, a
+  template-shaped summary gets one corrective round and then the apology.
+  The failure is reported; a guessed fact never is.
 
 `ToolAgent` also owns the bilingual gate via `_make_approval()`, which returns a
 *refusal string* rather than a bool so the engine can feed "the user declined"
@@ -776,8 +933,14 @@ desktop/
 │                          #   keyboard, pystray, pillow
 ├── app/
 │   ├── app.py             # Tk main thread + queue.Queue pump (TICK_MS = 30)
+│   ├── states.py          # Inputs -> UiState + label (pure, unit-tested)
+│   ├── core.py            # reactive Canvas "core" visualisation
+│   ├── header.py          # identity, status pills, window controls
+│   ├── sidepanel.py       # model, task, tools, CPU/RAM, actions, processes
+│   ├── dialogs.py         # confirmation dialog (Allow / Cancel)
+│   ├── activity.py        # per-turn activity model (plan, tool rows)
 │   ├── orb.py             # floating orb: Tk Canvas, colour-key transparency
-│   ├── panel.py           # expanded chat panel
+│   ├── panel.py           # the shell: layout_plan, compute_wrap, MessageRow
 │   ├── backend.py         # FastAPI child-process supervisor
 │   ├── client.py          # blocking websockets.sync client + backoff reconnect
 │   ├── protocol.py        # the 4 outbound builders + ServerEvent decoding
@@ -794,6 +957,27 @@ desktop/
 - **Window:** undecorated (`overrideredirect`), always-on-top, no taskbar
   button. Transparency is a **colour key** (`#000001`), not an alpha channel —
   Tk has no alpha on Windows, so soft edges are faked with canvas stipple.
+- **The shell is a command center, not a chat window.** `states.py` is a pure
+  `(connection, status frame, intent, tool frames, audio, errors) -> UiState +
+  label` function — the single source the header pill, the core visualisation
+  and the status line all read, so they cannot disagree. `panel.set_ui_state()`
+  is the one fan-out point.
+- **Animations self-stop.** `core.AnimationLoop` runs one cancellable chain per
+  widget and `set_mode(static)` cancels it outright; `STATIC_STATES = {IDLE,
+  OFFLINE}`. The idle breathing ring lost to the "no permanent `after()` loop"
+  rule, and `test_core_animation` enforces the rule rather than the decoration.
+- **Tk never blocks.** `TelemetryWorker` owns every REST call and the ctypes
+  CPU/RAM sampling and pushes through the same `queue.Queue` as the socket —
+  no `urllib` or `websockets` call ever happens in a widget callback. CPU is
+  read with `GetSystemTimes` and RAM with `GlobalMemoryStatusEx` rather than
+  adding `psutil` as a dependency.
+- **The confirmation dialog is security-critical UI**, so `ConfirmationState`
+  makes it exactly one decision (allow or cancel once), `mark_resolved`
+  suppresses a late frame, and closing the window is a denial. It lives in its
+  own `CTkToplevel` so it is visible in orb mode.
+- `/audit` and `/processes` are **optional**: a 404 hides the card rather than
+  showing an error, because the shell must work against a backend that predates
+  them.
 - **Global hotkeys** via the `keyboard` package (low-level OS hook): `Ctrl+Space`
   toggles the orb, `Alt+Z` switches orb ⇄ panel. Both are env-overridable
   (`ZAYTOON_TOGGLE_HOTKEY`, `ZAYTOON_EXPAND_HOTKEY`). A binding failure degrades
@@ -821,7 +1005,12 @@ desktop/
 - **Known gaps:** the shell handles no `reminder*` events and never sends
   `reminder_cmd`, so a fired reminder is silently dropped (`TrayIcon.notify()`
   exists but is unwired). Panel chrome beyond `theme.status_text` is English
-  only.
+  only. `theme.py` has **two layers**: layer 1 (`VOID`, `CYAN`, `RADIUS == 0`)
+  is pinned by `test_design_parity.py` to `frontend/src/styles/theme.css`, and
+  layer 2 is the redesign's palette that widgets actually render with. They can
+  only be unified by moving the CSS first. Visuals cannot be verified headlessly
+  — the tests assert tokens and the animation contract, not appearance, so the
+  shell still needs a human to look at it.
 - **Build:** `python desktop/scripts/build_exe.py` → `desktop/dist/Zaytoon.exe`
   (PyInstaller onefile, portable, no installer). The backend is deliberately
   **not** frozen in — `faster-whisper` + `edge-tts` push a bundle past 500 MB.

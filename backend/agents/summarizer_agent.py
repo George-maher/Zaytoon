@@ -13,7 +13,7 @@ unreachable.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from config import TIER_FAST
 from .base_agent import BaseAgent

@@ -46,10 +46,21 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from agents.events import AgentEventType, EventBus, NullBus
+from agents.events import EventBus, NullBus
+from common.audit import record as audit_record
+from common.reporting import safe_error
+from tools.metrics import (
+    STATUS_DECLINED,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_TIMED_OUT,
+    get_tool_metrics,
+    record_tool_call,
+)
 from services.completion_validator import (
     CompletionContract,
     contract_from_registry,
@@ -69,6 +80,38 @@ MAX_OBSERVATION_CHARS = 4_000
 #: The longest a single tool may run before the engine stops waiting. Tools
 #: have their own timeouts; this is the backstop for one that hangs.
 TOOL_TIMEOUT_S = 120
+
+#: How many *safe-tier* calls from one batch may run at once (increment B).
+#: Capped rather than unbounded so a model that emits twenty read calls cannot
+#: open twenty subprocesses or twenty files at the same time. Confirm and
+#: dangerous calls never share this budget — they run one at a time.
+PARALLEL_SAFE_TOOLS = 4
+
+#: How often a long-running tool says so (increment C). A module constant
+#: rather than a config value because it is a *wire cadence*, not a policy:
+#: tests monkeypatch it down to ~0.05s, and nothing outside the engine reads it.
+TOOL_HEARTBEAT_S = 2.0
+
+#: Heartbeat text. Fixed and human-written — never the model's own words, for
+#: the same reason tool labels are fixed.
+_HEARTBEAT = {
+    "en": "Still working…",
+    "ar": "لسه بشتغل…",
+}
+
+
+async def _heartbeat(name: str, bus: EventBus, language: str) -> None:
+    """Emit ``tool_progress`` until cancelled by the call it belongs to.
+
+    Cancellation is the *only* way out, so the frame count for a call is a
+    function of its duration — which is what makes it a useful liveness
+    signal. The first tick waits a full interval, so a fast tool never
+    produces one.
+    """
+    message = _HEARTBEAT.get(language, _HEARTBEAT["en"])
+    while True:
+        await asyncio.sleep(TOOL_HEARTBEAT_S)
+        await bus.tool_progress(name, message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +368,13 @@ def looks_like_tool_call(text: str) -> bool:
     # A bracketed call expression with no prose around it, e.g. "[get_time()]".
     if _CALL_EXPR.match(stripped) and len(stripped) <= 200:
         return True
+    # An entire reply that is one JSON object in the documented dialect and
+    # nothing else. It reached here *after* the scanners failed, so showing it
+    # verbatim would put raw tool JSON on the user's screen; admitting the
+    # model did not comply is strictly better.
+    if stripped.startswith("{") and stripped.endswith("}") and len(stripped) <= 2000:
+        if any(f'"{key}"' in stripped for key in _ACTION_KEYS):
+            return True
     return False
 
 
@@ -410,9 +460,20 @@ def extract_tool_calls(text: str) -> Tuple[List[ToolCall], str]:
 
 def _parse_json_object(raw: str) -> Optional[ToolCall]:
     """Turn one balanced ``{...}`` into a :class:`ToolCall`, or ``None``."""
+    parsed = None
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        # A model that was shown ``{{...}}`` copies the doubled braces, and
+        # ``{{"action": x}}`` is not valid JSON. Unwrap once before giving up:
+        # refusing here is what put raw tool JSON on a user's screen.
+        try:
+            body = raw.strip()
+            if body.startswith("{{") and body.endswith("}}"):
+                parsed = json.loads(body[1:-1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if parsed is None:
         return None
     if not isinstance(parsed, dict):
         return None
@@ -463,10 +524,11 @@ def render_observation(call: ToolCall, result: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 SYSTEM_EN = """\
 You are Zaytoon, a desktop assistant that can use tools.
+Answer in English only unless the user writes in another language.
 
 How to work:
 - If a tool is needed, reply with ONLY a JSON object and nothing else:
-  {{"action": "tool_name", "params": {{...}}}}
+  {"action": "tool_name", "params": {...}}
 - You may request several tool calls in one reply, one JSON object per line.
 - If no tool is needed, reply with plain prose for the user. No JSON.
 - After each round you will be shown what the tools actually did. Use those
@@ -481,6 +543,9 @@ Available tools:
 Rules:
 - Never invent a tool name or a parameter. Only use the ones listed above.
 - Never claim an action happened unless an observation confirms it.
+- Never answer from memory what a tool can tell you: the current time, date,
+  or any fact about this machine must come from the tool, not from you.
+  If the user asks what time or date it is, call the time tool first.
 - If a tool was refused or denied, say so plainly; do not pretend otherwise.
 """
 
@@ -488,8 +553,8 @@ SYSTEM_AR = """\
 انت زيتون، مساعد سطح مكتب بيقدر يستخدم أدوات.
 
 طريقة الشغل:
-- لو محتاج أداة، رد بـ JSON对象 بس وخلاص:
-  {{"action": "اسم_الأداة", "params": {{...}}}}
+- لو محتاج أداة، رد بـ JSON object بس وخلاص:
+  {"action": "اسم_الأداة", "params": {...}}
 - ينفع تطلب أكتر من أداة في نفس الرد، كل واحدة JSON object في سطر.
 - لو مش محتاج أداة، اكتب كلام عادي للمستخدم. بدون JSON.
 - بعد كل جولة هتشوف الأدوات عملت إيه فعلاً. استخدم النتيجة عشان تقرر الخطوة
@@ -503,11 +568,25 @@ SYSTEM_AR = """\
 قواعد:
 - متخترعش اسم أداة ولا بارامتر. استخدم الموجود في القائمة بس.
 - متقولش إنك عملت حاجة إلا لو النتيجة بتأكد.
+- متعرّفش من عندك حاجة الأدوات تقدر تقولها: الوقت والتاريخ وأي حقيقة عن
+  الجهاز لازم تيجي من الأداة مش منك. لو المستخدم سأل الوقت، نادِ أداة الوقت
+  الأول ومتقولش وقتك أنت.
 - لو أداة اترفضت أو اتمنعت، قولها بصراحة، متدّعيش إنك عملتها.
+
+مهم جداً (آخر كلام): رد على المستخدم بالعربي المصري فقط. ممنوع الرد
+بالإنجليزية مهما كانت لغة نتيجة الأداة — ترجم النتيجة واكتب الرد بالعربي.
 """
 
 
 def build_system_prompt(catalogue: str, language: str = "en") -> str:
+    """Render the tool-loop system prompt.
+
+    The templates contain literal braces — they are *not* ``str.format``
+    templates (``{catalogue}`` is substituted by name), so they must show the
+    model single braces. They previously showed ``{{...}}``; a model copied the
+    doubled braces verbatim, ``json.loads`` rejected them, and raw tool JSON
+    reached the user as the assistant's answer.
+    """
     template = SYSTEM_AR if language == "ar" else SYSTEM_EN
     return template.replace("{catalogue}", catalogue)
 
@@ -531,6 +610,95 @@ _ALL_MODELS_FAILED = {
         "complete this operation. Please try again in a moment."
     ),
     "ar": "كل الموديلات المجانية دلوقتي مشغولة أو مقدرش تكمّل العملية. جرّب تاني بعد شوية.",
+}
+
+#: An *unfilled template* is not an answer. Live run: the Arabic tool turn came
+#: back as ``الساعة الآن هي: [أكتب الوقت الحالي]`` — the model wrote a form to
+#: fill in instead of calling the tool, and that text was on its way to the
+#: user's screen. Narrow on purpose: only bracketed "write/enter/اكتب…"-style
+#: slots count, so legitimate prose containing a citation is untouched.
+_PLACEHOLDER_RE = re.compile(
+    r"\[\s*(?:أكتب|اكتب|أدخل|write|enter|insert|fill|put|your\b|xxx+)",
+    re.IGNORECASE,
+)
+
+
+def is_placeholder_reply(text: str) -> bool:
+    """Whether ``text`` is an unfilled template rather than an answer."""
+    return bool(_PLACEHOLDER_RE.search(text or ""))
+
+
+#: Model-to-model nudge for a placeholder that came *after* a tool already ran.
+#: The generic "_TOOL_EXPECTED_NAG" would be wrong here — a tool did run — so
+#: this one points at the observation and asks for prose built from it.
+_PLACEHOLDER_NAG = {
+    "en": (
+        "Your last reply was an unfilled template such as "
+        "'[write the time here]', which is not an answer. Use the tool result "
+        "shown above and write the actual final answer in prose — no brackets, "
+        "no placeholders."
+    ),
+    "ar": (
+        "آخر رد كان قالب فاضي زي [اكتب الوقت هنا]، وده مش رد. استخدم نتيجة "
+        "الأداة اللي فوق واكتب الرد النهائي كلام عادي — من غير أقواس ولا قوالب."
+    ),
+}
+
+
+#: The second and final corrective round. The first nag explains *what* a tool
+#: call looks like; this one insists on it, because a live run against the
+#: local 3B model ignored the first nag twice and shipped a fabricated clock
+#: reading ("الساعة الآن هي: 12:34:56" while the real time was 12:57).
+_TOOL_NAG_FINAL = {
+    "en": (
+        "Second and final attempt: you still answered in prose and this "
+        "request needs a tool. Output ONLY the JSON tool call for the tool "
+        "from the list that answers the request — for example "
+        '{"action": "get_time"} for time questions. Do not write prose and '
+        "do not state any fact from memory."
+    ),
+    "ar": (
+        "المحاولة التانية والأخيرة: لسه رديت كلام والطلب ده محتاج أداة. "
+        "اكتب بس استدعاء الأداة بصيغة JSON من القائمة اللي فوق — مثلاً "
+        '{"action": "get_time"} لأسئلة الوقت. متكتبش كلام عادي ومتقولش '
+        "أي حقيقة من عندك."
+    ),
+}
+
+#: Shown when the model answered in prose three times in a row on a turn that
+#: was routed to the tool agent. Delivering that prose is how a guessed fact
+#: reaches the user, so it is refused — honestly, in the user's language.
+_NO_TOOL_TAKEN = {
+    "en": (
+        "I couldn't complete that: the request needs a tool to run, and I "
+        "couldn't get one this time. Please try again or rephrase it."
+    ),
+    "ar": (
+        "مقدرتش أكمّل: الطلب محتاج أداة تتنفذ، وملقيتهاش المرة دي. جرّب تاني "
+        "أو صيغله بطريقة تانية."
+    ),
+}
+
+#: Sent back to the model (never to the user) when a request was routed to the
+#: tool agent but the model answered in prose on the first attempt. A live run
+#: had it reply ``الساعة الآن هي: [أكتب الوقت الحالي]`` — a template placeholder
+#: instead of calling ``get_time`` — so the nudge names both failure modes.
+_TOOL_EXPECTED_NAG = {
+    "en": (
+        "That reply used no tool, but this request was routed to the tool "
+        "agent because it needs one. Try again: send a tool call as "
+        '{"action": "tool_name", "params": {...}} — use get_time for time or '
+        "date questions. Never answer with a placeholder such as "
+        "'[write the time here]' and never invent a value; the observation "
+        "must come from the tool. If you are certain no tool applies, answer "
+        "the user in plain prose."
+    ),
+    "ar": (
+        "الرد ده ماستخدمش أداة، بس الطلب ده وصل لوكيل الأدوات لأنه محتاجها. "
+        "جرّب تاني: ابعت استدعاء أداة بالمطلوب — لأسئلة الوقت والتاريخ استخدم "
+        "get_time. متردش بقالب زي [اكتب الوقت هنا] ومتخترعش قيمة؛ لازم النتيجة "
+        "تيجي من الأداة. لو متأكد إن مفيش أداة مناسبة، رد على المستخدم بكلام عادي."
+    ),
 }
 
 
@@ -648,15 +816,30 @@ class AgentEngine:
         llm: Any,
         registry: ToolRegistry,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        metrics: Optional[Any] = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.max_iterations = max(1, int(max_iterations))
+        #: Execution metrics (increment C). Defaults to the process-wide
+        #: instance that ``GET /health`` reads; a test can pass its own to
+        #: assert on a clean slate instead of on shared global state.
+        self.metrics = metrics if metrics is not None else get_tool_metrics()
         # Built once per turn from the registry's real schemas, so the
         # validator checks tool names and argument types against what actually
         # exists rather than against a hand-written list.
         self._tool_contract = contract_from_registry(
-            registry, allow_prose=True, label="agent_turn"
+            registry,
+            allow_prose=True,
+            label="agent_turn",
+            # A wrong tool name or a wrong argument is exactly what the
+            # observation loop exists to correct: the registry refuses the call
+            # by name and the model is shown the refusal. Rejecting the
+            # completion here instead would spend the whole attempt budget on a
+            # recoverable slip and end the turn with "all models are
+            # unavailable" — which is what a live run did, twice, on a local
+            # 3B model inventing a plausible tool name.
+            allow_unknown_tools=True,
         )
 
     def _contract(self, require_tool: bool) -> CompletionContract:
@@ -679,6 +862,7 @@ class AgentEngine:
         bus: Optional[EventBus] = None,
         approval: Optional[Callable[..., Any]] = None,
         response_id: str = "",
+        expect_tool: bool = False,
     ) -> LoopResult:
         """Run the loop to completion.
 
@@ -686,6 +870,16 @@ class AgentEngine:
         ``(tool_name, params)`` and returning a bool, or a refusal string to
         return to the model. The engine does not own the human-in-the-loop
         policy; it owns the loop.
+
+        ``expect_tool`` says the caller routed this request *because* it needs
+        a tool. Prose answers are then corrected twice (call-format nag, then
+        a final insistence) before being **refused**: a small local model will
+        otherwise hand back a template placeholder
+        (``الساعة الآن هي: [أكتب الوقت الحالي]``) or a fabricated fact instead
+        of calling the tool. After two ignored nags the reply is replaced with
+        an honest bilingual failure, so a misrouted no-tool request terminates
+        with an explanation instead of burning the attempt budget — and a
+        guessed value is never delivered.
         """
         bus = bus or NullBus()
         catalogue = self._catalogue(language)
@@ -706,6 +900,16 @@ class AgentEngine:
         #: One correction is allowed for a malformed reply. More than one and a
         #: confused model just burns the budget.
         nagged = False
+        #: Corrective rounds spent because a tool was expected and prose came
+        #: back instead. Two are allowed (``_TOOL_EXPECTED_NAG`` then
+        #: ``_TOOL_NAG_FINAL``); the third prose reply is refused rather than
+        #: delivered, because that is the path a fabricated fact takes to the
+        #: user's screen. Separate from ``nagged`` so a malformed reply and a
+        #: skipped tool each get their own allowance.
+        tool_nags = 0
+        #: One corrective round for a placeholder that came *after* a tool
+        #: already ran (the no-tool case is handled by ``tool_nags``).
+        placeholder_nagged = False
 
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
@@ -773,8 +977,70 @@ class AgentEngine:
                         errors=errors,
                     )
 
+                # A tool was expected and prose came back. Correct the model:
+                # the first nag explains the call format, the second insists
+                # on it. Two ignored nags and the prose is refused — see the
+                # refusal below — so a guessed fact is never delivered.
+                if expect_tool and not tool_names:
+                    if tool_nags >= 2:
+                        # Third prose answer with no tool call. Delivering it
+                        # is exactly how the fabricated clock reading above
+                        # reached the user; report the failure instead.
+                        answer = _NO_TOOL_TAKEN.get(
+                            language, _NO_TOOL_TAKEN["en"]
+                        )
+                        errors.append(
+                            "no tool call after two corrective rounds"
+                        )
+                        await bus.error(answer)
+                        await bus.response_chunk(
+                            answer, response_id=response_id
+                        )
+                        await bus.completed(
+                            reason="no_tool_taken", iterations=iteration
+                        )
+                        return LoopResult(
+                            text=answer,
+                            iterations=iteration,
+                            tool_calls=tool_names,
+                            failed_calls=failed,
+                            stopped_reason="no_tool_taken",
+                            errors=errors,
+                        )
+                    nag = _TOOL_EXPECTED_NAG if tool_nags == 0 else _TOOL_NAG_FINAL
+                    tool_nags += 1
+                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({
+                        "role": "user",
+                        "content": nag.get(language, nag["en"]),
+                    })
+                    continue
+
                 # No tool call: this is the answer. Stream it as prose.
                 answer = prose or raw
+                if expect_tool and is_placeholder_reply(answer):
+                    if not placeholder_nagged:
+                        # The tool ran; only the summary is a template. One
+                        # corrective round pointing at the observation.
+                        placeholder_nagged = True
+                        messages.append({"role": "assistant", "content": raw})
+                        messages.append({
+                            "role": "user",
+                            "content": _PLACEHOLDER_NAG.get(
+                                language, _PLACEHOLDER_NAG["en"]
+                            ),
+                        })
+                        continue
+                    # An unfilled template is not an answer, and this is the
+                    # second one. Report the failure honestly instead of
+                    # shipping a form to fill in.
+                    answer = _MALFORMED_REPLY.get(
+                        language, _MALFORMED_REPLY["en"]
+                    )
+                    errors.append(
+                        "the model returned a placeholder instead of acting"
+                    )
+                    await bus.error(answer)
                 await bus.response_chunk(answer, response_id=response_id)
                 await bus.completed(reason="answered", iterations=iteration)
                 return LoopResult(
@@ -793,24 +1059,30 @@ class AgentEngine:
             messages.append({"role": "assistant", "content": raw})
 
             observations: List[str] = []
-            for call in calls:
-                label = tool_label(call.name, language)
-                await bus.tool_started(call.name, label=label)
-
-                outcome = await self._invoke(call, approval, bus, language)
+            # Increment B: safe-tier calls in a batch run concurrently; every
+            # confirm/dangerous call is a barrier that runs on its own, in the
+            # order the model wrote it. Results are keyed by index and folded
+            # back in that original order, so `observations`, `tool_calls` and
+            # `failed_calls` describe what happened in the sequence the model
+            # asked for — never in completion order. The start/finish frames
+            # are emitted inside each task, so the feed still shows progress
+            # live instead of every tool finishing at once.
+            outcomes = await self._run_batch(
+                calls, approval, bus, language,
+                # Increment F: what the user actually asked for, so the audit
+                # reads as a history of requests rather than of anonymous
+                # commands. Passed down instead of stored on `self` because one
+                # engine can serve overlapping turns.
+                audit={"trace_id": response_id, "user_request": user_message},
+            )
+            for call, outcome in zip(calls, outcomes):
                 if isinstance(outcome, str):
                     # The gate declined; the model is told, not the user.
-                    await bus.tool_finished(call.name, False, summary=outcome)
                     observations.append(render_observation(call, {"error": outcome, "cancelled": True}))
                     continue
 
-                if outcome.get("success"):
-                    summary = str(outcome.get("output") or "")[:200]
-                    await bus.tool_finished(call.name, True, summary=summary)
-                else:
-                    detail = outcome.get("error") or "failed"
-                    errors.append(f"{call.name}: {detail}")
-                    await bus.tool_finished(call.name, False, summary=str(detail)[:200])
+                if not outcome.get("success"):
+                    errors.append(f"{call.name}: {outcome.get('error') or 'failed'}")
                 observations.append(render_observation(call, outcome))
                 # `tool_calls` is every tool dispatched, so the UI can show the
                 # full activity trail; `failed_calls` is what did not work, so a
@@ -901,8 +1173,230 @@ class AgentEngine:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("AgentEngine LLM call failed: %s", e)
+            # One structured line, no traceback in the return value: `None`
+            # already means "no model could answer", and the loop reports that
+            # honestly rather than echoing an exception at the user.
+            safe_error(e, operation="llm.complete", component="agents.engine")
             return None
+
+    async def _run_batch(
+        self,
+        calls: List["ToolCall"],
+        approval: Optional[Callable[..., Any]],
+        bus: EventBus,
+        language: str,
+        audit: Optional[Dict[str, Any]] = None,
+    ) -> List[Any]:
+        """Run one round's tool calls, returning one outcome per call.
+
+        Two groups, one fold:
+
+        * a **run** of consecutive safe-tier calls executes concurrently under
+          :data:`PARALLEL_SAFE_TOOLS`, because they have no ordering
+          relationship with each other and reading three files should take one
+          file's worth of time;
+        * every confirm/dangerous call is a **barrier**: it runs alone, and
+          nothing written after it starts until it finishes.
+
+        The barrier rule is what keeps the fold honest. Results are returned
+        positionally, so `observations`, `tool_calls` and `failed_calls` are in
+        the order the model asked for. If a read were allowed to overtake the
+        `create_folder` that precedes it, the observation list would claim the
+        read happened after the folder existed while its own text said
+        "not found" — the model would then reason about an impossible sequence.
+
+        Outcomes are the registry's result dict, or a refusal **string** when
+        the caller's gate declined (kept distinct so the fold can tell
+        "declined" apart from "failed").
+        """
+        outcomes: List[Any] = [None] * len(calls)
+        budget = asyncio.Semaphore(PARALLEL_SAFE_TOOLS)
+        index = 0
+        while index < len(calls):
+            if self._needs_approval(calls[index]):
+                outcomes[index] = await self._run_one(
+                    calls[index], approval, bus, language, budget=None, audit=audit
+                )
+                index += 1
+                continue
+            end = index
+            while end < len(calls) and not self._needs_approval(calls[end]):
+                end += 1
+            group = calls[index:end]
+            if len(group) == 1:
+                outcomes[index] = await self._run_one(
+                    group[0], approval, bus, language, budget=budget, audit=audit
+                )
+            else:
+                # `gather` without `return_exceptions`: a child that raises
+                # must cancel its siblings rather than leave them running, and
+                # CancelledError (an interrupt) has to reach the caller. The
+                # failure path that matters here is handled inside `_run_one`.
+                outcomes[index:end] = list(
+                    await asyncio.gather(
+                        *[
+                            self._run_one(c, approval, bus, language, budget=budget, audit=audit)
+                            for c in group
+                        ]
+                    )
+                )
+            index = end
+        return outcomes
+
+    async def _run_one(
+        self,
+        call: "ToolCall",
+        approval: Optional[Callable[..., Any]],
+        bus: EventBus,
+        language: str,
+        budget: Optional[asyncio.Semaphore] = None,
+        audit: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Invoke one call: progress frames in, an outcome and metrics out.
+
+        Three things happen around the actual call, and none of them may
+        interfere with it:
+
+        * a **heartbeat** task emits ``tool_progress`` every
+          :data:`TOOL_HEARTBEAT_S` while the call is in flight, so a slow tool
+          reads as "still working" rather than as a frozen UI. It is cancelled
+          in the ``finally``, because a heartbeat that outlives its tool is a
+          permanent lie on the wire.
+        * the **start/finish frames** are emitted here rather than in the fold,
+          so concurrent siblings interleave honestly.
+        * **metrics** are recorded through :func:`tools.metrics.record_tool_call`,
+          which swallows its own failures: instrumentation must never be able
+          to fail the call it is measuring.
+        """
+
+        async def _body() -> Any:
+            started_at = time.perf_counter()
+            beat: Optional[asyncio.Task] = None
+            status = STATUS_FAILED
+            emitted = False
+            #: Bound before the try so the audit hook in `finally` can always
+            #: read it, including on the cancellation path.
+            outcome: Any = None
+            try:
+                await bus.tool_started(
+                    call.name, label=tool_label(call.name, language)
+                )
+                if self.metrics is not None:
+                    # Instrumentation must never fail the call it measures.
+                    try:
+                        self.metrics.begin(call.name)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                beat = asyncio.create_task(
+                    _heartbeat(call.name, bus, language), name=f"beat:{call.name}"
+                )
+                outcome: Any = await self._invoke(call, approval, bus, language)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - never escapes the batch
+                # `_invoke` should not raise (the registry turns tool failures
+                # into results), but if it ever does the user gets a structured
+                # failure instead of a dead turn. This branch also guarantees
+                # that a concurrent sibling can never take the batch down with
+                # it: `gather` is used without `return_exceptions`, so a child
+                # that raises would cancel the others.
+                outcome = {
+                    "success": False,
+                    "error": safe_error(
+                        exc, operation=call.name, component="agents.engine"
+                    ),
+                }
+
+            try:
+                if isinstance(outcome, str):
+                    status = STATUS_DECLINED
+                    await bus.tool_finished(call.name, False, summary=outcome)
+                elif outcome.get("success"):
+                    status = STATUS_OK
+                    await bus.tool_finished(
+                        call.name, True,
+                        summary=str(outcome.get("output") or "")[:200],
+                    )
+                elif outcome.get("timeout"):
+                    status = STATUS_TIMED_OUT
+                    await bus.tool_finished(
+                        call.name, False,
+                        summary=str(outcome.get("error") or "timed out")[:200],
+                    )
+                else:
+                    status = STATUS_FAILED
+                    await bus.tool_finished(
+                        call.name, False,
+                        summary=str(outcome.get("error") or "failed")[:200],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a display must not break a turn
+                pass
+            finally:
+                if beat is not None:
+                    beat.cancel()
+                    try:
+                        await beat
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                record_tool_call(
+                    self.metrics, call.name, status, elapsed_ms,
+                )
+                await self._audit_call(call, outcome, status, elapsed_ms, audit)
+            return outcome
+
+        if budget is None:
+            return await _body()
+        async with budget:
+            return await _body()
+
+    async def _audit_call(
+        self,
+        call: ToolCall,
+        outcome: Any,
+        status: str,
+        elapsed_ms: float,
+        context: Optional[Dict[str, Any]],
+    ) -> None:
+        """Write one execution record. Never raises, never blocks the turn.
+
+        The approval decision is *inferred* from the outcome rather than asked
+        of the gate: a refusal string means a human said no, and a result that
+        reports it reached execution means the prompt was answered. Guessing
+        beats threading the gate's private decision through the loop, and the
+        distinction that matters — asked-and-approved vs. declined — survives.
+        """
+        params = call.params or {}
+        data = outcome.get("data") if isinstance(outcome, dict) else None
+        approved: Optional[bool]
+        if isinstance(outcome, str):
+            approved = False                      # the gate declined
+        elif isinstance(data, dict) and data.get("requires_confirmation"):
+            approved = True                       # asked, and approved
+        else:
+            approved = None                       # ran without asking
+
+        try:
+            tier = self.registry.assessor.permission_for(call.name)
+        except Exception:  # noqa: BLE001 - auditing must not depend on this
+            tier = "unknown"
+
+        exit_code = data.get("exit_code") if isinstance(data, dict) else None
+        await audit_record(
+            tool=call.name,
+            trace_id=(context or {}).get("trace_id"),
+            user_request=(context or {}).get("user_request"),
+            command=params.get("command") or params.get("code"),
+            cwd=params.get("cwd") or params.get("working_directory"),
+            risk=tier,
+            approved=approved,
+            success=status == STATUS_OK,
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            duration_ms=elapsed_ms,
+            error=outcome.get("error") if isinstance(outcome, dict) else outcome,
+        )
 
     async def _invoke(
         self,
@@ -938,7 +1432,10 @@ class AgentEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("Approval callback failed for %s: %s", call.name, e)
+                safe_error(
+                    e, operation="approval", component="agents.engine",
+                    detail=f"for {call.name}",
+                )
                 decision = False
             if decision is not True:
                 reason = (
@@ -955,6 +1452,7 @@ class AgentEngine:
         except asyncio.TimeoutError:
             return {
                 "success": False,
+                "timeout": True,
                 "error": f"'{call.name}' did not finish within {TOOL_TIMEOUT_S}s.",
             }
 

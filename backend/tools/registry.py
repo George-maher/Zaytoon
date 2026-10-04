@@ -28,6 +28,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional
 
 from tools.base import BaseTool, ToolResult, ToolValidationError
+from common.reporting import safe_error
 from tools.sandbox import SecurityError
 from tools.safety import (
     PERMISSION_CONFIRM,
@@ -240,7 +241,15 @@ class ToolRegistry:
             return {"success": False, "error": str(e)}
         except Exception as e:  # a tool's own validate() misbehaving
             logger.warning("Tool %s validate() raised: %s", name, e)
-            return {"success": False, "error": f"Validation failed: {e}"}
+            # Increment A: an unexpected exception may carry a path, an argv
+            # or a token in its message. The client gets the type only.
+            return {
+                "success": False,
+                "error": safe_error(
+                    e, operation=f"{name}.validate", component="tools.registry"
+                ),
+                "data": {"exception": type(e).__name__},
+            }
 
         # 2. The gate. Tier comes from the tool declaration, so the label the
         #    user sees is the label the executor enforces.
@@ -289,7 +298,16 @@ class ToolRegistry:
             return {"success": False, "error": str(e), "blocked": True}
         except Exception as e:
             logger.exception("Tool %s raised during execution", name)
-            return {"success": False, "error": f"{tool.name()} failed: {e}"}
+            # Increment A: never echo an arbitrary exception to the client.
+            # `str(e)` here was the one place a traceback fragment, an absolute
+            # path or a command line could reach the transcript.
+            return {
+                "success": False,
+                "error": safe_error(
+                    e, operation=name, component="tools.registry"
+                ),
+                "data": {"exception": type(e).__name__},
+            }
 
         return self._render(result)
 
@@ -312,7 +330,10 @@ class ToolRegistry:
             return bool(await confirmation_manager.request(action, params))
         except Exception as e:
             # Fail closed: an error in the approval channel is a denial.
-            logger.error("Confirmation channel failed for %s: %s", action, e)
+            safe_error(
+                e, operation="confirmation.request", component="tools.registry",
+                detail=f"action={action}",
+            )
             return False
 
     @staticmethod
@@ -359,11 +380,6 @@ def _tier_rank(tier: str) -> int:
     return _TIER_ORDER.get(tier, 0)
 
 
-#: The tier names the registry groups by, kept here so callers do not import
-#: :mod:`tools.safety` just to label a group.
-DANGEROUS_TIER = PERMISSION_DANGEROUS
-
-
 def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegistry:
     """Construct a registry with every built-in tool registered.
 
@@ -376,14 +392,19 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
         coding,
         filesystem,
         git,
+        local_exec,
         media,
+        processes,
         system,
         terminal,
         web,
     )
 
     registry = ToolRegistry(assessor=assessor)
-    for module in (filesystem, terminal, applications, system, web, git, coding, media):
+    for module in (
+        filesystem, terminal, local_exec, processes, applications, system,
+        web, git, coding, media,
+    ):
         registry.register_all(module.build_tools())
     logger.info("Tool registry ready with %d tools: %s", len(registry), registry.list())
     return registry

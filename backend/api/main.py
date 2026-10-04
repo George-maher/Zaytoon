@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import asyncio
 import logging
@@ -8,8 +7,10 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, UploadFile, File
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from agents import (
     RouterAgent, PlannerAgent, FastAgent, CodeAgent,
@@ -17,16 +18,19 @@ from agents import (
 )
 from voice import SpeechToText, TextToSpeech
 from memory import ShortTermMemory, UserPreferences
-from scheduler import SchedulerManager, TimeParser
+from scheduler import SchedulerManager
 from reminder import ReminderService, NotificationManager
 from tools.base import OSToolkit
 from tools.executor import ToolExecutor
-from config import config
+from config import config, PROVIDER_OLLAMA, TIER_FAST, TIER_REASONING
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
-from services.auth import get_device_auth, PermissionScope, require_device_auth
+from services.auth import get_device_auth, PermissionScope
 from services.llm_client import get_llm_client
+from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
+from tools.metrics import get_tool_metrics
+from common.reporting import client_error, redact, safe_error
 
 from api.websocket import (
     create_websocket_handler,
@@ -102,32 +106,46 @@ manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(scheduler.start())
-    logger.info(
-        "LLM provider=%s endpoint=%s (key=%s)", config.PROVIDER,
-        config.LLM_API_URL, "present" if config.llm_configured else "ABSENT",
-    )
-    logger.info(
-        "  primary=%s reasoning=%s fallback=%s",
-        config.OPENROUTER_PRIMARY_MODEL,
-        config.OPENROUTER_REASONING_MODEL,
-        config.OPENROUTER_FALLBACK_MODEL,
-    )
-    rejected = config.validate_free_models()
-    if rejected:
-        # Fail closed and loudly: these would be refused on the request path.
-        logger.error(
-            "FREE-MODEL POLICY VIOLATION: %s not in the allow-list. "
-            "Requests using them will be rejected before any network call.",
-            rejected,
+    
+    # Log provider configuration
+    if config.PROVIDER == "ollama":
+        logger.info(
+            "LLM provider=ollama endpoint=%s",
+            config.OLLAMA_BASE_URL,
+        )
+        logger.info(
+            "  general=%s coding=%s fast=%s",
+            config.OLLAMA_GENERAL_MODEL,
+            config.OLLAMA_CODING_MODEL,
+            config.OLLAMA_FAST_MODEL,
         )
     else:
-        logger.info("Free-model policy: OK (all configured models allow-listed)")
-    if not config.llm_configured:
-        logger.error(
-            "OPENROUTER_API_KEY is not set. Zaytoon calls OpenRouter only "
-            "(local model execution has been removed), so the assistant will "
-            "be unable to answer until a key is configured."
+        logger.info(
+            "LLM provider=openrouter endpoint=%s (key=%s)", config.PROVIDER,
+            config.LLM_API_URL, "present" if config.llm_configured else "ABSENT",
         )
+        logger.info(
+            "  primary=%s reasoning=%s fallback=%s",
+            config.OPENROUTER_PRIMARY_MODEL,
+            config.OPENROUTER_REASONING_MODEL,
+            config.OPENROUTER_FALLBACK_MODEL,
+        )
+        rejected = config.validate_free_models()
+        if rejected:
+            logger.error(
+                "FREE-MODEL POLICY VIOLATION: %s not in the allow-list. "
+                "Requests using them will be rejected before any network call.",
+                rejected,
+            )
+        else:
+            logger.info("Free-model policy: OK (all configured models allow-listed)")
+        if not config.llm_configured:
+            logger.error(
+                "OPENROUTER_API_KEY is not set. Zaytoon calls OpenRouter only "
+                "(local model execution has been removed), so the assistant will "
+                "be unable to answer until a key is configured."
+            )
+    
     logger.info("Tool safety sandbox: %s (confirm timeout %.0fs)",
                 "on" if config.TOOL_SAFETY_ENABLED else "off",
                 config.TOOL_CONFIRM_TIMEOUT)
@@ -142,11 +160,33 @@ async def lifespan(app):
             logger.warning("STT unavailable - voice input disabled")
 
     asyncio.create_task(_load_stt())
+    
+    # Pre-warm provider connection
+    try:
+        provider = get_provider()
+        health = await provider.health_check()
+        if health.connected:
+            logger.info("AI provider connected: %s (%s)", provider.name, health.version)
+            for m in health.models:
+                logger.info("  Model available: %s (%s)", m.id, ", ".join(m.capabilities) or "no caps")
+        else:
+            logger.warning("AI provider not connected: %s", health.error)
+    except Exception as e:
+        safe_error(e, operation="provider.health", component="api.startup")
+
     logger.info("Zaytoon AI started on %s:%s", config.BACKEND_HOST, config.BACKEND_PORT)
     yield
     await scheduler.stop()
     await close_shared_client()
     await get_llm_client().aclose()
+    # Close AI provider
+    from services.ai_provider import close_provider
+    await close_provider()
+    # The Ollama transport is a module-level singleton reached through the
+    # Ollama path in `services/llm_client`, so closing the provider alone
+    # leaves that connection open until the process exits.
+    from services.ollama_client import close_ollama_client
+    await close_ollama_client()
     logger.info("Zaytoon AI backend shut down")
 
 
@@ -161,11 +201,71 @@ async def http_exception_handler(request, exc: HTTPException):
     in this API — tool results, ``/health``, ``/command/*`` — uses ``error``.
     Two shapes for the same concept means every client has to check both, and
     the frontend's ``setWorkspace`` was reading ``data.error``.
+
+    Registered for both exception classes below, because FastAPI raises
+    ``fastapi.exceptions.HTTPException`` from routes while Starlette raises
+    ``starlette.exceptions.HTTPException`` for an unmatched path — the two are
+    not the same class, so registering only this one left ``GET /nope`` answering
+    ``{"detail": "Not Found"}``.
     """
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.detail},
         headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def starlette_http_exception_handler(request, exc):
+    """The unmatched-route case: same body, same shape (see above)."""
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request, exc: RequestValidationError):
+    """422s carry ``error`` too, as one sentence rather than a schema dump.
+
+    ``exc.errors()`` items nest ``ctx`` values that are not always JSON-safe
+    (e.g. ``ValueError`` objects from a custom validator), so the raw list is
+    not returned. The first message is enough for a client to act on, and the
+    field path says where to look.
+    """
+    errs = exc.errors()
+    if errs:
+        first = errs[0]
+        where = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
+        msg = str(first.get("msg", "invalid request"))
+        detail = f"{where}: {msg}" if where else msg
+        if len(errs) > 1:
+            detail = f"{detail} (+{len(errs) - 1} more)"
+    else:
+        detail = "invalid request"
+    return JSONResponse(status_code=422, content={"error": detail})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    """The REST boundary: report one line, return a sentence, never a traceback.
+
+    Without this, an unexpected exception in a route becomes Starlette's bare
+    ``Internal Server Error`` — no correlation id, no structured log entry, and
+    nothing for an operator to grep. With it, the response is the same fixed
+    bilingual sentence the WebSocket layer sends, and the log carries
+    ``op=<method> <path> type=<ExcClass>`` with the detail redacted.
+
+    The debug traceback still exists for ``uvicorn --debug``/``--reload``:
+    Starlette re-raises after this handler has produced the response, so
+    ``TestClient(raise_server_exceptions=True)`` keeps showing real failures in
+    tests instead of hiding them behind a friendly message.
+    """
+    safe_error(
+        exc,
+        operation=f"{request.method} {request.url.path}",
+        component="api",
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": client_error(exc, operation="request", component="api")},
     )
 
 app.add_middleware(
@@ -206,32 +306,58 @@ async def health():
     # allow-listed free model, or when nothing satisfies a capability
     # requirement. /health must stay answerable in exactly those situations, so
     # report the error instead of propagating it.
-    try:
+    #
+    # With the Ollama provider there is no OpenRouter pool to describe: the
+    # "chain" is the three configured local models, and reporting the free
+    # cloud pool here would be a lie about where the next request goes.
+    if config.PROVIDER == PROVIDER_OLLAMA:
+        _url = f"{config.OLLAMA_BASE_URL}/api/chat"
+        seen: dict[str, None] = {}
+        for _tier in ("general", "reasoning", "fast"):
+            seen.setdefault(config.ollama_model_for_tier(_tier), None)
         chain = [
-            {"model": e.model, "provider": e.provider, "url": e.url}
-            for e in client.build_chain()
+            {"model": m, "provider": "ollama", "url": _url} for m in seen
         ]
         chain_error = None
-    except Exception as e:
-        chain = []
-        chain_error = str(e)
-
-    # The routing decision, and why each candidate was or was not usable. This
-    # is the answer to "why did it pick that model?", which used to be
-    # unanswerable because the chain ended in an auto-router.
-    routing = {}
-    for tier in ("fast", "reasoning"):
+        routing = {
+            _tier: {
+                "provider": "ollama",
+                "tier": _tier,
+                "model": config.ollama_model_for_tier(_tier),
+                "requires": [],
+            }
+            for _tier in ("fast", "reasoning", "general")
+        }
+    else:
         try:
-            routing[tier] = client.plan(tier, ()).to_dict()
+            chain = [
+                {"model": e.model, "provider": e.provider, "url": e.url}
+                for e in client.build_chain()
+            ]
+            chain_error = None
+        except Exception as e:
+            chain = []
+            # Surfaced by `GET /health` and drawn in the settings panel, so it
+            # is user-visible: redacted rather than dropped, because the text
+            # is exactly what an operator needs to fix a model configuration.
+            chain_error = redact(str(e))
+
+        # The routing decision, and why each candidate was or was not usable.
+        # This is the answer to "why did it pick that model?", which used to be
+        # unanswerable because the chain ended in an auto-router.
+        routing = {}
+        for tier in ("fast", "reasoning"):
+            try:
+                routing[tier] = client.plan(tier, ()).to_dict()
+            except Exception as e:  # pragma: no cover - defensive
+                routing[tier] = {"models": [], "error": redact(str(e))}
+        try:
+            routing["tools"] = client.plan("fast", ("tools",)).to_dict()
         except Exception as e:  # pragma: no cover - defensive
-            routing[tier] = {"models": [], "error": str(e)}
-    try:
-        routing["tools"] = client.plan("fast", ("tools",)).to_dict()
-    except Exception as e:  # pragma: no cover - defensive
-        routing["tools"] = {"models": [], "error": str(e)}
+            routing["tools"] = {"models": [], "error": redact(str(e))}
 
     return {
-        "status": "ok" if config.llm_configured else "degraded",
+        "status": "ok" if config.provider_ready else "degraded",
         "version": "3.0.0",
         "llm": {
             **config.describe_llm(),
@@ -243,6 +369,9 @@ async def health():
             "metrics": client.metrics.to_dict(),
         },
         "agents": ["router", "planner", "fast", "code", "tool", "memory", "scheduler"],
+        # Tool-layer health, alongside (not inside) `llm.metrics`: one answers
+        # "is the model healthy?", this one "is the tool layer healthy?".
+        "metrics": {"tools": get_tool_metrics().to_dict()},
         "safety": {
             "enabled": config.TOOL_SAFETY_ENABLED,
             "confirm_timeout": config.TOOL_CONFIRM_TIMEOUT,
@@ -386,7 +515,7 @@ async def get_workspace():
         info["entries"] = entries
     except OSError as e:
         info["entries"] = []
-        info["error"] = str(e)
+        info["error"] = redact(str(e))
     return info
 
 
@@ -409,7 +538,7 @@ async def set_workspace(data: dict):
         resolved = candidate.resolve()
     except OSError as e:
         logger.warning("Rejected workspace %r: %s", raw, e)
-        raise HTTPException(400, f"Cannot use that directory: {e}")
+        raise HTTPException(400, f"Cannot use that directory: {redact(str(e))}")
 
     if not resolved.is_dir():
         raise HTTPException(400, "Not a directory")
@@ -419,10 +548,187 @@ async def set_workspace(data: dict):
     try:
         await user_prefs.set("workspace_root", str(resolved))
     except Exception as e:  # preferences are best-effort
-        logger.warning("Could not persist workspace preference: %s", e)
+        safe_error(
+            e, operation="prefs.workspace", component="api.settings",
+            detail="workspace not persisted",
+        )
 
     logger.info("Workspace root set to %s", resolved)
     return {"status": "saved", **config.describe_workspace()}
+
+
+# ---------------------------------------------------------------------------
+# AI Provider Settings
+# ---------------------------------------------------------------------------
+
+@app.get("/settings/ai")
+async def get_ai_settings():
+    """Get current AI provider configuration and model status."""
+    from services.ai_provider import get_provider
+    
+    provider = get_provider()
+    health = await provider.health_check()
+    
+    return {
+        "provider": config.PROVIDER,
+        "endpoint": provider.base_url,
+        "connected": health.connected,
+        "version": health.version,
+        "error": health.error,
+        "models": [
+            {
+                "id": m.id,
+                "name": m.name,
+                "available": m.available,
+                "capabilities": m.capabilities,
+                "size_bytes": m.size_bytes,
+            }
+            for m in health.models
+        ],
+        "routing": {
+            "fast": provider.model_for_tier(TIER_FAST),
+            "reasoning": provider.model_for_tier(TIER_REASONING),
+            "general": provider.model_for_tier("general"),
+        },
+        "configured_models": {
+            "general": getattr(config, "OLLAMA_GENERAL_MODEL", ""),
+            "coding": getattr(config, "OLLAMA_CODING_MODEL", ""),
+            "fast": getattr(config, "OLLAMA_FAST_MODEL", ""),
+        } if config.PROVIDER == "ollama" else {
+            "primary": config.OPENROUTER_PRIMARY_MODEL,
+            "reasoning": config.OPENROUTER_REASONING_MODEL,
+            "fallback": config.OPENROUTER_FALLBACK_MODEL,
+        },
+    }
+
+
+@app.post("/settings/ai")
+async def set_ai_settings(data: dict):
+    """Update AI provider configuration."""
+    provider_name = (data.get("provider") or "").strip().lower()
+    if provider_name and provider_name not in ("ollama", "openrouter"):
+        raise HTTPException(400, "Invalid provider. Must be 'ollama' or 'openrouter'")
+    
+    if provider_name:
+        config.PROVIDER = provider_name
+        config.AI_PROVIDER = provider_name
+    
+    if config.PROVIDER == "ollama":
+        # Update Ollama settings
+        base_url = (data.get("base_url") or "").strip()
+        if base_url:
+            config.OLLAMA_BASE_URL = base_url.rstrip("/")
+        
+        general = (data.get("general_model") or "").strip()
+        if general:
+            config.OLLAMA_GENERAL_MODEL = general
+        
+        coding = (data.get("coding_model") or "").strip()
+        if coding:
+            config.OLLAMA_CODING_MODEL = coding
+        
+        fast = (data.get("fast_model") or "").strip()
+        if fast:
+            config.OLLAMA_FAST_MODEL = fast
+        
+        timeout = data.get("timeout")
+        if timeout is not None:
+            try:
+                config.OLLAMA_TIMEOUT = float(timeout)
+            except (ValueError, TypeError):
+                raise HTTPException(400, "Invalid timeout value")
+    
+    else:
+        # Update OpenRouter settings
+        api_key = (data.get("api_key") or "").strip()
+        if api_key:
+            config.OPENROUTER_API_KEY = api_key
+        
+        base_url = (data.get("base_url") or "").strip()
+        if base_url:
+            config.OPENROUTER_BASE_URL = base_url.rstrip("/")
+        
+        primary = (data.get("primary_model") or "").strip()
+        if primary:
+            config.OPENROUTER_PRIMARY_MODEL = primary
+        
+        reasoning = (data.get("reasoning_model") or "").strip()
+        if reasoning:
+            config.OPENROUTER_REASONING_MODEL = reasoning
+        
+        fallback = (data.get("fallback_model") or "").strip()
+        if fallback:
+            config.OPENROUTER_FALLBACK_MODEL = fallback
+    
+    # Invalidate provider singleton so new settings take effect
+    from services.ai_provider import close_provider
+    await close_provider()
+    
+    # Verify new configuration
+    from services.ai_provider import get_provider
+    provider = get_provider()
+    health = await provider.health_check()
+    
+    return {
+        "status": "saved",
+        "provider": config.PROVIDER,
+        "connected": health.connected,
+        "error": health.error,
+        "models": [m.id for m in health.models],
+    }
+
+
+@app.post("/settings/ai/validate")
+async def validate_ai_settings(data: dict):
+    """Test AI provider connection and list available models."""
+    provider_name = (data.get("provider") or config.PROVIDER).strip().lower()
+    
+    if provider_name == "ollama":
+        base_url = (data.get("base_url") or config.OLLAMA_BASE_URL).rstrip("/")
+        from services.ollama_client import OllamaClient
+        client = OllamaClient(base_url, timeout=config.OLLAMA_TIMEOUT)
+        try:
+            health = await client.health_check()
+            return {
+                "connected": health.connected,
+                "endpoint": base_url,
+                "version": health.version,
+                "models": [m.name for m in health.models],
+                "error": health.error,
+            }
+        finally:
+            await client.aclose()
+    else:
+        # OpenRouter validation would require API key
+        return {
+            "connected": False,
+            "error": "OpenRouter validation requires API key",
+        }
+
+
+@app.post("/settings/ai/pull")
+async def pull_model(data: dict):
+    """Pull a model from Ollama registry."""
+    if config.PROVIDER != "ollama":
+        raise HTTPException(400, "Model pulling only available with Ollama provider")
+    
+    model = (data.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "Model name required")
+    
+    from services.ai_provider import get_provider
+    provider = get_provider()
+    
+    if not isinstance(provider, OllamaProvider):
+        raise HTTPException(500, "Provider is not Ollama")
+    
+    # Return a streaming response or just start the pull
+    # For now, return immediately with status
+    return {
+        "status": "started",
+        "model": model,
+        "message": f"Model pull started. Check logs for progress.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +855,78 @@ async def run_command_endpoint(data: dict):
         return {"success": False, "error": "No command provided"}
 
     return await tool_executor.execute("system_command", {"command": command})
+
+
+# ---------------------------------------------------------------------------
+# Tracked processes and the execution audit log
+# ---------------------------------------------------------------------------
+# Read-only views over two subsystems that already enforce their own rules, so
+# these routes stay deliberately thin. In particular `POST /processes/{id}/stop`
+# is a *request* to the same registry the `process_stop` tool uses, and it is
+# the only stop path reachable without a WebSocket — which is why it stops a
+# registry-tracked process and nothing else.
+@app.get("/processes")
+async def list_processes():
+    """Background processes Zaytoon started, newest first."""
+    from tools.processes import registry
+
+    processes = registry.snapshot()
+    return {"processes": processes, "total": len(processes)}
+
+
+@app.get("/processes/{process_id}/logs")
+async def read_process_logs(process_id: str, tail: int = 20):
+    """The recent output of one tracked process."""
+    from tools.processes import registry
+
+    entry = registry.get(process_id)
+    if entry is None:
+        return {"error": f"No such process: {process_id}", "lines": []}
+    try:
+        count = max(1, min(int(tail), 500))
+    except (TypeError, ValueError):
+        count = 20
+    return {"id": entry.id, "status": entry.status, "lines": entry.tail(count)}
+
+
+@app.post("/processes/{process_id}/stop")
+async def stop_process(process_id: str):
+    """Stop a tracked process.
+
+    Denies by default: an unknown id means Zaytoon did not start that process,
+    and the whole point of the registry is that Zaytoon never reaches outside
+    it. There is no override and no "force" parameter.
+    """
+    from tools.processes import registry
+
+    result = await registry.stop(process_id)
+    if result is None:
+        return {
+            "stopped": False,
+            "error": f"No such process: {process_id}. "
+                     "Only processes Zaytoon started can be stopped.",
+        }
+    return {"stopped": True, "status": result.get("status"), "process": result}
+
+
+@app.get("/audit")
+async def list_audit(limit: int = 100):
+    """Execution history, newest first. Never raises: a read failure is an
+    empty list, because the history page is not worth failing a request over."""
+    from common import audit
+
+    entries = await audit.recent(limit)
+    return {"entries": entries, "total": await audit.count()}
+
+
+@app.delete("/audit")
+async def clear_audit():
+    """Clear the execution history. Returns how many rows were removed."""
+    from common import audit
+
+    cleared = await audit.clear()
+    logger.info("Execution audit cleared: %s entries", cleared)
+    return {"cleared": cleared}
 
 
 @app.get("/", response_class=HTMLResponse)

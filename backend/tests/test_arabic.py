@@ -1,4 +1,3 @@
-import pytest
 from arabic import (
     detect_language,
     is_egyptian,

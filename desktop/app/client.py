@@ -39,6 +39,15 @@ RECONNECT_MIN = 1.0
 RECONNECT_MAX = 15.0
 
 
+def _content_hash(text: str) -> str:
+    """Simple hash for content deduplication."""
+    h = 0
+    for ch in text.strip().lower():
+        h = ((h << 5) - h) + ord(ch)
+        h &= 0xFFFFFFFF
+    return f"{h:x}"
+
+
 class BackendClient:
     """Maintains one WebSocket connection to the backend and pumps events."""
 
@@ -54,6 +63,10 @@ class BackendClient:
         #: The response id of the request currently streaming, so a late frame
         #: from a cancelled turn can be discarded.
         self._active_response: str | None = None
+        #: The trace id of the current logical request, for correlation.
+        self._active_trace: str | None = None
+        #: Content hashes of rendered messages for deduplication fallback.
+        self._rendered_hashes: set[str] = set()
 
     # -- state ------------------------------------------------------------
     @property
@@ -150,13 +163,48 @@ class BackendClient:
         if event is None:
             logger.debug("ignoring unparseable frame")
             return
-        if event.type is protocol.EventType.TOKEN:
-            response_id = event.data.get("response_id")
-            if response_id and self._active_response and response_id != self._active_response:
-                # A stale stream from a turn the user already interrupted.
+        
+        # Track trace_id for correlation
+        trace_id = event.trace_id
+        if trace_id:
+            self._active_trace = trace_id
+        
+        # Stale frame filtering for ALL frame types (not just TOKEN)
+        # A frame is stale if it belongs to a different response_id or trace_id
+        # than the currently active one.
+        response_id = event.response_id
+        is_final = event.is_final
+        
+        if response_id and self._active_response and response_id != self._active_response:
+            # Different response_id: could be a late frame from a cancelled turn
+            logger.debug("discarding stale frame type=%s response_id=%s (active=%s)",
+                        event.type.value, response_id, self._active_response)
+            return
+        
+        if trace_id and self._active_trace and trace_id != self._active_trace:
+            # Different trace_id: definitely a stale frame from a previous turn
+            logger.debug("discarding stale frame type=%s trace_id=%s (active=%s)",
+                        event.type.value, trace_id, self._active_trace)
+            return
+        
+        # Content-hash deduplication for final messages
+        if is_final and event.text:
+            content_hash = _content_hash(event.text)
+            if content_hash in self._rendered_hashes:
+                logger.debug("discarding duplicate message (content hash match): %s", content_hash)
                 return
-        if event.type in (protocol.EventType.MESSAGE, protocol.EventType.ERROR):
+            self._rendered_hashes.add(content_hash)
+            # Limit the set size
+            if len(self._rendered_hashes) > 500:
+                # Keep only recent half
+                self._rendered_hashes = set(list(self._rendered_hashes)[-250:])
+        
+        # Update active response tracking
+        if is_final:
             self._active_response = None
+        elif response_id:
+            self._active_response = response_id
+        
         self.events.put(event)
 
     # -- sending ----------------------------------------------------------
@@ -190,6 +238,9 @@ class BackendClient:
 
     def interrupt(self) -> bool:
         self._active_response = None
+        self._active_trace = None
+        # Clear rendered hashes on interrupt so a new response can be rendered
+        self._rendered_hashes.clear()
         return self.send(protocol.interrupt_message())
 
     def respond_to_confirmation(self, request_id: str, approved: bool) -> bool:

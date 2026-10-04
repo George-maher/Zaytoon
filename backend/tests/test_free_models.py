@@ -19,7 +19,7 @@ from config import (
     is_allowed_model,
     is_free_model,
 )
-from services.llm_client import LLMClient, LLMError, ProviderEndpoint, get_llm_client
+from services.llm_client import LLMClient, LLMError, ProviderEndpoint
 from services.model_registry import (
     MODEL_REGISTRY,
     is_free_router,
@@ -172,13 +172,19 @@ class TestEndpointGuard:
                 provider=PROVIDER_OPENROUTER, model=model, url="http://x", headers={}
             )
 
-    def test_no_local_provider_exists(self):
-        """Local model execution has been removed from the codebase."""
+    def test_local_provider_exists_but_legacy_endpoints_do_not(self):
+        """Local execution is back, but only behind the provider abstraction.
+
+        The free-model gates below still apply to every OpenRouter request:
+        adding Ollama must not have loosened them, so the old un-abstracted
+        Ollama endpoint attributes must stay gone.
+        """
         import config as config_module
 
-        assert not hasattr(config_module, "PROVIDER_OLLAMA")
-        for attr in ("OLLAMA_BASE_URL", "OLLAMA_MODEL", "OLLAMA_FALLBACK_MODEL"):
-            assert not hasattr(config, attr), attr
+        assert config_module.PROVIDER_OLLAMA in config_module.VALID_PROVIDERS
+        for attr in ("OLLAMA_MODEL", "OLLAMA_FALLBACK_MODEL"):
+            assert not hasattr(config_module, attr), attr
+        from services.ai_provider import AIProvider  # noqa: F401
 
     def test_free_but_unlisted_model_is_refused(self):
         """The allow-list is stricter than the ':free' shape check."""

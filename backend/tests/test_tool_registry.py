@@ -18,8 +18,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import sandbox  # noqa: E402
-from tools.base import ToolResult, ToolValidationError  # noqa: E402
-from tools.registry import ToolRegistry, build_default_registry  # noqa: E402
+from tools.base import ToolResult  # noqa: E402
+from tools.registry import build_default_registry  # noqa: E402
 from tools.safety import PERMISSION_CONFIRM, PERMISSION_DANGEROUS, PERMISSION_SAFE  # noqa: E402
 
 

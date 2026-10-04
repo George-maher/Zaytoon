@@ -1,4 +1,3 @@
-import pytest
 from datetime import datetime
 from reminder.models import (
     ReminderData, ReminderStatus, RecurrenceType,

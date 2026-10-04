@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *.db
+# SQLite sidecar files: without these the journal mode looks absent
+# and a stale WAL is committed on every run.
+*.db-wal
+*.db-shm
 *.sqlite3
 .env
 venv/

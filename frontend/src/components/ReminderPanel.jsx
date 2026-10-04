@@ -28,17 +28,29 @@ function ReminderPanel({ reminders, onRefresh, onDelete, onDone, language }) {
 
   const trigger = (
     <button onClick={() => setOpen((v) => !v)}
-      className="relative text-[9px] px-2 py-1 rounded-sm font-display font-bold tracking-wider transition-all"
+      className="relative font-display font-bold tracking-wider transition-all"
       style={{
-        background: open ? "rgba(0, 212, 255, 0.08)" : count > 0 ? "rgba(0, 212, 255, 0.05)" : "transparent",
-        color: count > 0 ? "#00D4FF" : "var(--text-muted)",
-        border: `1px solid ${open ? "rgba(0, 212, 255, 0.25)" : count > 0 ? "rgba(0, 212, 255, 0.12)" : "var(--border-color)"}`,
+        fontSize: "var(--font-sm)",
+        padding: "var(--space-1) var(--space-3)",
+        background: open ? "color-mix(in srgb, var(--hud-cyan) 8%, transparent)" : count > 0 ? "color-mix(in srgb, var(--hud-cyan) 5%, transparent)" : "transparent",
+        color: count > 0 ? "var(--hud-cyan)" : "var(--text-muted)",
+        border: `var(--border-w) solid ${open ? "color-mix(in srgb, var(--hud-cyan) 25%, transparent)" : count > 0 ? "color-mix(in srgb, var(--hud-cyan) 12%, transparent)" : "var(--border-color)"}`,
+        borderRadius: "var(--radius-sm)",
       }}
     >
       {ar ? "مهام" : "TASKS"}
       {count > 0 && (
-        <span className="absolute -top-1.5 -right-1.5 w-3.5 h-3.5 rounded-full text-[7px] flex items-center justify-center font-bold"
-          style={{ background: "#00D4FF", color: "#050508" }}
+        <span className="absolute font-bold flex items-center justify-center"
+          style={{
+            top: -4,
+            insetInlineEnd: -4,
+            width: 14,
+            height: 14,
+            fontSize: "var(--font-xs)",
+            borderRadius: "50%",
+            background: "var(--hud-cyan)",
+            color: "var(--bg0)", // dark glyph on the bright cyan dot: contrast, not decoration
+          }}
         >{count > 9 ? "9+" : count}</span>
       )}
     </button>
@@ -50,45 +62,53 @@ function ReminderPanel({ reminders, onRefresh, onDelete, onDone, language }) {
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div ref={panelRef} className="fixed right-3 top-12 z-50 w-80 max-h-[60vh] rounded-sm overflow-hidden animate-fade-in"
+          <div ref={panelRef} className="fixed z-50 overflow-hidden animate-fade-in"
             style={{
-              background: "rgba(5, 5, 12, 0.95)",
-              border: "1px solid rgba(0, 212, 255, 0.15)",
+              insetInlineEnd: "var(--space-4)",
+              top: "var(--header-h)",
+              width: "20rem",
+              maxHeight: "55vh",
+              background: "var(--surface-2)",
+              border: "var(--border-w) solid color-mix(in srgb, var(--hud-cyan) 15%, transparent)",
+              borderRadius: "var(--radius-sm)",
               backdropFilter: "blur(20px)",
-              boxShadow: "0 8px 40px rgba(0,0,0,0.6), 0 0 30px rgba(0,212,255,0.05)",
+              boxShadow: "0 8px 40px rgba(0,0,0,0.6), 0 0 24px color-mix(in srgb, var(--hud-cyan) 5%, transparent)",
             }}
           >
-            <div className="flex items-center justify-between px-3 py-2 border-b" style={{ borderColor: "rgba(0, 212, 255, 0.1)" }}>
-              <span className="text-[10px] font-display font-bold tracking-wider" style={{ color: "#00D4FF" }}>
+            <div className="flex items-center justify-between" style={{ padding: "var(--space-2) var(--space-3)", borderBottom: "var(--border-w) solid color-mix(in srgb, var(--hud-cyan) 10%, transparent)" }}>
+              <span className="font-display font-bold tracking-wider" style={{ fontSize: "var(--font-sm)", color: "var(--hud-cyan)" }}>
                 {ar ? "المهام" : "REMINDERS"}
-                {count > 0 && <span className="ml-1 font-mono" style={{ color: "var(--text-muted)" }}>({count})</span>}
+                {count > 0 && <span className="font-mono" style={{ marginLeft: "var(--space-1)", color: "var(--text-muted)" }}>({count})</span>}
               </span>
-              <div className="flex gap-1">
+              <div className="flex" style={{ gap: "var(--space-1)" }}>
                 <button onClick={onRefresh}
-                  className="text-[8px] px-1.5 py-0.5 rounded-sm font-mono transition-all"
+                  className="font-mono transition-all"
                   style={{
-                    background: "rgba(0, 212, 255, 0.06)",
-                    color: "#00D4FF",
-                    border: "1px solid rgba(0, 212, 255, 0.12)",
+                    fontSize: "var(--font-xs)",
+                    padding: "var(--space-1) var(--space-2)",
+                    background: "color-mix(in srgb, var(--hud-cyan) 6%, transparent)",
+                    color: "var(--hud-cyan)",
+                    border: "var(--border-w) solid color-mix(in srgb, var(--hud-cyan) 12%, transparent)",
+                    borderRadius: "var(--radius-sm)",
                   }}
                 >{ar ? "تحديث" : "REFRESH"}</button>
                 <button onClick={() => setOpen(false)}
-                  className="text-[8px] px-1.5 py-0.5 rounded-sm font-mono transition-all"
-                  style={{ color: "var(--text-muted)" }}
+                  className="font-mono transition-all"
+                  style={{ fontSize: "var(--font-xs)", padding: "var(--space-1) var(--space-2)", color: "var(--text-muted)" }}
                 >{ar ? "إغلاق" : "CLOSE"}</button>
               </div>
             </div>
 
-            <div className="overflow-y-auto max-h-[calc(60vh-36px)]">
+            <div className="overflow-y-auto" style={{ maxHeight: "calc(55vh - 34px)" }}>
               {count === 0 ? (
-                <div className="flex flex-col items-center justify-center py-8 px-4 text-center">
-                  <span className="text-lg mb-1 font-mono" style={{ color: "var(--text-muted)" }}>📋</span>
-                  <p className="text-[10px] font-mono" style={{ color: "var(--text-muted)" }}>
+                <div className="flex flex-col items-center justify-center text-center" style={{ padding: "var(--space-6) var(--space-5)" }}>
+                  <span className="mb-1 font-mono" style={{ fontSize: "var(--font-md)", color: "var(--text-muted)" }}>📋</span>
+                  <p className="font-mono" style={{ fontSize: "var(--font-sm)", color: "var(--text-muted)" }}>
                     {ar ? "لا توجد مهام" : "No pending reminders."}
                   </p>
                 </div>
               ) : (
-                <div className="space-y-0.5 p-1">
+                <div className="flex flex-col" style={{ gap: "var(--space-1)", padding: "var(--space-1)" }}>
                   {reminders.map((r) => {
                     const rid = r.reminder_id || r.id;
                     const task = r.task || r.title || "?";
@@ -97,29 +117,29 @@ function ReminderPanel({ reminders, onRefresh, onDelete, onDone, language }) {
                       ? (ar ? { daily: "يومي", weekly: "أسبوعي", monthly: "شهري" }[r.recurring] || r.recurring : r.recurring)
                       : null;
                     return (
-                      <div key={rid} className="flex items-start gap-1.5 px-2 py-1.5 rounded-sm transition-all"
-                        style={{ background: "rgba(0, 212, 255, 0.02)", border: "1px solid rgba(0, 212, 255, 0.06)" }}
+                      <div key={rid} className="flex items-start transition-all"
+                        style={{ gap: "var(--space-2)", padding: "var(--space-2) var(--space-3)", background: "color-mix(in srgb, var(--hud-cyan) 2%, transparent)", border: "1px solid color-mix(in srgb, var(--hud-cyan) 6%, transparent)", borderRadius: "var(--radius-sm)" }}
                         dir={isArabic(task) ? "rtl" : "ltr"}
                       >
                         <div className="flex-1 min-w-0">
-                          <p className="text-[9px] font-mono leading-relaxed truncate">{task}</p>
-                          <div className="flex items-center gap-1.5 mt-0.5">
-                            <span className="text-[7px] font-mono" style={{ color: "rgba(0, 212, 255, 0.6)" }}>{time}</span>
+                          <p className="font-mono" style={{ fontSize: "var(--font-sm)", lineHeight: 1.45, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task}</p>
+                          <div className="flex items-center" style={{ gap: "var(--space-2)", marginTop: "var(--space-1)" }}>
+                            <span className="font-mono" style={{ fontSize: "var(--font-xs)", color: "color-mix(in srgb, var(--hud-cyan) 60%, transparent)" }}>{time}</span>
                             {rec && (
-                              <span className="text-[6px] font-mono px-1 rounded-sm"
-                                style={{ background: "rgba(0, 212, 255, 0.06)", color: "#00D4FF" }}
+                              <span className="font-mono"
+                                style={{ fontSize: "var(--font-xs)", padding: "0 var(--space-1)", background: "color-mix(in srgb, var(--hud-cyan) 6%, transparent)", color: "var(--hud-cyan)", borderRadius: "var(--radius-sm)" }}
                               >{rec}</span>
                             )}
                           </div>
                         </div>
-                        <div className="flex gap-0.5 flex-shrink-0">
+                        <div className="flex flex-shrink-0" style={{ gap: "var(--space-1)" }}>
                           <button onClick={() => onDone(rid)}
-                            className="text-[7px] px-1 py-0.5 rounded-sm font-mono transition-all"
-                            style={{ color: "#00FF88", border: "1px solid rgba(0, 255, 136, 0.15)" }}
+                            className="font-mono transition-all"
+                            style={{ fontSize: "var(--font-xs)", padding: "var(--space-1)", color: "var(--hud-green)", border: "1px solid color-mix(in srgb, var(--hud-green) 15%, transparent)" }}
                           >✓</button>
                           <button onClick={() => onDelete(rid)}
-                            className="text-[7px] px-1 py-0.5 rounded-sm font-mono transition-all"
-                            style={{ color: "#FF3355", border: "1px solid rgba(255, 51, 85, 0.15)" }}
+                            className="font-mono transition-all"
+                            style={{ fontSize: "var(--font-xs)", padding: "var(--space-1)", color: "var(--hud-red)", border: "1px solid color-mix(in srgb, var(--hud-red) 15%, transparent)" }}
                           >✕</button>
                         </div>
                       </div>

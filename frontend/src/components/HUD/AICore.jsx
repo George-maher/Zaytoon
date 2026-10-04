@@ -74,6 +74,15 @@ function WaveformBand({ active }) {
 
   useEffect(() => {
     if (!active) return undefined;
+    // The stylesheet can freeze CSS animations under reduced motion, but this
+    // is a rAF loop pushing React state every frame — it has to police itself.
+    // The bars keep their active shape and colour; only the per-frame motion
+    // stops, which is exactly what `prefers-reduced-motion` asks for.
+    const reduced =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduced) return undefined;
     let stop = false;
     const tick = () => {
       if (stop) return;
@@ -153,14 +162,15 @@ function AICore({ state = "idle", size = 300, language = "en", speakingVoice = n
 
       {/* Identity disc. Flat fill plus a lit edge — no blur. */}
       <div
-        className="absolute flex flex-col items-center justify-center gap-1"
+        className="absolute flex flex-col items-center justify-center"
         style={{
+          gap: "var(--space-2)",
           width: inner,
           height: inner,
           borderRadius: "50%",
-          background: "rgba(3, 7, 13, 0.82)",
-          border: `1px solid var(--state-color)`,
-          boxShadow: `0 0 26px var(--state-glow), inset 0 0 30px rgba(0,229,255,0.05)`,
+          background: "color-mix(in srgb, var(--bg0) 82%, transparent)",
+          border: `var(--border-w) solid var(--state-color)`,
+          boxShadow: `0 0 22px var(--state-glow), inset 0 0 26px color-mix(in srgb, var(--hud-cyan) 4%, transparent)`,
         }}
       >
         <span
@@ -176,7 +186,7 @@ function AICore({ state = "idle", size = 300, language = "en", speakingVoice = n
           <span aria-hidden="true">{s.glyph}</span>
           <span className="ml-1.5">{s.word}</span>
         </span>
-        <span className="hud-micro" style={{ opacity: 0.5, fontSize: 7 }}>
+        <span className="hud-micro" style={{ opacity: 0.5, fontSize: "var(--font-xs)" }}>
           {language === "ar" ? s.ar : s.en.toUpperCase()}
         </span>
       </div>

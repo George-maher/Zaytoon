@@ -13,10 +13,15 @@ function StatusIndicator({ state, language = "en", word, compact = false, classN
   const label = word || (language === "ar" ? s.ar : s.en);
   return (
     <span
-      className={`inline-flex items-center gap-2 ${className}`}
-      style={hueVars(s.hue)}
+      className={`inline-flex items-center ${className}`}
+      style={{ gap: "var(--space-2)", ...hueVars(s.hue) }}
       role="status"
-      aria-live="polite"
+      /* One announcer per screen, and it is not this one: the console's
+         status line (components/StatusLine) already announces the derived
+         sentence for every state this word mirrors. Two polite regions
+         updating together would read the same moment out loud twice.
+         The word stays as readable static text for anyone navigating to it. */
+      aria-live="off"
     >
       <span
         className={`hud-led${s.pulse ? " hud-led--pulse" : ""}${state === "idle" ? " hud-led--hollow" : ""}`}

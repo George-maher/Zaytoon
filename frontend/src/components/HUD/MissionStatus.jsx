@@ -58,10 +58,10 @@ function MissionStatus({
       />
       {(awaitingCommand || pendingConfirmation) && (
         <>
-          <div className="hud-rule my-1" />
+          <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
           <p
             className="font-mono"
-            style={{ fontSize: 9, color: "var(--hud-amber)", lineHeight: 1.5 }}
+            style={{ fontSize: "var(--font-sm)", color: "var(--hud-amber)", lineHeight: 1.45 }}
           >
             {pendingConfirmation
               ? (ar ? "في انتظار موافقتك" : "AWAITING HUMAN APPROVAL")

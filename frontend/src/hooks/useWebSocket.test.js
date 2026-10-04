@@ -109,9 +109,35 @@ describe('outbound frames', () => {
   it('sends a chat message', async () => {
     const { result, socket } = await mount()
     act(() => result.current.sendMessage('hello there'))
-    expect(socket.sentOfType('message')).toEqual([
-      { type: 'message', message: 'hello there' },
-    ])
+    // Assert the fields that define the frame rather than its exact shape:
+    // the frame also carries `client_msg_id` (below), and pinning the whole
+    // object would make every optional field a breaking change.
+    expect(socket.sentOfType('message')).toHaveLength(1)
+    expect(socket.sentOfType('message')[0]).toMatchObject({
+      type: 'message',
+      message: 'hello there',
+    })
+  })
+
+  it('stamps every message frame with a fresh client_msg_id', async () => {
+    // The backend dedupes retried sends on this id (double Enter, a replay
+    // after a flaky reconnect), so it must be present, unique per send, and
+    // stable in shape across sends.
+    const { result, socket } = await mount()
+
+    act(() => result.current.sendMessage('first'))
+    const first = socket.sentOfType('message')[0]
+    expect(typeof first.client_msg_id).toBe('string')
+    expect(first.client_msg_id.length).toBeGreaterThanOrEqual(16)
+
+    // Release the processing latch the way the backend does, then send again.
+    act(() => socket.emit({ type: 'interrupted' }))
+    act(() => result.current.sendMessage('second'))
+
+    const frames = socket.sentOfType('message')
+    expect(frames).toHaveLength(2)
+    expect(frames[1].client_msg_id).not.toBe(frames[0].client_msg_id)
+    expect(frames.map((f) => f.message)).toEqual(['first', 'second'])
   })
 
   it('refuses to send while disconnected rather than dropping silently', async () => {
@@ -449,5 +475,79 @@ describe('robustness', () => {
     act(() => socket.emit({ type: 'interrupted' }))
     expect(result.current.isTyping).toBe(false)
     expect(result.current.isSpeaking).toBe(false)
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+describe('stop control', () => {
+  // The STOP button used to call `stopAudio` alone: it flipped the flags but
+  // never sent `interrupt` (the backend kept generating), and the Audio
+  // element was a local variable inside audio_end (playback kept talking).
+  // These tests pin all three halves of that bug.
+
+  it('requestStop sends the interrupt frame to the backend', async () => {
+    const { result, socket } = await mount()
+    act(() => result.current.requestStop())
+    expect(socket.sentOfType('interrupt')).toEqual([{ type: 'interrupt' }])
+  })
+
+  it('requestStop does not throw when the socket is closed', async () => {
+    const { result, socket } = await mount()
+    socket.readyState = 3
+    expect(() => act(() => result.current.requestStop())).not.toThrow()
+    expect(socket.sentOfType('interrupt')).toHaveLength(0)
+  })
+
+  it('clears the processing latch so the next message can be sent', async () => {
+    const { result, socket } = await mount()
+    act(() => result.current.sendMessage('what time is it'))
+    // Latched while the backend works: a second send is refused.
+    act(() => result.current.sendMessage('and again'))
+    expect(socket.sentOfType('message')).toHaveLength(1)
+
+    act(() => result.current.requestStop())
+    expect(result.current.isTyping).toBe(false)
+
+    act(() => result.current.sendMessage('after stop'))
+    expect(socket.sentOfType('message')).toHaveLength(2)
+  })
+
+  it('stopAudio pauses the playing utterance and revokes its blob', async () => {
+    const { result, socket } = await mount()
+    const players = []
+    class FakeAudio {
+      constructor(url) {
+        this.url = url
+        this.paused = true
+        this.onended = null
+        this.onerror = null
+        players.push(this)
+      }
+      play() { this.paused = false; return Promise.resolve() }
+      pause() { this.paused = true }
+    }
+    vi.stubGlobal('Audio', FakeAudio)
+    const prevCreate = URL.createObjectURL
+    const prevRevoke = URL.revokeObjectURL
+    URL.createObjectURL = vi.fn(() => 'blob:utt')
+    URL.revokeObjectURL = vi.fn()
+    try {
+      act(() => socket.emit({ type: 'audio_start', language: 'en', voice: 'v', format: 'mpeg' }))
+      act(() => socket.emit({ type: 'audio_chunk', data: btoa('MP3DATA') }))
+      act(() => socket.emit({ type: 'audio_end' }))
+
+      expect(players).toHaveLength(1)
+      expect(result.current.isSpeaking).toBe(true)
+
+      act(() => result.current.stopAudio())
+
+      expect(players[0].paused).toBe(true)
+      expect(result.current.isSpeaking).toBe(false)
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:utt')
+    } finally {
+      URL.createObjectURL = prevCreate
+      URL.revokeObjectURL = prevRevoke
+    }
   })
 })

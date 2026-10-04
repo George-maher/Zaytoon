@@ -29,8 +29,3 @@ ANTI_HALLUCINATION_AR = """\
 - ممنوع تقول إنك عملت حاجة. إنت بتقترح بس؛ التنفيذ بيحصل في طبقة الأدوات،
   وأي عملية تدميرية لازم تأخذ موافقة المستخدم.
 - جواب قصير وصادق أحسن من جواب طويل ومغلوط."""
-
-
-def grounding_guard(lang: str = "en") -> str:
-    """Return the anti-hallucination block for a language."""
-    return ANTI_HALLUCINATION_AR if lang == "ar" else ANTI_HALLUCINATION_EN

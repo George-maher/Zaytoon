@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 from .models import ReminderData, ReminderStatus, RecurrenceType, detect_recurrence, RECURRENCE_DELTAS

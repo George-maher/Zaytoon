@@ -1,7 +1,6 @@
 """
 Sanity check: verify all new modules can be imported without errors.
 """
-import pytest
 
 
 def test_import_reminder_models():

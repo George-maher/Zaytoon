@@ -1,4 +1,3 @@
-import pytest
 from voice.tts import TextToSpeech
 
 
