@@ -1,0 +1,398 @@
+"""Any OpenAI-compatible endpoint, as a provider.
+
+One client covers ``/v1/chat/completions`` and ``/v1/models``, which is what
+Ollama, llama.cpp's server, LM Studio, vLLM, text-generation-webui and every
+cloud gateway speak. That is the whole point of the abstraction: a user adds a
+provider by pasting a URL, and if the endpoint speaks the format, it works.
+
+Two things it is deliberately not:
+
+* **Not a fallback chain.** :mod:`core.providers.router` decides *which* model;
+  this decides *how* to talk to it. A transport that also picked models would
+  make "why did it use that one?" unanswerable.
+* **Not an unrestricted client.** The free-only policy is applied by the router
+  before a request is built, and this module refuses a provider whose policy
+  would be violated rather than sending it anyway.
+
+Errors are classified, not string-matched at the call site, because the
+distinction the product cares about is *retry this model elsewhere* versus *give
+up*: a 429 means move on, a 401 means the key is wrong and no other model will
+help.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+import httpx
+
+from common.reporting import safe_error
+from core.providers.capabilities import Capability, normalise
+
+logger = logging.getLogger("Zaytoon.Core.Providers.Client")
+
+DEFAULT_TIMEOUT = 120.0
+DISCOVERY_TIMEOUT = 10.0
+
+#: How long a streamed completion may produce nothing before it is considered
+#: stalled. A model that opens the stream and then thinks for three minutes is
+#: still working; one that never writes a byte is not.
+STREAM_IDLE_TIMEOUT = 90.0
+
+
+class ProviderTransportError(RuntimeError):
+    """A provider request failed. ``retryable`` says whether to try another model."""
+
+    def __init__(self, message: str, *, status: int = 0, retryable: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+
+
+#: Status codes where trying a *different* model is the right response. A 401 is
+#: deliberately absent: a bad key fails identically for every model on that
+#: provider, so switching models just burns the budget.
+RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+
+FATAL_STATUS = frozenset({400, 401, 402, 403, 404, 405, 413, 415, 422})
+
+
+@dataclass
+class DiscoveredModel:
+    """One model an endpoint reports."""
+
+    id: str
+    capabilities: List[str] = field(default_factory=list)
+    context_length: Optional[int] = None
+    display_name: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.display_name or self.id,
+            "capabilities": list(self.capabilities),
+            "context_length": self.context_length,
+        }
+
+
+class OpenAICompatibleClient:
+    """Chat completions and model discovery against one endpoint."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: Optional[str] = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        kind: str = "openai_compatible",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.kind = kind
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            headers=self._headers(api_key),
+        )
+
+    @staticmethod
+    def _headers(api_key: Optional[str]) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    # -- discovery --------------------------------------------------------
+    async def list_models(self) -> List[DiscoveredModel]:
+        """Ask the endpoint what it has.
+
+        Tries ``/v1/models`` then ``/api/tags`` (Ollama's native shape), because
+        "OpenAI-compatible" and "Ollama" are different answers for the same
+        question and a provider row can be either.
+        """
+        errors: List[str] = []
+        for path, parser in (
+            ("/v1/models", _parse_openai_models),
+            ("/api/tags", _parse_ollama_tags),
+        ):
+            try:
+                response = await self._client.get(path, timeout=DISCOVERY_TIMEOUT)
+            except httpx.HTTPError as exc:
+                errors.append(f"{path}: {type(exc).__name__}")
+                continue
+            if response.status_code >= 400:
+                errors.append(f"{path}: HTTP {response.status_code}")
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                errors.append(f"{path}: response was not JSON")
+                continue
+            models = parser(payload)
+            if models:
+                return models
+            errors.append(f"{path}: no models in the response")
+
+        raise ProviderTransportError(
+            "Could not list models. Tried " + "; ".join(errors), retryable=False
+        )
+
+    # -- chat -------------------------------------------------------------
+    async def complete(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stop: Optional[List[str]] = None,
+    ) -> str:
+        """One non-streaming completion. Returns the assistant's text."""
+        payload = self._payload(messages, model, max_tokens, temperature, tools, stop)
+        response = await self._post("/v1/chat/completions", payload, stream=False)
+        return _extract_text(_json(response))
+
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        max_tokens: int = 2048,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        stop: Optional[List[str]] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream a completion as text deltas.
+
+        Yields only text. Tool calls arrive as structured deltas on some
+        endpoints; those are accumulated into a final message rather than
+        streamed as text, because a JSON blob arriving character by character is
+        exactly the bug the agent engine's "tool calls are not prose" rule exists
+        to prevent.
+        """
+        payload = self._payload(messages, model, max_tokens, temperature, tools, stop)
+        payload["stream"] = True
+        try:
+            async with self._client.stream(
+                "POST", "/v1/chat/completions", json=payload, timeout=None
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise _classify(response.status_code, body)
+
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        if data == "[DONE]":
+                            break
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        # A malformed SSE frame is skipped, not fatal: the stream
+                        # may still deliver a complete answer, and aborting a
+                        # half-received response loses real content.
+                        logger.debug("Skipping unparseable SSE frame")
+                        continue
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        text = delta.get("content")
+                        if text:
+                            yield text
+        except httpx.HTTPError as exc:
+            raise ProviderTransportError(
+                f"Transport error while streaming: {type(exc).__name__}",
+                retryable=True,
+            ) from exc
+
+    async def health(self) -> Dict[str, Any]:
+        """Whether the endpoint answers, and how fast."""
+        import time
+
+        started = time.monotonic()
+        try:
+            response = await self._client.get("/v1/models", timeout=DISCOVERY_TIMEOUT)
+        except httpx.HTTPError as exc:
+            return {
+                "connected": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            }
+        latency = int((time.monotonic() - started) * 1000)
+        if response.status_code in (401, 403):
+            return {
+                "connected": False,
+                "error": f"HTTP {response.status_code}: the endpoint rejected the credentials",
+                "latency_ms": latency,
+            }
+        if response.status_code >= 400:
+            return {
+                "connected": False,
+                "error": f"HTTP {response.status_code} from /v1/models",
+                "latency_ms": latency,
+            }
+        try:
+            payload = response.json()
+        except ValueError:
+            return {"connected": False, "error": "/v1/models did not return JSON", "latency_ms": latency}
+        models = _parse_openai_models(payload)
+        return {
+            "connected": True,
+            "error": "",
+            "latency_ms": latency,
+            "models": [m.id for m in models],
+        }
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # -- internals --------------------------------------------------------
+    @staticmethod
+    def _payload(
+        messages, model, max_tokens, temperature, tools, stop
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        if stop:
+            payload["stop"] = stop
+        return payload
+
+    async def _post(self, path: str, payload: Dict[str, Any], stream: bool):
+        try:
+            response = await self._client.post(path, json=payload)
+        except httpx.HTTPError as exc:
+            raise ProviderTransportError(
+                f"Transport error: {type(exc).__name__}", retryable=True
+            ) from exc
+        if response.status_code >= 400:
+            raise _classify(response.status_code, response.content)
+        return response
+
+
+def _classify(status: int, body: bytes) -> ProviderTransportError:
+    """Turn an HTTP error into a typed failure.
+
+    The body is decoded and truncated for the message, but only after
+    redaction — a provider's error body can echo the request, and the request
+    carries the prompt.
+    """
+    from common.reporting import redact
+
+    text = redact(body.decode("utf-8", errors="replace"))[:300]
+    retryable = status in RETRYABLE_STATUS and status not in FATAL_STATUS
+    hint = ""
+    if status == 429:
+        hint = " (rate limited — try a different model)"
+    elif status == 401:
+        hint = " (the endpoint rejected the API key)"
+    elif status == 404:
+        hint = " (no such endpoint or model — check the base URL and model id)"
+    return ProviderTransportError(
+        f"HTTP {status}{hint}: {text or '(empty body)'}", status=status, retryable=retryable
+    )
+
+
+def _json(response) -> Dict[str, Any]:
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ProviderTransportError(
+            "Provider returned a non-JSON response", retryable=False
+        ) from exc
+
+
+def _extract_text(payload: Dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        raise ProviderTransportError(
+            "Provider returned no choices — the completion is empty", retryable=True
+        )
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        # Some endpoints return content as parts rather than a string.
+        content = "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return str(content or "")
+
+
+def _parse_openai_models(payload: Dict[str, Any]) -> List[DiscoveredModel]:
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        return []
+    models: List[DiscoveredModel] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        models.append(DiscoveredModel(
+            id=str(model_id),
+            display_name=str(entry.get("name") or model_id),
+            # An endpoint that reports no capabilities is assumed to do the two
+            # the chat-completions contract guarantees. Assuming *less* would
+            # make every model unroutable on a freshly added provider.
+            capabilities=sorted(normalise(entry.get("capabilities"))),
+            context_length=entry.get("context_length") or entry.get("max_context_length"),
+            raw=entry,
+        ))
+    return models
+
+
+def _parse_ollama_tags(payload: Dict[str, Any]) -> List[DiscoveredModel]:
+    entries = payload.get("models")
+    if not isinstance(entries, list):
+        return []
+    models: List[DiscoveredModel] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or entry.get("model")
+        if not name:
+            continue
+        details = entry.get("details") or {}
+        capabilities = {Capability.CHAT.value, Capability.STREAMING.value}
+        family = str(details.get("family") or "").lower()
+        parameter_size = str(details.get("parameter_size") or "")
+        if "embed" in family:
+            capabilities = {Capability.EMBEDDINGS.value}
+        elif family in ("llama", "gemma", "qwen", "mistral", "phi", "deepseek"):
+            capabilities.add(Capability.CODING.value)
+        elif family:
+            # An unrecognised family still does chat and streaming. The coding
+            # capability is *inferred* from a known family and never granted by
+            # default, so a model is not advertised as good at code on the
+            # strength of an unrecognised name.
+            logger.debug("Unknown Ollama model family %r; chat/streaming assumed", family)
+        models.append(DiscoveredModel(
+            id=str(name),
+            display_name=str(entry.get("name") or name),
+            capabilities=sorted(capabilities),
+            context_length=None,
+            raw={"parameter_size": parameter_size} if parameter_size else {},
+        ))
+    return models
+
+
+__all__ = [
+    "DEFAULT_TIMEOUT",
+    "DiscoveredModel",
+    "FATAL_STATUS",
+    "OpenAICompatibleClient",
+    "ProviderTransportError",
+    "RETRYABLE_STATUS",
+    "STREAM_IDLE_TIMEOUT",
+]

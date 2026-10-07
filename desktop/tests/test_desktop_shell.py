@@ -2,9 +2,9 @@
 
 These replace an earlier suite that asserted on a Tauri/Rust bundle
 (``desktop/src-tauri/tauri.conf.json``, ``Cargo.toml``, ``check_env.js``). That
-shell no longer exists: ``desktop/`` is a Python/customTkinter application, so
-the old tests could only ever fail. They are replaced by tests against the
-behaviour that actually ships.
+shell no longer exists: ``desktop/`` is a Python application hosting the React
+UI in a native WebView (pywebview), so the old tests could only ever fail. They
+are replaced by tests against the behaviour that actually ships.
 
 What is deliberately covered here is the set of properties the shell exists to
 guarantee:
@@ -202,6 +202,24 @@ class TestDesktopConfig:
         text = DesktopConfig().describe()
         for token in ("repo=", "addr=", "ws=", "hotkeys=", "manage_backend="):
             assert token in text, text
+
+    def test_dev_mode_defaults_to_false(self, clean_env):
+        assert DesktopConfig().dev_mode is False
+
+    def test_dev_mode_can_be_enabled(self, clean_env):
+        clean_env.setenv("ZAYTOON_DEV_MODE", "true")
+        assert DesktopConfig().dev_mode is True
+
+    def test_frontend_dist_defaults_to_repo_frontend_dist(self, clean_env):
+        cfg = DesktopConfig()
+        assert cfg.frontend_dist == cfg.repo_root / "frontend" / "dist"
+
+    def test_window_dimensions_have_sane_defaults(self, clean_env):
+        cfg = DesktopConfig()
+        assert cfg.window_width == 1280
+        assert cfg.window_height == 800
+        assert cfg.window_min_width == 800
+        assert cfg.window_min_height == 600
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +516,19 @@ class TestSpawnIsArgumentVector:
         BackendProcess(self._live_config()).ensure_running()
 
         assert isinstance(captured["argv"], list), "must be an argument vector"
-        assert captured["argv"][0] == sys.executable
+        # Compare against the resolver's decision, not sys.executable: the
+        # interpreter may legitimately be backend/.venv while the suite runs
+        # from a different venv (and CI has no backend/.venv at all — only
+        # tier 3). Asserting sys.executable encoded the *runner's* environment
+        # and failed on any other interpreter, even though the spawn itself
+        # was correct. The tier logic has its own tests in
+        # TestBackendCommandResolution; this test owns the hand-off.
+        resolved = resolve_backend_command(self._live_config())
+        assert resolved is not None
+        assert captured["argv"][0] == resolved[0]
+        assert captured["argv"][0].lower().endswith(
+            ("python", "python.exe")
+        ), "argv[0] must be an interpreter path, not arbitrary text"
         assert captured["argv"][1].endswith("main.py")
         assert "shell" not in captured["kwargs"], "shell=True must never be used"
         assert captured["kwargs"]["env"].get("PYTHONUNBUFFERED") == "1"
@@ -708,6 +738,12 @@ class TestBuildScript:
     def test_icon_asset_exists(self):
         assert (REPO_ROOT / "desktop" / "icons" / "source.png").is_file()
 
+    def test_requirements_list_pywebview(self):
+        """The host's runtime dependency must be declared, or CI installs a shell that cannot start."""
+        req_file = REPO_ROOT / "desktop" / "requirements.txt"
+        assert req_file.is_file()
+        assert "pywebview" in req_file.read_text(encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
 # guard against the Tauri shell creeping back in
@@ -758,7 +794,7 @@ class TestNoRustResidue:
         for token in forbidden:
             assert token not in text, (
                 f"AGENTS.md still references {token!r}; desktop/ is a "
-                "Python/customTkinter application with no Rust toolchain."
+                "Python/pywebview application with no Rust toolchain."
             )
 
     def test_startup_script_does_not_launch_a_tauri_dev_server(self):

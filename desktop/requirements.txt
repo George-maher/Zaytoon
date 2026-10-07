@@ -1,4 +1,4 @@
-# Runtime dependencies for the Zaytoon desktop shell (desktop/main.py).
+# Runtime dependencies for the Zaytoon desktop application (desktop/main.py).
 #
 # These are deliberately separate from backend/requirements.txt: the backend is
 # the service, this is the client. Install them into the same virtualenv to
@@ -7,19 +7,9 @@
 #   backend\.venv\Scripts\activate
 #   pip install -r backend\requirements.txt -r desktop\requirements.txt
 #
-# The UI, audio and hotkey layers are all optional at runtime except
-# customtkinter: main.py --diagnose reports exactly which are missing.
+# The desktop application hosts the React/Vite UI through a native WebView.
+# pywebview uses WebView2 on Windows (no Chromium bundle), making it lightweight
+# with fast startup and low RAM usage.
 
-customtkinter>=5.2
-sounddevice>=0.4.6
-numpy>=1.24
-# PyAV decodes the MP3 that edge-tts produces. It is required, not optional:
-# it links ffmpeg as a library, so TTS works from a plain `pip install`.
-# pydub/ffmpeg-python are only fallbacks and both need the ffmpeg *binary* on
-# PATH, which a default Windows install does not have -- with those alone, TTS
-# decoded to zero bytes and the user heard nothing at all.
-av>=12.0
+pywebview>=5.0
 websockets>=12.0
-keyboard>=0.13.5
-pystray>=0.19
-pillow>=10.0

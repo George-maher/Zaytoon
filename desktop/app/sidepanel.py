@@ -360,7 +360,7 @@ def _card(parent, title: str) -> tuple[ctk.CTkFrame, ctk.CTkFrame]:
         font=(theme.FONT_MONO, theme.FONT_SECTION, "bold"),
         text_color=theme.TEXT_FAINT,
     ).pack(fill="x", padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
-    body = ctk.CTkFrame(card, fg_color="transparent")
+    body = ctk.CTkFrame(card, fg_color="transparent", height=1)
     body.pack(fill="x", padx=theme.SPACE_3, pady=(2, theme.SPACE_2))
     return card, body
 

@@ -20,10 +20,15 @@ dist/
 .vite/
 
 # Rust
-# The desktop shell is Python/customTkinter, not Tauri, so there is no
+# The desktop shell is Python/pywebview, not Tauri, so there is no
 # src-tauri/target. `target/` is kept for anyone experimenting with a Rust
 # sidecar without polluting the root.
 target/
+
+# The checkout's portable home (install.sh creates the same layout at
+# $ZAYTOON_HOME): the desktop host persists window state to Config/ when
+# ZAYTOON_HOME is unset.
+/Config/
 
 # PyInstaller output from desktop/scripts/build_exe.py
 desktop/dist/

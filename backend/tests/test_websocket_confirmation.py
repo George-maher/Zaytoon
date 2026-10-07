@@ -25,7 +25,10 @@ class FakeWebSocket:
     then raises ``WebSocketDisconnect`` like a real client going away.
     """
 
-    def __init__(self, incoming, idle_grace=0.3):
+    def __init__(self, incoming, idle_grace=1.0):
+        # A turn now writes a task record (core.db) before its final frames,
+        # so the idle window that lets background dispatches finish had to
+        # grow with it — see the same note in test_websocket_interrupt.py.
         self.incoming = list(incoming)
         self.idle_grace = idle_grace
         self.sent: list[dict] = []

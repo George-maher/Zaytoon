@@ -100,9 +100,20 @@ class RouterAgent(BaseAgent):
         self, user_message: str, context: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         msg_lower = user_message.lower().strip()
+        # The orchestrator may prepend a project/skill preamble, separated by a
+        # blank line, so that "run the tests" is judged with the project in
+        # view. The preamble is *context*, not user speech — and a keyword rule
+        # reading its facts as a request is a real misroute: "git repo on main"
+        # matches the git rule, so **every** message in a detected git project
+        # would become a `tools` turn, and "run: npm start" matches the npm
+        # rule in a node project. Keyword rules therefore see only what comes
+        # after the last blank line — the user's own message. The LLM fallback
+        # still sees the full text, where context helps classification instead
+        # of misfiring a regex.
+        user_part = msg_lower.rsplit("\n\n", 1)[-1]
 
         for pattern, intent, confidence in KEYWORD_ROUTES:
-            if pattern.search(msg_lower):
+            if pattern.search(user_part):
                 return {"intent": intent, "confidence": confidence, "reasoning": "keyword_match"}
 
         result = await self.process(user_message, context)

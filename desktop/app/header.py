@@ -25,6 +25,11 @@ class Pill(ctk.CTkFrame):
             border_width=1,
             border_color=border,
             corner_radius=theme.RADIUS_CONTROL,
+            # A pill is a chip, and it has to be told so: an unsized
+            # customTkinter frame requests 300x300, which stretched the whole
+            # header to 312px tall and left the row of pills floating in an
+            # empty band. Same height as the header buttons, deliberately.
+            height=kwargs.pop("height", 22),
             **kwargs,
         )
         self.accent = accent
@@ -58,6 +63,10 @@ class HeaderBar(ctk.CTkFrame):
         on_toggle_side=None,
         **kwargs,
     ) -> None:
+        # Sized by its children: see the Pill comment below. Without this the bar
+        # itself carries customTkinter's 300px default and the row of pills ends
+        # up floating in an empty band. Set before super() so it actually lands.
+        kwargs.setdefault("height", 1)
         super().__init__(master, fg_color=theme.BG1, **kwargs)
         self._on_settings = on_settings
         self._on_minimize = on_minimize
@@ -69,7 +78,12 @@ class HeaderBar(ctk.CTkFrame):
         self._compact = False
 
         # -- identity ------------------------------------------------------
-        identity = ctk.CTkFrame(self, fg_color="transparent")
+        # `height=1` on both containers is load-bearing, not cosmetic: a
+        # customTkinter frame given no size requests the 300x300 default, so the
+        # header asked for 312px of height and its contents floated in the middle
+        # of an empty band. A frame sized by its children is the fix; an explicit
+        # 1 says "take the children's height, not a default".
+        identity = ctk.CTkFrame(self, fg_color="transparent", height=1)
         identity.pack(side="left", padx=(theme.SPACE_3, theme.SPACE_4))
 
         # A cyan accent dot is the whole logo mark: no asset, no emoji.
@@ -97,7 +111,7 @@ class HeaderBar(ctk.CTkFrame):
         self.mic_pill.pack(side="left", padx=(0, theme.SPACE_2), pady=theme.SPACE_2)
 
         # -- right-hand controls -------------------------------------------
-        controls = ctk.CTkFrame(self, fg_color="transparent")
+        controls = ctk.CTkFrame(self, fg_color="transparent", height=1)
         controls.pack(side="right", padx=(theme.SPACE_2, theme.SPACE_2))
         self._controls = controls
 

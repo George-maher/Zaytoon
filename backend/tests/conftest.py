@@ -16,3 +16,20 @@ from config import PROVIDER_OPENROUTER, config
 def _openrouter_provider(monkeypatch):
     monkeypatch.setattr(config, "PROVIDER", PROVIDER_OPENROUTER)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_core_db(monkeypatch, tmp_path):
+    """Point the core database at a fresh temp file for every test.
+
+    The LLM client consults the provider registry (``core.db``) before it
+    falls back to the configured chain, so a registry populated on a
+    developer's machine would steer — and a stale row could break — tests
+    that are about the chain itself. Isolation here is what keeps
+    "which model answered?" a question the test controls.
+
+    Deeper fixtures override this: ``tests/core``'s ``temp_core_db`` sets the
+    same variable later (conftest depth orders parent before child), so the
+    core suite keeps its own explicit database.
+    """
+    monkeypatch.setenv("CORE_DB_PATH", str(tmp_path / "core.db"))

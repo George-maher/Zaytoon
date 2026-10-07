@@ -31,6 +31,8 @@ function CommandConsole({
   onSettingsToggle,
   settingsOpen,
   onLanguageToggle,
+  onPanelSelect,
+  activePanel,
 }) {
   const ar = language === "ar";
 
@@ -102,6 +104,8 @@ function CommandConsole({
               onSettingsToggle={onSettingsToggle}
               settingsOpen={settingsOpen}
               onStop={onStop}
+              onPanelSelect={onPanelSelect}
+              activePanel={activePanel}
               hideMic
             />
           </div>

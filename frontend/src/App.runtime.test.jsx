@@ -13,7 +13,7 @@
  * stops sending it, manual voice silently requires "Zaytoon" again.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import App from "./App";
 
 class FakeSocket {
@@ -139,17 +139,58 @@ describe("App runtime", () => {
     expect(screen.getByRole("img", { name: /ai core/i })).toBeInTheDocument();
     expect(screen.getByText(/transcript/i)).toBeInTheDocument();
     expect(screen.getByText(/command console/i)).toBeInTheDocument();
-    // Both rails, exactly one copy of each (discriminated by the panel code
-    // chips, because the drawer tabs reuse the same words).
+    // Telemetry lives behind the header nav's System button — a right-rail
+    // panel, present exactly once when opened. The nav click is the point:
+    // it proves the header drives the shell's focus rather than decorating
+    // it. Discriminated on the panel code chip, because the tab buttons
+    // reuse some of the same words.
+    expect(screen.queryByText(/system status/i)).not.toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "System" }));
+    });
     expect(screen.getAllByText(/system status/i)).toHaveLength(1);
     expect(screen.getAllByText(/^MSN$/)).toHaveLength(1);
-    // The tabbed drawer must not also be present at this width.
-    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+    // Both rails are present as *asides*, not collapsed into a drawer.
+    expect(screen.getByRole("complementary", { name: /workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: /inspector/i })).toBeInTheDocument();
+    // Each rail has its own labelled tab list - two, not one merged drawer.
+    expect(screen.getByRole("tablist", { name: /workspace/i })).toBeInTheDocument();
+    expect(screen.getByRole("tablist", { name: /inspector/i })).toBeInTheDocument();
     // Full-size core: the shrink to 180px is the phone's, not ours.
     expect(screen.getByRole("img", { name: /ai core/i }).style.width).toBe("260px");
   });
 
-  it("collapses the rails into one tabbed drawer at narrow width", async () => {
+  it("drives the shell from the dock's panel strip", async () => {
+    await act(async () => { render(<App />); });
+    // Wide is this suite's default, so the strip addresses the inspector. TERM
+    // must actually move it — a navigation control that renders but does
+    // nothing is worse than no control at all.
+    const strip = screen.getByRole("tablist", { name: "Quick access" });
+    expect(within(strip).getByRole("tab", { name: "TERM" })).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+    fireEvent.click(within(strip).getByRole("tab", { name: "TERM" }));
+    // The terminal's new-command field proves the inspector switched to it.
+    expect(await screen.findByText("New command")).toBeInTheDocument();
+    expect(within(strip).getByRole("tab", { name: "TERM" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // LOG and DIFF are centre-column jumps: there is no rail panel to switch
+    // *to*, so they scroll to the execution log and the editor. The stub is
+    // installed after render so only the strip's clicks are attributed.
+    const scroll = vi.fn();
+    window.Element.prototype.scrollIntoView = scroll;
+    fireEvent.click(within(strip).getByRole("tab", { name: "LOG" }));
+    expect(scroll).toHaveBeenCalled();
+    scroll.mockClear();
+    fireEvent.click(within(strip).getByRole("tab", { name: "DIFF" }));
+    expect(scroll).toHaveBeenCalled();
+  });
+
+  it("puts the whole workspace behind one drawer at narrow width", async () => {
     global.matchMedia = vi.fn((q) => ({
       matches: false,
       media: q,
@@ -161,14 +202,15 @@ describe("App runtime", () => {
     window.matchMedia = global.matchMedia;
     await act(async () => { render(<App />); });
 
-    expect(screen.getByRole("tablist")).toBeInTheDocument();
-    // The SYSTEM tab is open, so SystemStatus is mounted once...
-    expect(screen.getAllByText(/system status/i)).toHaveLength(1);
-    // ...and the mission panel is behind the other tab rather than duplicated
-    // alongside it. Discriminate on the panel's code chip: the tab button is
-    // itself labelled "MISSION", so the title text cannot be used.
-    expect(screen.queryByText(/^MSN$/)).not.toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /mission/i })).toBeInTheDocument();
+    // A phone must not lose the task list or the terminal: they are the two
+    // things a user needs while work is running. So the single drawer carries
+    // **both** rails' tabs rather than only the workspace ones.
+    const tabs = screen.getByRole("tablist", { name: /panels/i });
+    for (const name of [/projects/i, /files/i, /skills/i, /models/i, /tasks/i, /terminal/i]) {
+      expect(within(tabs).getByRole("tab", { name })).toBeInTheDocument();
+    }
+    // And no rail survives as an aside.
+    expect(screen.queryByRole("complementary", { name: /inspector/i })).not.toBeInTheDocument();
     // The core and the console survive the collapse.
     expect(screen.getByRole("img", { name: /ai core/i })).toBeInTheDocument();
     expect(screen.getByText(/command console/i)).toBeInTheDocument();
@@ -205,8 +247,14 @@ describe("App runtime", () => {
     expect(screen.getAllByRole("img", { name: /ai core/i })).toHaveLength(1);
     expect(screen.getAllByLabelText(/your message/i)).toHaveLength(1);
     expect(screen.getAllByText(/command console/i)).toHaveLength(1);
+    // The system panel sits behind its tab — absent from the default
+    // render, exactly once when opened through the drawer.
+    expect(screen.queryByText(/system status/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: /system/i }));
     expect(screen.getAllByText(/system status/i)).toHaveLength(1);
-    expect(screen.getByRole("tablist")).toBeInTheDocument();
+    // The drawer's tab list, *named*: the dock carries its own differently
+    // named strip now, so a bare `getByRole("tablist")` would find two.
+    expect(screen.getByRole("tablist", { name: /panels/i })).toBeInTheDocument();
   });
 
   it("announces what the engine is doing on the status line", async () => {

@@ -125,10 +125,10 @@ jobs:
           cache: pip
           cache-dependency-path: desktop/requirements-dev.txt
 
-      # Only pytest is needed. `keyboard`, `pystray` and `sounddevice` are
-      # imported behind try/except in app/, and Tk needs no display for the
-      # tests here, which cover config, protocol, hotkeys and the backend
-      # supervisor rather than any widget.
+      # requirements-dev.txt carries the runtime deps (pywebview, websockets)
+      # plus the legacy-module test deps (customtkinter, keyboard, numpy,
+      # sounddevice, av), so the whole suite runs on a clean machine. Tk tests
+      # never create a widget on screen, so no display is needed either.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

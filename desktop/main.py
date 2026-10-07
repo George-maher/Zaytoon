@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-"""Entry point for the Zaytoon desktop shell.
+"""Entry point for the Zaytoon desktop application.
 
     python desktop/main.py                # normal launch
     python desktop/main.py --diagnose     # print what it can see, then exit
-    python desktop/main.py --panel        # start in the expanded panel
     python desktop/main.py --no-backend   # never spawn FastAPI
+    python desktop/main.py --dev          # connect to Vite dev server
 
-``--diagnose`` exists because the most common first-run failure is
-environmental (no interpreter, no PortAudio, hotkeys already taken). It reports
-all of that without opening a window, so the answer is one command instead of a
-log file.
+The desktop application hosts the React/Vite UI through a native WebView
+(pywebview + WebView2 on Windows). The React app is the primary interface;
+this host provides native window management, backend lifecycle, and OS
+integration through a secure bridge.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from app.backend import (  # noqa: E402
     wait_for_backend,
 )
 from app.config import DesktopConfig, default_repo_root  # noqa: E402
-from app.hotkeys import format_hotkey  # noqa: E402
+from app.host import WEBVIEW2_DOWNLOAD_URL, webview2_runtime_present  # noqa: E402
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -70,12 +70,8 @@ def _diagnose(config: DesktopConfig) -> int:
     # 2. dependencies
     print("dependencies")
     for module, why in (
-        ("customtkinter", "the UI"),
-        ("sounddevice", "microphone and TTS playback"),
-        ("numpy", "audio maths"),
-        ("websockets.sync.client", "the backend connection"),
-        ("keyboard", "global hotkeys"),
-        ("pystray", "the tray icon"),
+        ("webview", "the WebView runtime (pywebview)"),
+        ("websockets", "the backend connection"),
     ):
         try:
             __import__(module)
@@ -84,56 +80,47 @@ def _diagnose(config: DesktopConfig) -> int:
             print(f"  FAIL {module}  ({why}) - {type(exc).__name__}: {exc}")
     print()
 
-    # 3. audio devices
-    print("audio")
-    try:
-        from app.audio import list_devices
+    # 3. frontend build
+    print("frontend")
+    dist = config.frontend_dist
+    index = dist / "index.html"
+    if index.exists():
+        print(f"  OK   production build at {dist}")
+    else:
+        print(f"  WARN no production build at {dist}")
+        print(f"       run `npm run build` in frontend/ or use --dev mode")
+    print()
 
-        inputs, outputs = list_devices()
-        print(f"  {len(inputs)} input device(s), {len(outputs)} output device(s)")
-        for name in inputs[:4]:
-            print(f"    in  {name}")
-        for name in outputs[:2]:
-            print(f"    out {name}")
-        if not inputs:
+    # 4. WebView2 (Windows)
+    if sys.platform == "win32":
+        print("webview2")
+        try:
+            import webview
+
+            # pywebview 6 no longer exposes __version__; do not let its
+            # absence be reported as a failed import.
+            version = getattr(webview, "__version__", None) or getattr(
+                webview, "VERSION", "unknown"
+            )
+            print(f"  OK   pywebview ({version})")
+        except Exception as exc:
             ok = False
-            print("  FAIL no microphone detected")
-    except Exception as exc:
-        ok = False
-        print(f"  FAIL {type(exc).__name__}: {exc}")
-    print()
+            print(f"  FAIL pywebview - {type(exc).__name__}: {exc}")
+        if webview2_runtime_present():
+            print("  OK   WebView2 runtime installed")
+        else:
+            ok = False
+            print("  FAIL WebView2 runtime missing - the window cannot open.")
+            print(f"       Install it once: {WEBVIEW2_DOWNLOAD_URL}")
+        print()
 
-    # 4. display
-    print("display")
-    try:
-        import tkinter
-
-        root = tkinter.Tk()
-        root.withdraw()
-        print(f"  OK   tkinter ({root.tk.call('tk', 'windowingsystem')})")
-        root.destroy()
-    except Exception as exc:
-        ok = False
-        print(f"  FAIL tkinter - {type(exc).__name__}: {exc}")
-    print()
-
-    # 5. hotkeys
-    print("hotkeys")
-    try:
-        from app.hotkeys import HotkeyManager
-
-        manager = HotkeyManager()
-        results = {}
-        for name, key in (("toggle", config.toggle_hotkey), ("expand", config.expand_hotkey)):
-            results[name] = manager.register(key, lambda: None)
-            print(f"  {'OK  ' if results[name] else 'FAIL'} {format_hotkey(key)}")
-        if not all(results.values()):
-            print(f"  note: {manager.error}")
-            print("        these are optional; the tray menu still works")
-        manager.unregister_all()
-    except Exception as exc:
-        print(f"  FAIL {type(exc).__name__}: {exc}")
-    print()
+    # 5. dev mode
+    if config.dev_mode:
+        print("dev mode")
+        dev_url = f"http://localhost:{config.dev_port}"
+        print(f"  URL        : {dev_url}")
+        print(f"  (ensure Vite dev server is running)")
+        print()
 
     print("verdict:", "ready" if ok else "problems above must be fixed first")
     return 0 if ok else 1
@@ -141,11 +128,11 @@ def _diagnose(config: DesktopConfig) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="zaytoon-desktop", description="Zaytoon AI floating assistant"
+        prog="zaytoon-desktop", description="Zaytoon AI desktop environment"
     )
     parser.add_argument("--diagnose", action="store_true", help="check the environment and exit")
-    parser.add_argument("--panel", action="store_true", help="start in the expanded panel")
     parser.add_argument("--no-backend", action="store_true", help="never spawn FastAPI")
+    parser.add_argument("--dev", action="store_true", help="connect to Vite dev server")
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
@@ -155,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     config = DesktopConfig()
     if args.no_backend:
         config.manage_backend = False
+    if args.dev:
+        config.dev_mode = True
 
     if args.diagnose:
         return _diagnose(config)
@@ -162,23 +151,18 @@ def main(argv: list[str] | None = None) -> int:
     if not backend_is_up(config.host, config.port) and config.manage_backend:
         print("Starting the Zaytoon backend, this takes a few seconds…")
 
-    # One orb, one keyboard hook. Claimed before anything global is created,
-    # so a second launch reports the conflict instead of contending for the
-    # hotkey -- which, depending on timing and elevation, surfaced as a crash
-    # inside the `keyboard` package rather than as a message.
+    # Single instance guard — one window, one backend handle
     from app.instance import claim_or_report
 
     guard = claim_or_report()
     if guard is None:
         return 0
 
-    from app.app import ZaytoonApp
+    from app.host import WebViewHost
 
-    application = ZaytoonApp(config)
-    if args.panel:
-        application._enter_panel()
+    host = WebViewHost(config)
     try:
-        return application.run()
+        return host.run()
     finally:
         guard.release()
 

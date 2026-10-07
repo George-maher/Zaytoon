@@ -136,21 +136,31 @@ class TestWorkspaceEndpoint:
 
 
 class TestReminderRoutes:
+    """Reminders live at ``/reminders``.
+
+    They used to be at ``/tasks``, which now means agent tasks. The move is
+    deliberate — see ``core/api/tasks_api.py`` — so these assertions follow the
+    path rather than asserting the old one.
+    """
+
     def test_list_requires_no_arguments(self, client):
-        response = client.get("/tasks")
+        response = client.get("/reminders")
         assert response.status_code == 200
         assert "tasks" in response.json()
 
     def test_create_rejects_a_missing_time(self, client):
-        response = client.post("/tasks", json={"task": "x"})
+        response = client.post("/reminders", json={"task": "x"})
         assert response.status_code == 400
 
     def test_create_rejects_a_malformed_time(self, client):
-        response = client.post("/tasks", json={"task": "x", "time": "not-a-time"})
+        response = client.post("/reminders", json={"task": "x", "time": "not-a-time"})
         assert response.status_code == 400
 
-    def test_missing_task_is_404(self, client):
-        assert client.get("/tasks/999999").status_code == 404
+    def test_missing_reminder_is_404(self, client):
+        assert client.get("/reminders/999999").status_code == 404
+
+    def test_a_reminder_can_be_marked_done(self, client):
+        assert client.patch("/reminders/999999/done").status_code == 404
 
 
 class TestCommandRoutes:
@@ -258,6 +268,519 @@ class TestAISettings:
         assert "refused" in body["error"]
 
 
+_OLLAMA_SETTINGS_FIELDS = (
+    "PROVIDER", "AI_PROVIDER", "OLLAMA_BASE_URL", "OLLAMA_GENERAL_MODEL",
+    "OLLAMA_CODING_MODEL", "OLLAMA_FAST_MODEL", "OLLAMA_TIMEOUT",
+)
+_OPENROUTER_SETTINGS_FIELDS = (
+    "PROVIDER", "AI_PROVIDER", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL",
+    "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_REASONING_MODEL",
+    "OPENROUTER_FALLBACK_MODEL",
+)
+
+
+class TestAISettingsPersistAcrossRestarts:
+    """A save that reverts on restart is the bug users call "did not stick".
+
+    Two stores, and the split matters: settings in `kv`, the key in
+    credential storage — never in a table a later query could print.
+    """
+
+    @pytest.fixture
+    def isolated_secrets(self, monkeypatch, tmp_path):
+        """The credential round-trip must not touch the real secrets file."""
+        from core import secrets as core_secrets
+
+        monkeypatch.setenv(
+            "ZAYTOON_SECRETS_PATH", str(tmp_path / "secrets.json")
+        )
+        core_secrets.reset_cache()
+        yield
+        core_secrets.reset_cache()
+
+    @staticmethod
+    def _guard_config(monkeypatch, fields):
+        """Snapshot every field the POST mutates; teardown restores them.
+
+        `raising=False` because the route itself is what first creates a few
+        of these (e.g. `AI_PROVIDER`) — an attribute that did not exist is
+        deleted again at teardown, which is exactly the restore we want.
+        """
+        from config import config
+
+        for name in fields:
+            monkeypatch.setattr(
+                config, name, getattr(config, name, None), raising=False
+            )
+
+    @staticmethod
+    def _no_sockets(monkeypatch):
+        """The route's `get_provider()` is a local import — patch the module."""
+        from services import ai_provider
+
+        monkeypatch.setattr(ai_provider, "get_provider", lambda: _FakeProvider())
+
+    async def test_saved_settings_are_applied_on_next_startup(
+        self, client, monkeypatch
+    ):
+        from config import config
+        from services.ai_settings import apply_persisted_ai_settings, is_persisted
+
+        self._guard_config(monkeypatch, _OLLAMA_SETTINGS_FIELDS)
+        self._no_sockets(monkeypatch)
+
+        response = client.post("/settings/ai", json={
+            "provider": "ollama",
+            "base_url": "http://localhost:11500",
+            "general_model": "saved-general:7b",
+            "fast_model": "saved-fast:3b",
+        })
+        assert response.status_code == 200
+        assert response.json()["persisted"] is True
+        assert await is_persisted() is True
+
+        # Simulate the restart: a process that has only ever seen the
+        # environment defaults.
+        config.OLLAMA_BASE_URL = "http://localhost:11434"
+        config.OLLAMA_GENERAL_MODEL = "env-default:9b"
+        config.OLLAMA_FAST_MODEL = "env-default:3b"
+
+        applied = await apply_persisted_ai_settings()
+
+        assert config.OLLAMA_BASE_URL == "http://localhost:11500"
+        assert config.OLLAMA_GENERAL_MODEL == "saved-general:7b"
+        assert config.OLLAMA_FAST_MODEL == "saved-fast:3b"
+        assert "provider" in applied
+
+    async def test_the_api_key_goes_to_credential_storage_not_kv(
+        self, client, monkeypatch, isolated_secrets
+    ):
+        from core import db, secrets as core_secrets
+        from config import config
+        from services.ai_settings import API_KEY_SECRET
+
+        self._guard_config(monkeypatch, _OPENROUTER_SETTINGS_FIELDS)
+        self._no_sockets(monkeypatch)
+
+        response = client.post("/settings/ai", json={
+            "provider": "openrouter",
+            "api_key": "sk-super-secret-42",
+            "primary_model": "qwen/qwen3.8-27b:free",
+        })
+        assert response.status_code == 200
+        # Never in the response:
+        assert "sk-super-secret-42" not in response.text
+        # Never in kv — a plain table a later query could print:
+        raw = await db.kv_get("settings.ai")
+        assert raw and "sk-super-secret-42" not in raw
+        # Always in credential storage, and applied to the live config:
+        assert core_secrets.has_secret(API_KEY_SECRET)
+        assert core_secrets.get_secret(API_KEY_SECRET) == "sk-super-secret-42"
+        assert config.OPENROUTER_API_KEY == "sk-super-secret-42"
+
+    async def test_no_read_path_returns_the_saved_key(
+        self, client, monkeypatch, isolated_secrets
+    ):
+        """The audit half: a stored key must never surface on any status read.
+
+        The write path above proves the key goes to credential storage; this
+        proves the *read* routes behave as if they were never handed it. One
+        echo — a health payload, a settings dump, a diagnostics feed — is the
+        classic leak, and it only takes one route that does `**config`.
+        """
+        self._guard_config(monkeypatch, _OPENROUTER_SETTINGS_FIELDS)
+        self._no_sockets(monkeypatch)
+
+        saved = client.post("/settings/ai", json={
+            "provider": "openrouter",
+            "api_key": "sk-audit-only-99887766",
+        })
+        assert saved.status_code == 200
+        assert "sk-audit-only-99887766" not in saved.text
+
+        for path in ("/settings/ai", "/health", "/system", "/events/recent"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert "sk-audit-only-99887766" not in response.text, path
+
+    async def test_get_reports_whether_settings_are_persisted(
+        self, client, monkeypatch
+    ):
+        from services import ai_provider
+
+        monkeypatch.setattr(ai_provider, "_provider_instance", _FakeProvider())
+        body = client.get("/settings/ai").json()
+        # Isolated per-test database: no row was ever written here.
+        assert body["persisted"] is False
+
+    async def test_a_corrupt_row_applies_nothing(self, monkeypatch):
+        """A damaged preference degrades to the defaults, not to a crash."""
+        from config import config
+        from core import db
+        from services.ai_settings import apply_persisted_ai_settings
+
+        self._guard_config(monkeypatch, _OLLAMA_SETTINGS_FIELDS)
+        sentinel = config.OLLAMA_BASE_URL
+        await db.kv_set("settings.ai", "{not json")
+
+        assert await apply_persisted_ai_settings() == []
+        assert config.OLLAMA_BASE_URL == sentinel
+
+
+class TestPullIsExplicitAndBounded:
+    """Pulling gigabytes is a decision, never an installation side effect."""
+
+    @pytest.fixture
+    def pull_world(self, monkeypatch):
+        """Isolated pull records, an Ollama-looking provider, ollama selected."""
+        import api.main as main_module
+        from services.ai_provider import OllamaProvider
+        from services.ollama_client import PullProgress
+
+        class _PullingProvider(OllamaProvider):
+            def __init__(self):
+                self.pulled = []
+                self.invalidations = 0
+
+            async def pull_model(self, model):
+                self.pulled.append(model)
+                yield PullProgress(status="pulling manifest")
+                yield PullProgress(status="success")
+
+            def invalidate_cache(self):
+                self.invalidations += 1
+
+        monkeypatch.setattr(main_module, "_PULLS", {})
+        monkeypatch.setattr(
+            main_module, "get_provider", lambda: _PullingProvider()
+        )
+        monkeypatch.setattr(main_module.config, "PROVIDER", "ollama")
+        return main_module
+
+    def test_pull_needs_ollama_selected(self, client, monkeypatch):
+        import api.main as main_module
+
+        monkeypatch.setattr(main_module.config, "PROVIDER", "openrouter")
+        response = client.post("/settings/ai/pull", json={"model": "llama3:8b"})
+        assert response.status_code == 400
+        assert "Ollama" in response.json()["error"]
+
+    def test_hostile_model_names_are_refused(self, client, pull_world):
+        """Validation runs before a provider or a task is ever touched."""
+        for bad in (
+            "llama3:8b & hostname",
+            "../secrets",
+            "a/../../b",
+            "name with space",
+            "model;rm -rf",
+            "-leading-dash",
+            "",
+        ):
+            response = client.post("/settings/ai/pull", json={"model": bad})
+            assert response.status_code == 400, bad
+
+    def test_a_running_pull_is_not_started_twice(self, client, pull_world):
+        pull_world._PULLS["hang:7b"] = {
+            "model": "hang:7b", "state": "running", "status": "downloading",
+            "total": 100, "completed": 50, "error": None,
+            "started_at": 1.0, "finished_at": None,
+        }
+        response = client.post("/settings/ai/pull", json={"model": "hang:7b"})
+        assert response.status_code == 409
+        assert "already running" in response.json()["error"]
+
+    def test_a_pull_starts_and_is_pollable(self, client, pull_world):
+        response = client.post(
+            "/settings/ai/pull", json={"model": "tinyllama:1.1b"}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "started"
+        assert body["model"] == "tinyllama:1.1b"
+        assert body["state"] == "running"
+
+        listed = client.get("/settings/ai/pull").json()["pulls"]
+        assert any(p["model"] == "tinyllama:1.1b" for p in listed)
+        record = client.get(
+            "/settings/ai/pull", params={"model": "tinyllama:1.1b"}
+        )
+        assert record.status_code == 200
+        assert record.json()["model"] == "tinyllama:1.1b"
+
+    def test_an_unknown_pull_reports_404(self, client, pull_world):
+        response = client.get(
+            "/settings/ai/pull", params={"model": "nope:1b"}
+        )
+        assert response.status_code == 404
+
+    async def test_the_pull_record_tells_the_truth_to_the_end(
+        self, monkeypatch
+    ):
+        import api.main as main_module
+        from services.ollama_client import PullProgress
+
+        monkeypatch.setattr(main_module, "_PULLS", {})
+        model = "tinyllama:1.1b"
+        main_module._PULLS[model] = {
+            "model": model, "state": "running", "status": "starting",
+            "total": 0, "completed": 0, "error": None,
+            "started_at": 1.0, "finished_at": None,
+        }
+
+        class _Provider:
+            def __init__(self):
+                self.invalidations = 0
+
+            async def pull_model(self, _model):
+                yield PullProgress(status="downloading", total=10, completed=4)
+                yield PullProgress(status="success", total=10, completed=10)
+
+            def invalidate_cache(self):
+                self.invalidations += 1
+
+        provider = _Provider()
+        await main_module._run_pull(provider, model)
+
+        state = main_module._PULLS[model]
+        assert state["state"] == "done"
+        assert state["status"] == "success"
+        assert state["total"] == 10 and state["completed"] == 10
+        assert state["error"] is None
+        assert state["finished_at"] is not None
+        # A finished pull must be visible to the next model listing.
+        assert provider.invalidations == 1
+
+    async def test_a_broken_pull_says_so(self, monkeypatch):
+        import api.main as main_module
+        from services.ollama_client import PullProgress
+
+        monkeypatch.setattr(main_module, "_PULLS", {})
+        model = "big:70b"
+        main_module._PULLS[model] = {
+            "model": model, "state": "running", "status": "downloading",
+            "total": 10, "completed": 3, "error": None,
+            "started_at": 1.0, "finished_at": None,
+        }
+
+        class _Provider:
+            invalidations = 0
+
+            async def pull_model(self, _model):
+                yield PullProgress(status="downloading", total=10, completed=3)
+                raise RuntimeError("connection reset by peer")
+
+            def invalidate_cache(self):
+                type(self).invalidations += 1
+
+        await main_module._run_pull(_Provider(), model)
+
+        state = main_module._PULLS[model]
+        assert state["state"] == "failed"
+        assert "connection reset" in state["error"]
+        assert state["finished_at"] is not None
+
+    async def test_a_stream_that_ends_without_success_is_a_failure(
+        self, monkeypatch
+    ):
+        """Silence is not success: an abruptly ended stream is reported."""
+        import api.main as main_module
+
+        monkeypatch.setattr(main_module, "_PULLS", {})
+        model = "big:70b"
+        main_module._PULLS[model] = {
+            "model": model, "state": "running", "status": "starting",
+            "total": 0, "completed": 0, "error": None,
+            "started_at": 1.0, "finished_at": None,
+        }
+
+        class _Provider:
+            async def pull_model(self, _model):
+                if False:
+                    yield None  # an async generator that yields nothing
+                return
+
+            def invalidate_cache(self):
+                raise AssertionError("a failed pull must not refresh models")
+
+        await main_module._run_pull(_Provider(), model)
+
+        state = main_module._PULLS[model]
+        assert state["state"] == "failed"
+        assert "without a success status" in state["error"]
+
+    def test_nothing_pulls_on_its_own(self):
+        """A health check, a probe or an installer must never download.
+
+        The route is the only caller in the tree; these three files are the
+        route, the wrapper and the client method itself.
+        """
+        import re as _re
+        from pathlib import Path
+
+        backend_root = Path(__file__).resolve().parents[1]
+        allowed = {
+            "api/main.py",
+            "services/ai_provider.py",
+            "services/ollama_client.py",
+        }
+        offenders = []
+        for path in sorted(backend_root.rglob("*.py")):
+            rel = path.relative_to(backend_root).as_posix()
+            if rel.startswith((".venv/", "tests/")) or rel in allowed:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if _re.search(r"\bpull_model\s*\(", source):
+                offenders.append(rel)
+        assert offenders == [], f"pull_model must stay explicit: {offenders}"
+
+
+class TestProbeIsHonest:
+    """A capability claim is only worth what measured it."""
+
+    @pytest.fixture
+    def frozen_ollama(self, monkeypatch):
+        """No test may ever reach a real Ollama — endpoints point at a wall."""
+        import api.main as main_module
+
+        monkeypatch.setattr(
+            main_module.config, "OLLAMA_BASE_URL", "http://127.0.0.1:1"
+        )
+        monkeypatch.setattr(main_module.config, "OLLAMA_TIMEOUT", 3.0)
+
+    async def test_a_non_ollama_provider_cannot_be_probed(
+        self, client, frozen_ollama
+    ):
+        from core.providers import save_provider
+
+        provider = await save_provider(
+            None, name="Cloud", kind="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        response = client.post("/settings/ai/probe", json={
+            "model": "some/model:free", "provider_id": provider["id"],
+        })
+        assert response.status_code == 400
+        assert "Ollama" in response.json()["error"]
+
+    async def test_an_unreachable_endpoint_says_so(self, client, frozen_ollama):
+        from core.providers import save_provider
+
+        await save_provider(
+            None, name="Local", kind="ollama", base_url="http://127.0.0.1:1"
+        )
+        response = client.post("/settings/ai/probe", json={"model": "any:7b"})
+        assert response.status_code == 400
+        assert "unreachable" in response.json()["error"]
+
+    async def test_a_missing_model_says_pull_first(
+        self, client, frozen_ollama, monkeypatch
+    ):
+        from services.ai_provider import HealthStatus, ModelInfo
+        import services.ollama_client as oc
+
+        class _FakeClient:
+            def __init__(self, base_url, timeout=None, **kwargs):
+                self.base_url = base_url
+
+            async def health_check(self):
+                return HealthStatus(
+                    provider="ollama", connected=True,
+                    endpoint=self.base_url, version="test",
+                    models=[
+                        ModelInfo(id="have:9b", name="have:9b", provider="ollama")
+                    ],
+                )
+
+            async def probe_capabilities(self, model):
+                raise AssertionError(
+                    "an uninstalled model must never be probed"
+                )
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(oc, "OllamaClient", _FakeClient)
+        from core.providers import save_provider
+
+        await save_provider(
+            None, name="Local", kind="ollama", base_url="http://127.0.0.1:1"
+        )
+        response = client.post(
+            "/settings/ai/probe", json={"model": "missing:1b"}
+        )
+        assert response.status_code == 404
+        assert "pull it first" in response.json()["error"]
+
+    async def test_probe_records_what_it_measured_and_changes_nothing_else(
+        self, client, frozen_ollama, monkeypatch
+    ):
+        """Capabilities update; the user's priority and disabled state do not."""
+        from core import db
+        from core.providers import list_models, save_model, save_provider
+        from services.ai_provider import HealthStatus, ModelInfo
+        from services.ollama_client import ModelCapabilities
+        import services.ollama_client as oc
+
+        provider = await save_provider(
+            None, name="Local", kind="ollama", base_url="http://127.0.0.1:1"
+        )
+        await save_model(
+            provider["id"], "have:9b", capabilities=["chat"], priority=7
+        )
+        await db.execute(
+            "UPDATE models SET enabled = 0 WHERE provider_id = ? "
+            "AND model_id = ?",
+            (provider["id"], "have:9b"),
+        )
+
+        caps = ModelCapabilities(model="have:9b")
+        caps.supports_streaming = True
+        caps.supports_tools = True
+        caps.context_window = 8192
+
+        class _FakeClient:
+            def __init__(self, base_url, timeout=None, **kwargs):
+                self.base_url = base_url
+
+            async def health_check(self):
+                return HealthStatus(
+                    provider="ollama", connected=True,
+                    endpoint=self.base_url, version="test",
+                    models=[
+                        ModelInfo(id="have:9b", name="have:9b", provider="ollama")
+                    ],
+                )
+
+            async def probe_capabilities(self, model):
+                return caps
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(oc, "OllamaClient", _FakeClient)
+        response = client.post(
+            "/settings/ai/probe", json={"model": "have:9b"}
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["capabilities"] == ["chat", "streaming", "tools"]
+        assert body["supports"]["tools"] is True
+        assert body["supports"]["structured_output"] is False
+        assert body["context_window"] == 8192
+        assert body["recorded"] is True
+
+        rows = await list_models(provider["id"], enabled_only=False)
+        row = rows[0]
+        assert "tools" in row["capabilities"]
+        assert row["context_length"] == 8192
+        # save_model's upsert overwrites both — the probe must not claim them:
+        assert row["priority"] == 7
+        assert row["enabled"] is False
+
+
 class TestTheErrorContract:
     """One shape for every REST failure: ``{"error": "<sentence>"}``.
 
@@ -276,11 +799,23 @@ class TestTheErrorContract:
     """
 
     def test_a_route_http_exception_uses_the_error_key(self, client):
-        response = client.get("/tasks/999999")
+        # `/reminders`, not `/tasks`: the agent task system moved into `/tasks`
+        # and answers with its own (more specific) 404 text. This test is about
+        # the error *key* contract, so it uses a route that still raises the
+        # plain "not found" it is asserting on.
+        response = client.get("/reminders/999999")
         assert response.status_code == 404
         body = response.json()
         assert set(body) == {"error"}, body
         assert body["error"] == "not found"
+
+    def test_the_core_404_also_uses_the_error_key(self, client):
+        """The core routers raise their own 404s; they get the same shape."""
+        response = client.get("/tasks/999999")
+        assert response.status_code == 404
+        body = response.json()
+        assert set(body) == {"error"}, body
+        assert "999999" in body["error"], "a 404 should name what was not found"
 
     def test_an_unmatched_path_uses_the_error_key(self, client):
         response = client.get("/definitely-not-a-route")

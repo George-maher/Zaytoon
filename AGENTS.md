@@ -20,11 +20,13 @@ Prerequisites:
   command — Zaytoon never downloads a model on its own.
 - **OpenRouter API key** — optional, only when `AI_PROVIDER=openrouter`.
 
-Desktop shell (optional, Python/customTkinter — spawns the backend itself):
+Desktop (optional, Python/pywebview — hosts the React UI and spawns the backend):
 ```bash
+cd frontend && npm run build              # produce dist/ for production mode
 cd desktop && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python main.py            # or: python main.py --diagnose
-# Ctrl+Space toggles the floating orb; Alt+Z switches orb <-> panel.
+.venv\Scripts\python main.py              # or: python main.py --diagnose
+.venv\Scripts\python main.py --dev        # connect to the Vite dev server instead
+.venv\Scripts\python scripts\smoke_desktop.py  # live proof: real window + bridge + CORS
 ```
 
 Root scripts (via `concurrently`):
@@ -37,7 +39,8 @@ Root scripts (via `concurrently`):
 ```
 backend/
 ├── main.py                 # Thin entry: sys.path.insert + uvicorn.run("main:app", ...)
-├── config.py               # Env-based config (python-dotenv)
+├── config.py               # Env-based config (python-dotenv); workspace default
+│                           #   and Config/.env loading delegate to core.paths
 ├── arabic.py               # Language detection, Egyptian markers, normalization
 ├── api/main.py             # FastAPI app factory, REST routes, CORS, lifespan
 ├── api/websocket.py        # WS handler, streaming TTS, session management
@@ -67,12 +70,27 @@ backend/
 │   ├── sandbox.py          # Unconditional blocks: shell metachars, path containment
 │   └── safety.py           # RiskAssessor + ConfirmationManager (human-in-the-loop)
 ├── memory/                 # ShortTermMemory, UserPreferences
-├── tests/                  # 27 test files, pytest-asyncio
+├── core/                   # The core runtime: tasks, projects, skills, providers,
+│   │                       #   workspace, git, permissions, events, secrets, paths
+│   ├── paths.py            # THE portable layout — one answer per location
+│   ├── db.py               # core.db schema + migrations (own file, see below)
+│   ├── secrets.py          # DPAPI / 0600 credential storage; no route returns one
+│   ├── events.py           # task.* / tool.* / model.* / permission.* vocabulary
+│   ├── permissions.py      # 10 named permissions derived from the tool tiers
+│   ├── orchestrator.py     # one turn → one task record, sequenced in one place
+│   ├── tasks/              # models (lifecycle) | store | manager | graph (DAG)
+│   ├── projects/           # detect | store | context (the per-turn preamble)
+│   ├── skills/             # manifest | registry (skill.json packages)
+│   ├── providers/          # capabilities | store | client | router
+│   ├── workspace/          # files (service) | terminal | git (service)
+│   └── api/                # tasks | projects | files | git | registry routers
+├── tests/                  # 45 test files (16 of them tests/core/), pytest-asyncio
 ├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
 ├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
 ├── scripts/verify_execution.py    # Live probe: tools, audit, dedupe, processes
 └── data/zaytoon.db         # SQLite (auto-created by MemoryAgent)
     data/audit.db           # Execution audit (separate file, see Execution layer)
+    data/core.db            # Core runtime (a THIRD file — see below)
 frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
 ├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
@@ -80,10 +98,11 @@ frontend/src/
 │   ├── Chat/ActivityFeed.jsx  # Agent progress: plan + tool_started/finished log
 │   └── SettingsPanel.jsx   # workspace root, API key, model chain, LLM metrics
 └── styles/index.css        # Tailwind + CSS vars + animations
-desktop/                    # Python/customTkinter floating orb + chat panel
-├── app/                    # Tk main thread; orb, panel, tray, hotkeys, WS client
+desktop/                    # Python/pywebview native host for the React UI
+├── app/                    # host.py (WebView window), bridge.py (JS ⇄ Python),
+│                           #   backend supervisor, single instance, protocol
 ├── scripts/build_exe.py    # PyInstaller onefile build
-└── tests/                  # pytest suite for the shell
+└── tests/                  # pytest suite (host, bridge, backend, legacy logic)
 ```
 
 ## Tool layer
@@ -546,6 +565,14 @@ transient. A shared file sounded simpler and was not.
 A failing audit write must never break a turn: every function swallows its own
 errors and logs once.
 
+### And so does the core runtime (`data/core.db`, override with `CORE_DB_PATH`)
+
+Same lesson, third application. The task records, project registry, skill table
+and provider registry are **not** in `zaytoon.db` (which the memory agent holds
+open for the life of the process) and **not** in `audit.db`. Three files, three
+owners. `tests/core/test_core_paths.py` asserts `audit._db_path() !=
+db.db_path()`, so a well-meaning consolidation cannot reintroduce the lock.
+
 ### Duplicate requests are dropped by id, not by text
 
 Content-based duplicate detection cannot catch a resend — the retry arrives
@@ -561,18 +588,56 @@ task cancelled in the call's `finally` — a heartbeat that outlives its tool is
 a permanent lie on the wire. `tools/metrics.py` counts calls, failures and
 average duration per tool and appears at `GET /health` under `metrics.tools`.
 
+## Portable layout (`core/paths.py`)
+
+`ZAYTOON_HOME` (set by the generated launchers) selects the layout. Resolution
+order for every location is: **explicit env var → `ZAYTOON_HOME/<Dir>` → the
+checkout's own `backend/data`**.
+
+- **Never writes.** Resolution is called from import-time health checks, and an
+  import that touches the filesystem is a side effect nobody can find.
+  `ensure()` is the only function that creates, and every caller asks for it.
+- `config_dir()`, `workspaces_dir()` and `skills_dir()` return **`None`** in a
+  checkout. That is the meaningful answer, not a convenience: a plausible-looking
+  wrong path sends someone looking for a file that does not exist, and a
+  `workspaces_dir()` path would silently change the default from
+  `~/ZaytoonWorkspace` to inside the source tree.
+- `config.py` delegates its workspace default here and loads
+  `ZAYTOON_HOME/Config/.env` with `override=False` — a variable already in the
+  environment was set deliberately, so the file must not overwrite it.
+- `secrets_path()` keeps `backend/data/secrets.json` for a checkout (an existing
+  install must not appear to lose its keys) and uses `Config/` only for a portable
+  one.
+- **Do not add a second resolver.** Two modules disagreeing about what a path
+  means is a containment hole, and this codebase has already paid for it once —
+  `tools/sandbox` had to be rewritten for exactly that.
+
+`install.sh` and `install.ps1` create `Application/ Config/ Data/ Models/ Skills/
+Workspaces/ Logs/ Cache/`, symlink (junction on Windows) `Application/{backend,
+frontend,desktop}` at the checkout, and write `Config/.env` **only if absent** —
+overwriting it would destroy the user's API keys and workspace choice on a
+reinstall, the single most destructive thing an installer can do. `Application/`
+is linked rather than copied because a copy installs a stale tree that then looks
+like a mystery bug while the user edits the checkout.
+
+Neither script downloads an AI model — pulling gigabytes is a decision, not an
+installation step — and a missing dependency is a **warning rather than an
+abort**: an installer that stops at the first absent tool leaves a
+half-installed system.
+
 ## Tests
 
 ```bash
-# backend (1405 tests)
+# backend (2307 tests)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
-# desktop shell (476 tests)
+# desktop shell (549 tests — includes the retained legacy suites; ~4 min,
+# test_audio_pipeline.py decodes real MP3 chunks)
 cd desktop
 ..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# frontend (221 tests + lint + build)
+# frontend (376 tests + lint + build)
 cd frontend
 npm run verify          # lint && test && build
 ```
@@ -630,6 +695,21 @@ npm run verify          # lint && test && build
   reports rather than fails on tool overlap and heartbeat cadence: real tools
   finish in milliseconds, so those two are proven by the suite instead.
 - `tests/test_summarization.py` — guards the abstract-`BaseAgent` silent failure.
+- `tests/core/` — the core runtime, 16 files:
+  - `test_core_paths.py` — layout precedence, and the three `None` answers.
+  - `test_core_git.py` — **real repositories** in a temp workspace: containment,
+    porcelain `-z` parsing (a file named `my notes.md` and `ملف.md`), NUL-separated
+    log records, remote vs local branches, and the REST status mapping. Skipped,
+    not failed, when git is absent.
+  - `test_core_orchestrator.py` — one turn → one task record; the preamble is built
+    **before** routing ("run the tests" means `pytest` or `npm test` depending on
+    the project, and a router told afterwards has already chosen); cancellation
+    reaches both the work and the record.
+  - `test_core_db.py`, `test_core_secrets.py`, `test_core_events.py`,
+    `test_core_tasks.py`, `test_task_graph.py`, `test_core_projects.py`,
+    `test_core_skills.py`, `test_core_providers.py`, `test_core_workspace.py`,
+    `test_core_terminal.py`, `test_api_core.py`, `test_api_providers.py`,
+    `test_api_tasks.py`, `test_api_workspace.py`.
 - `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
   the seam both the browser app and the desktop shell depend on.
 - `python scripts/verify_final.py` — live smoke check of all three areas. It is
@@ -654,6 +734,19 @@ React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
 - **Audit and processes are optional capabilities.** `ExecutionHistory.jsx`
   treats a 404 as "unavailable" and hides the processes card rather than showing
   an error, so the page works against a backend that predates the endpoints.
+- **`components/workspace/` is the application shell.** `WorkspaceShell.jsx` holds
+  three panels — *what is this project* (left), *what are we doing* (centre),
+  *what happened* (right). The centre survives every width; the rails collapse
+  into one drawer below 1280px. Below the breakpoint the drawer's single tab list
+  carries **both** rails' tabs, because hiding the task list and the terminal on a
+  phone loses the two things a user needs while work is running. `WorkspaceShell`
+  has one `inspector` function used by both layouts rather than two switches —
+  the previous version had two, and the drawer had already lost the task list.
+- **`components/workspace/GitPanel.jsx` distinguishes its failures.** A 404 is
+  "not a repository here" and hides the panel; a 403 is a containment decision
+  with no retry; a 409 shows git's own words, which are specific in a way a
+  paraphrase would not be. The commit input and the error banner are separate
+  state — sharing one means a failed commit eats the user's half-typed message.
 - **Outbound messages carry `client_msg_id`** (`lib/ids.js`, `crypto.randomUUID`
   with a manual fallback) so the server can drop a resent frame. A client that
   omits it behaves exactly as before.
@@ -912,118 +1005,218 @@ A `ConfirmationManager` is created per WebSocket session and stored on
 `SessionState.confirmation_manager`; it is resolved by `tool_confirm` and
 cancelled on disconnect, timeout, or `interrupt`.
 
-## Desktop (Python / customTkinter)
+## Desktop (Python / pywebview + React)
 
-`desktop/` is a **Python** application — a floating always-on-top orb plus an
-expanded chat panel, built on customTkinter. It is *not* Tauri, *not* Rust, and
-it does *not* embed the React frontend. It is an independent WebSocket client of
-the same `ws://127.0.0.1:8000/ws` endpoint the browser app uses.
+`desktop/` is a **native host** that presents the React/Vite UI inside a
+WebView. The React application is the primary desktop interface; the host is a
+thin native shell that provides window management, backend lifecycle and secure
+OS integration. It is *not* Tauri, *not* Electron, *not* Rust, and it does
+**not** render its own UI.
 
-> Historical note: this directory was migrated off a Tauri/Rust shell. The
-> `AGENTS.md` section and `.github/workflows/ci.yml` continued to describe the
-> Rust build for several revisions, which made the docs and CI actively wrong.
-> `desktop/tests/test_desktop_shell.py::TestNoRustResidue` now fails if that
-> drift is reintroduced.
+```
+┌─────────────────────────────┐
+│      Native Desktop Host    │   desktop/app/host.py  (pywebview)
+│       WebView/WebView2      │   desktop/app/bridge.py (JS ⇄ Python bridge)
+│             │               │
+│      React/Vite UI          │   frontend/dist/index.html  (or Vite dev server)
+└─────────────┬───────────────┘
+              │  ws://127.0.0.1:8000/ws  +  REST
+              ▼
+        Zaytoon Backend        (spawned or adopted by app/backend.py)
+```
+
+> Historical note: this directory was first migrated off a Tauri/Rust shell onto
+> a Python/customTkinter orb+panel shell, and then off Tk onto pywebview.
+> `desktop/tests/test_desktop_shell.py::TestNoRustResidue` fails if the Tauri
+> scaffolding or its documentation reappear.
 
 ```
 desktop/
-├── main.py                # entry: --diagnose, --console, then ZaytoonApp
+├── main.py                # entry: --diagnose, --dev, --no-backend
 ├── start_desktop.bat      # launcher (prefers backend\.venv\Scripts\python.exe)
-├── requirements.txt       # customtkinter, sounddevice, numpy, websockets,
-│                          #   keyboard, pystray, pillow
+├── requirements.txt       # pywebview, websockets
 ├── app/
-│   ├── app.py             # Tk main thread + queue.Queue pump (TICK_MS = 30)
-│   ├── states.py          # Inputs -> UiState + label (pure, unit-tested)
-│   ├── core.py            # reactive Canvas "core" visualisation
-│   ├── header.py          # identity, status pills, window controls
-│   ├── sidepanel.py       # model, task, tools, CPU/RAM, actions, processes
-│   ├── dialogs.py         # confirmation dialog (Allow / Cancel)
-│   ├── activity.py        # per-turn activity model (plan, tool rows)
-│   ├── orb.py             # floating orb: Tk Canvas, colour-key transparency
-│   ├── panel.py           # the shell: layout_plan, compute_wrap, MessageRow
-│   ├── backend.py         # FastAPI child-process supervisor
-│   ├── client.py          # blocking websockets.sync client + backoff reconnect
+│   ├── host.py            # WebViewHost: window, URL, health check, window state
+│   ├── bridge.py          # NativeBridge: the explicit JS ⇄ Python API
+│   ├── backend.py         # FastAPI child-process supervisor (unchanged)
+│   ├── instance.py        # single-instance named mutex (unchanged)
 │   ├── protocol.py        # the 4 outbound builders + ServerEvent decoding
-│   ├── audio.py           # mic capture / TTS playback, ring buffers, VAD
-│   ├── hotkeys.py         # global hotkeys via `keyboard`
-│   ├── tray.py            # pystray menu
-│   ├── config.py          # every value env-overridable
-│   └── theme.py           # colours + bilingual status labels
-├── icons/source.png       # 1024px orb asset
+│   ├── config.py          # every value env-overridable (+ dev/window options)
+│   └── app.py, orb.py, panel.py, core.py, header.py, sidepanel.py,
+│       dialogs.py, activity.py, states.py, theme.py, audio.py, hotkeys.py,
+│       tray.py, client.py  # legacy Tk shell modules (kept, no longer launched)
 ├── scripts/build_exe.py   # PyInstaller onefile build
-└── tests/                 # pytest suite for the shell
+├── scripts/smoke_desktop.py  # live proof: opens the real window, probes the
+│                           #   page + bridge + CORS, then closes itself
+└── tests/                 # pytest suite (host, bridge, backend lifecycle, …)
 ```
 
-- **Window:** undecorated (`overrideredirect`), always-on-top, no taskbar
-  button. Transparency is a **colour key** (`#000001`), not an alpha channel —
-  Tk has no alpha on Windows, so soft edges are faked with canvas stipple.
-- **The shell is a command center, not a chat window.** `states.py` is a pure
-  `(connection, status frame, intent, tool frames, audio, errors) -> UiState +
-  label` function — the single source the header pill, the core visualisation
-  and the status line all read, so they cannot disagree. `panel.set_ui_state()`
-  is the one fan-out point.
-- **Animations self-stop.** `core.AnimationLoop` runs one cancellable chain per
-  widget and `set_mode(static)` cancels it outright; `STATIC_STATES = {IDLE,
-  OFFLINE}`. The idle breathing ring lost to the "no permanent `after()` loop"
-  rule, and `test_core_animation` enforces the rule rather than the decoration.
-- **Tk never blocks.** `TelemetryWorker` owns every REST call and the ctypes
-  CPU/RAM sampling and pushes through the same `queue.Queue` as the socket —
-  no `urllib` or `websockets` call ever happens in a widget callback. CPU is
-  read with `GetSystemTimes` and RAM with `GlobalMemoryStatusEx` rather than
-  adding `psutil` as a dependency.
-- **The confirmation dialog is security-critical UI**, so `ConfirmationState`
-  makes it exactly one decision (allow or cancel once), `mark_resolved`
-  suppresses a late frame, and closing the window is a denial. It lives in its
-  own `CTkToplevel` so it is visible in orb mode.
-- `/audit` and `/processes` are **optional**: a 404 hides the card rather than
-  showing an error, because the shell must work against a backend that predates
-  them.
-- **Global hotkeys** via the `keyboard` package (low-level OS hook): `Ctrl+Space`
-  toggles the orb, `Alt+Z` switches orb ⇄ panel. Both are env-overridable
-  (`ZAYTOON_TOGGLE_HOTKEY`, `ZAYTOON_EXPAND_HOTKEY`). A binding failure degrades
-  to the tray menu and reports `HotkeyManager.error` — it never crashes.
-- **Backend lifecycle** (`app/backend.py`): probes `127.0.0.1:8000` with a bare
-  `socket.connect_ex` (no HTTP client needed). If nothing answers it spawns
+- **Runtime choice: `pywebview`.** It uses the OS's own WebView2 on Windows
+  (no bundled Chromium), so startup is fast, RAM is low, and packaging stays a
+  single PyInstaller file. The equivalent on Linux is GTK WebKit; the same
+  `webview` API covers both. Electron was rejected: it would ship ~150 MB of
+  Chromium and a Node runtime for a UI that already exists in `frontend/`.
+- **The React app is the application.** The host loads
+  `frontend/dist/index.html` in production (no internet connection required) or
+  `http://localhost:5173` with `--dev` / `ZAYTOON_DEV_MODE=1`. The React app's
+  own `useWebSocket.js` handles the backend connection, streaming, confirmations
+  and reconnection — the host does not duplicate any of it.
+- **The bridge is a closed set** (`app/bridge.py`): window controls, file/folder
+  dialogs, `reveal_in_os`, `open_path`, `open_url`, `notify`, clipboard, system
+  info, backend status/restart. Every method is explicitly registered and
+  JSON-serialisable; **no arbitrary Python, no `eval`/`exec`, no `shell=True`** —
+  asserted by `tests/test_bridge.py::TestSecurity`. Destructive actions are *not*
+  on the bridge; they travel through the backend's gated tool layer and its
+  confirmation flow, which is unchanged.
+- **The React side of the bridge** is `frontend/src/lib/desktop.js`: a wrapper
+  that resolves `window.pywebview.api` once and degrades to no-ops in a plain
+  browser, so the same bundle runs as web or desktop. `App.jsx` uses it for OS
+  reminders notifications.
+- **Backend lifecycle** (`app/backend.py`, unchanged): probes `127.0.0.1:8000`
+  with a bare `socket.connect_ex`. If nothing answers it spawns
   `ZAYTOON_BACKEND_{PYTHON,MAIN,CWD}` resolved in three tiers — explicit
   override → `backend/.venv` → the running interpreter — with `shell=False`,
-  `PYTHONUNBUFFERED=1` and `CREATE_NO_WINDOW` on Windows. It polls for up to
+  `PYTHONUNBUFFERED=1` and `CREATE_NO_WINDOW`. It polls for up to
   `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout.
 - **The safety property that matters:** `BackendProcess.shutdown()` returns
   immediately unless `self._spawned_by_us` is true, and `ensure_running()`
   *releases* its handle if a foreign process took the port. A backend the user
   started by hand is never killed. Covered by
   `TestBackendNeverTouchesAForeignProcess`.
+- **Single instance:** `app/instance.py` claims a named Windows mutex
+  (`Local\Zaytoon.Desktop.Shell.Instance`) before the window exists; a second
+  launch prints a message and exits. The kernel releases the mutex if the
+  owning process dies, so a crash cannot leave a stale lock.
+- **Startup sequence:** parse args → single-instance claim → `WebViewHost.run()`
+  → `backend.ensure_running()` → resolve URL (production file vs dev server) →
+  create window with `js_api=bridge` → start health-check thread →
+  `webview.start()`. On window close: save window state → stop health check →
+  `backend.shutdown()` (only if we spawned it).
+- **Health check:** a daemon thread probes the backend every 5s (0.1s under
+  pytest) and dispatches a `backend-health` CustomEvent into the page, so the
+  React UI can show link status without polling itself.
+- **The asset-server port is pinned, and the backend allowlists it.** In
+  production pywebview serves `frontend/dist` itself from a *random* port, and
+  a random origin is not one the backend's CORS allowlist recognises — the
+  page loads and looks fine while every REST call (reminders, health,
+  settings) is silently rejected. `host.pick_asset_server_port()` therefore
+  takes the first free port in **5175–5179** (override:
+  `ZAYTOON_DESKTOP_PORT`, which must stay inside the same range) and passes it
+  to `webview.start(http_port=…)`, and the backend's `allow_origin_regex`
+  matches `http://(localhost|127.0.0.1):517\d+`. **Keep the two ranges in
+  step.** A busy port is skipped rather than handed over: bottle would fail
+  inside its thread while pywebview still reports the address as healthy — a
+  blank window with no error anywhere.
+- **Window state** (size, position, maximized) is persisted to
+  `$ZAYTOON_HOME/window_state.json` — outside the installation directory, per
+  the portable-layout rule — and restored on the next launch. A corrupt file
+  degrades to defaults. Geometry reads go through `_geometry()`, because at
+  `closed` pywebview's `width`/`height` getters unpack `gui.get_size()` which
+  returns `None` once the native window is gone — a raw read dies with
+  `cannot unpack non-iterable NoneType object` and **the state was never
+  saved at all**.
 - **Repository root** is resolved by `config.default_repo_root()`:
   `ZAYTOON_REPO_ROOT` → source layout (`<repo>/desktop/app/config.py`) →
   `sys._MEIPASS` for a frozen build. `scripts/build_exe.py` tells the user to
   set `ZAYTOON_REPO_ROOT`; that variable is read by the code and asserted by
   `TestRepoRootDiscovery::test_build_exe_documents_the_env_var_that_exists`.
-- **Protocol** is centralised in `app/protocol.py` so the shell and the backend
-  cannot drift. The shell generates its **own** `response_id` per turn, which
-  is what makes `client.py`'s stale-stream guard able to drop tokens from a turn
-  the user already interrupted.
-- **Known gaps:** the shell handles no `reminder*` events and never sends
-  `reminder_cmd`, so a fired reminder is silently dropped (`TrayIcon.notify()`
-  exists but is unwired). Panel chrome beyond `theme.status_text` is English
-  only. `theme.py` has **two layers**: layer 1 (`VOID`, `CYAN`, `RADIUS == 0`)
-  is pinned by `test_design_parity.py` to `frontend/src/styles/theme.css`, and
-  layer 2 is the redesign's palette that widgets actually render with. They can
-  only be unified by moving the CSS first. Visuals cannot be verified headlessly
-  — the tests assert tokens and the animation contract, not appearance, so the
-  shell still needs a human to look at it.
+- **Protocol** is centralised in `app/protocol.py` so any Python client and the
+  backend cannot drift. The React client is the one in use; the builders remain
+  the reference for message shapes.
+- **Diagnose:** `python desktop/main.py --diagnose` reports the TCP probe,
+  interpreter resolution, `pywebview`/`websockets` imports, the presence of a
+  production frontend build, and the **WebView2 runtime itself** (registry +
+  fixed-path check on Windows, not merely that `pywebview` imports) — then a
+  verdict with the download URL when it is missing. It exits non-zero on a
+  real problem instead of opening a broken window; `WebViewHost.run()` fails
+  fast with the same message before any window is created.
 - **Build:** `python desktop/scripts/build_exe.py` → `desktop/dist/Zaytoon.exe`
-  (PyInstaller onefile, portable, no installer). The backend is deliberately
-  **not** frozen in — `faster-whisper` + `edge-tts` push a bundle past 500 MB.
-  Ship `backend/` as files and point `ZAYTOON_REPO_ROOT` at the install dir.
-- **Diagnose:** `python desktop/main.py --diagnose` checks the TCP probe,
-  interpreter resolution, optional imports, audio devices, display
-  `windowingsystem`, and actually binds then unbinds both hotkeys.
+  (PyInstaller onefile, portable). The backend and the frontend bundle are
+  deliberately **not** frozen in: ship `backend/` and `frontend/dist/` as files
+  next to the exe, or point `ZAYTOON_REPO_ROOT` at the install dir. The frontend
+  is loaded from disk, so the installed app works offline.
+- **Legacy Tk modules** (`app.py`, `orb.py`, `panel.py`, `core.py`,
+  `theme.py`, …) are retained for reference and the **whole legacy suite still
+  runs against them** (`test_states`, `test_app_wiring`, `test_core_animation`,
+  `test_activity_model`, `test_single_instance`, `test_telemetry`, plus the
+  hotkey/audio/sidepanel cases in `test_desktop_shell.py` and
+  `test_audio_pipeline.py`) — no test was deleted when the entry point moved.
+  They are **not** imported by `main.py` any more. `requirements.txt` carries
+  only the shipped runtime (`pywebview`, `websockets`); the legacy test deps
+  (`customtkinter`, `keyboard`, `numpy`, `sounddevice`, `av`) moved to
+  `requirements-dev.txt`, which is what CI installs.
+- **Tests:** `tests/test_host.py` (URL resolution, window state, health check,
+  diagnostics, WebView2 detection, the pinned asset-server port),
+  `tests/test_bridge.py` (every bridge method, a real clipboard round trip,
+  the notification-encoding fixes, and the security invariants),
+  `tests/test_desktop_shell.py` (repo discovery, backend lifecycle, protocol,
+  packaging guards), plus the full retained legacy suite above.
+- **Live proof:** `python desktop/scripts/smoke_desktop.py` opens a real
+  window against the production build, then checks — from inside the actual
+  page — that React mounted, the bridge answers (`get_system_info`,
+  `get_app_path`, …) and `fetch('http://127.0.0.1:8000/health')` survives
+  CORS, before closing itself and stopping the backend it spawned. It is the
+  only check that exercises pywebview + WebView2 + the built bundle
+  together; unit tests cannot. Add `--keep` to leave the window open.
+
+## Recent increments (IMPLEMENTATION_MAP Phases 4–9)
+
+- **AI settings (Ph4):** `POST /settings/ai` persists — the API key goes to
+  `core.secrets` (never `kv`, never echoed on any read; asserted by
+  `test_no_read_path_returns_the_saved_key`), everything else to `kv`
+  (`services/ai_settings.py`, applied best-effort at lifespan). Pull is
+  explicit and single-flight (`POST /settings/ai/pull` — background, strict
+  name regex, 409 concurrent); nothing else in the tree calls `pull_model(`.
+  Per-tier pins live at `GET/POST /models/tiers`.
+- **Skill tools (Ph5):** an enabled skill may ship `tools/*.py` with
+  `build_tools()`; `core.skills.load_skill_tools()` loads them into the one
+  live `ToolRegistry` at lifespan (so `/tools`, health, the agent catalogue and
+  execution all see them). Contained realpath import, per-skill module
+  namespace, **permission floor: a skill cannot self-declare `safe`** (raised
+  to `confirm` at registration *and* enforced at the gate — see
+  `TestSkillToolsAreGated`), name collisions refused, failures reported never
+  fatal.
+- **What the model changed (Ph6):** `BaseTool.mutates_files` + a per-turn
+  recorder in the orchestrator → `task.tools_used` / `task.files_changed` and a
+  `file.changed` event (failed/declined tools count as used but claim no file
+  change). FileExplorer badges the rows (`changed` prop); GitPanel has merge UI.
+- **Command centre (Ph7):** header nav (Project/Model/System/Settings) and the
+  dock's panel strip (TERM/LOG/DIFF/TASK, tablist named **"Quick access"** —
+  it must not collide with the drawer's "Panels") both write shell focus
+  through App-level `tab`/`inspectorTab` state. The System inspector tab reads
+  `GET /system`'s `resources` (CPU delta-sampling returns `sampling` on the
+  first reading — never a fabricated `0%`; network is `unavailable` + reason)
+  and `uptime_seconds`, plus `llm.metrics.by_model_latency_ms` from `/health`.
+- **Diagnostics (Ph8):** `GET /events/recent` exposes the core bus's ring
+  buffer — clamped to 1–100 by `EventBus.recent()` and passed through
+  `reporting.redact_payload()` (structured redaction: string values masked,
+  keys and counters untouched). Every failing response across all failure
+  classes is pinned as `{"error": str}` (never FastAPI's `{"detail": ...}`)
+  by `TestErrorShapeIsUnified`.
+- **E2E verification (Ph9):** `backend/scripts/e2e_scenarios.py` drives seven
+  scripted acceptance scenarios over the real WebSocket (bilingual turn, safe
+  tool, confirmation approve/decline, reminder round-trip, diagnostics shapes,
+  containment + audit, policy guards) and finished **7/7**. It caught four
+  defects no unit test covered, each now pinned by a test: the WS
+  `reminder_cmd` call site whose function was never written
+  (`tests/test_websocket_reminders.py` drives the real handler), reminders
+  partitioned by an ephemeral session id (**decision: `session_id` is
+  attribution, not a partition** — list defaults to workspace-wide,
+  `TestReminderVisibility`), `ToolAgent._make_approval` referencing the
+  module-level notice dicts as `self._DECLINED` (every non-approval branch
+  raised `AttributeError`; `TestApprovalCallbackNotices`), and the
+  `expect_tool` nag driving a *declined* turn to `no_tool_taken`
+  (`AgentEngine.gate_refused` exempts prose only after a real gate refusal;
+  `test_a_decline_exempts_prose_from_the_tool_nag`). The runner waits for the
+  terminal `done` frame, which the transport emits only after TTS drain.
 
 ## Notes
 
 - CI is GitHub Actions (`.github/workflows/ci.yml`): three jobs — `backend`
   (Windows, py3.11, policy guards + pytest + live smoke check), `frontend`
-  (Node 20, lint/typecheck/build/test), and `desktop` (Python shell tests).
+  (Node 20, lint/test/build), and `desktop` (Python shell tests; installs only
+  `desktop/requirements-dev.txt`, which is what makes that job a real
+  clean-machine check).
 - No formatter or typechecker is configured for Python. The frontend is
   **JavaScript/JSX, not TypeScript** — there is no `tsconfig.json`.
 - Dockerfiles exist for both services and `docker-compose.yml` wires them

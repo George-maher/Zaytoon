@@ -448,6 +448,42 @@ describe('inbound: reminders', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('one owner per event class', () => {
+  it('renders one activity row per tool even when both vocabularies arrive', async () => {
+    // Two buses are relayed onto the wire for the same tool turn: the agent's
+    // own `tool_started` (underscore) and the core bus's `tool.started`
+    // (dotted — `CoreEvent.to_dict()` flattens the type). The renderer owns
+    // only the first; a second owner would double every tool row, the exact
+    // class of bug that once rendered whole messages twice.
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'tool_started', name: 'file_write', label: 'Write' })
+      socket.emit({ type: 'tool.started', name: 'file_write', task_id: 3 })
+      socket.emit({ type: 'tool_progress', name: 'file_write', message: 'writing' })
+      socket.emit({ type: 'tool_finished', name: 'file_write', success: true, summary: 'ok' })
+      socket.emit({ type: 'tool.completed', name: 'file_write', success: true })
+    })
+
+    const rows = result.current.activity.filter((e) => e.name === 'file_write')
+    // Started + progress + finished — the dotted forms added nothing.
+    expect(rows).toHaveLength(3)
+    expect(rows.filter((e) => e.kind === 'started')).toHaveLength(1)
+    expect(rows.filter((e) => e.kind === 'finished')).toHaveLength(1)
+  })
+
+  it('adds nothing when only the core dotted form arrives', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'tool.started', name: 'file_write', task_id: 3 })
+      socket.emit({ type: 'tool.completed', name: 'file_write', success: true })
+    })
+
+    expect(result.current.activity).toHaveLength(0)
+  })
+})
+
 describe('robustness', () => {
   it('survives a malformed frame without tearing down the connection', async () => {
     const { result, socket } = await mount()

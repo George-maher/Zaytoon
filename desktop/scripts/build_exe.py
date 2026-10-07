@@ -1,19 +1,11 @@
-"""Build a standalone Zaytoon-desktop executable with PyInstaller.
+"""Build a standalone Zaytoon desktop executable with PyInstaller.
 
     python desktop/scripts/build_exe.py            # build
     python desktop/scripts/build_exe.py --clean    # rebuild from scratch
 
-This replaces what Tauri's ``msi``/``nsis`` bundlers used to do. The
-difference worth knowing: PyInstaller produces a **portable** ``.exe`` that
-needs no installer, and it does **not** bundle the Python backend. The shell
-still finds the backend through the same ``ZAYTOON_BACKEND_*`` variables it
-uses in development, so a portable build expects ``backend/`` to sit next to
-the executable (or to be pointed at with ``ZAYTOON_REPO_ROOT``).
-
-The backend is deliberately not frozen into the exe: ``faster-whisper`` plus
-``edge-tts`` pushes a PyInstaller bundle past 500 MB, and freezing the model
-cache into an exe makes upgrades painful. Ship the backend as files and let the
-exe drive it.
+The desktop application hosts the React/Vite UI through pywebview (WebView2 on
+Windows). The backend is deliberately not frozen into the exe — the host finds
+it through the same ``ZAYTOON_BACKEND_*`` variables it uses in development.
 """
 
 from __future__ import annotations
@@ -27,32 +19,19 @@ from pathlib import Path
 DESKTOP = Path(__file__).resolve().parent.parent
 REPO = DESKTOP.parent
 ENTRY = DESKTOP / "main.py"
-ICON = DESKTOP / "icons" / "source.png"
 DIST = DESKTOP / "dist"
 BUILD = DESKTOP / "build"
 
-#: Hidden imports that PyInstaller's static analysis cannot see. `keyboard`
-#: and `pystray` both resolve their backend at runtime, and the PortAudio
-#: bindings in `sounddevice` are loaded through cffi.
+#: Hidden imports that PyInstaller's static analysis cannot see.
 HIDDEN_IMPORTS = [
     "app",
-    "app.app",
-    "app.audio",
     "app.backend",
-    "app.client",
+    "app.bridge",
     "app.config",
-    "app.hotkeys",
-    "app.orb",
-    "app.panel",
+    "app.host",
+    "app.instance",
     "app.protocol",
-    "app.theme",
-    "app.tray",
-    "keyboard",
-    "pystray",
-    "pystray._win32",
-    "sounddevice",
-    "websockets.sync.client",
-    "websockets.sync.connection",
+    "webview",
 ]
 
 
@@ -71,15 +50,11 @@ def check_prerequisites() -> list[str]:
     except ImportError:
         problems.append("PyInstaller is not installed (pip install pyinstaller)")
 
-    for module in ("customtkinter", "numpy", "PIL", "websockets"):
+    for module in ("webview", "websockets"):
         try:
             __import__(module)
         except ImportError:
             problems.append(f"missing runtime dependency: {module}")
-
-    if not ICON.exists():
-        # Cosmetic, but the exe would get a default icon.
-        problems.append(f"missing icon asset: {ICON}")
 
     return problems
 
@@ -115,8 +90,6 @@ def build(clean: bool = False, console: bool = False) -> int:
         str(DESKTOP),
     ]
     args.append("--console" if console else "--windowed")
-    if ICON.exists():
-        args += ["--icon", str(ICON)]
     for module in HIDDEN_IMPORTS:
         args += ["--hidden-import", module]
     args.append(str(ENTRY))

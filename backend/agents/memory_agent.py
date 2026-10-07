@@ -345,14 +345,33 @@ class MemoryAgent:
         }
 
     async def list_reminders(
-        self, status: str = "pending", session_id: str = "default"
+        self, status: str = "pending", session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        """Rows for ``status`` in due-first order.
+
+        ``session_id`` is **attribution, not a partition**: a reminder set from
+        a conversation must outlive the socket that created it — the WS session
+        id changes on every reconnect, so filtering by it hides a reminder from
+        every future view of the panel. The default therefore lists every
+        session; an explicit id still filters for callers that want one
+        session's rows.
+
+        The firing path (`get_due_reminders`) never filtered on session, which
+        is why this showed up as "the reminder says it was set but the panel is
+        empty" rather than as a reminder that never fired.
+        """
         await self._ensure_initialized()
         db = await self._get_db()
-        async with db.execute(
-            "SELECT * FROM reminders WHERE status = ? AND session_id = ? ORDER BY remind_time",
-            (status, session_id),
-        ) as cursor:
+        if session_id:
+            query = (
+                "SELECT * FROM reminders WHERE status = ? AND session_id = ? "
+                "ORDER BY remind_time"
+            )
+            params: tuple = (status, session_id)
+        else:
+            query = "SELECT * FROM reminders WHERE status = ? ORDER BY remind_time"
+            params = (status,)
+        async with db.execute(query, params) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 

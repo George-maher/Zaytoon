@@ -124,7 +124,15 @@ class ReminderService:
                 return f"Done. I'll remind you to '{task}' on {day_str} at {time_str} {rec_en.get(recurring.value, '')}."
             return f"Done. Reminder set: '{task}' for {day_str} at {time_str}."
 
-    async def list(self, status: str = "pending", session_id: str = "default") -> List[dict]:
+    async def list(
+        self, status: str = "pending", session_id: Optional[str] = None
+    ) -> List[dict]:
+        """Pending reminders (or ``status``), due-first.
+
+        ``session_id=None`` lists **every** session — the default, because a
+        reminder outlives the conversation that created it (see
+        ``MemoryAgent.list_reminders``). Pass an id to filter deliberately.
+        """
         rows = await self._memory.list_reminders(status=status, session_id=session_id)
         return [ReminderData.from_db_row(r).to_dict() for r in rows]
 

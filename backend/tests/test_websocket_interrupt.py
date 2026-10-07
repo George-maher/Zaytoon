@@ -24,7 +24,13 @@ from domain.models import TokenBucketRateLimiter
 class FakeWebSocket:
     """Minimal WebSocket double that records what the server sent."""
 
-    def __init__(self, incoming, idle_grace=0.3):
+    def __init__(self, incoming, idle_grace=1.0):
+        # The grace covers everything the *scheduled* turn still has to do
+        # after the last incoming frame: a turn now writes a task record
+        # (create + transitions against core.db) on its way to the `error` /
+        # `done` frames, and 0.3s was the size of a turn that wrote nothing —
+        # under full-suite load it expired first and the disconnect's
+        # `state.cancel()` cancelled the turn before it could report.
         self.incoming = list(incoming)
         self.idle_grace = idle_grace
         self.sent: list[dict] = []

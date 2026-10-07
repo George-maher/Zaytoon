@@ -199,3 +199,87 @@ class TestRouterAgentRoute:
         assert result["intent"] == "tools"
         assert result["reasoning"] == "keyword_match"
         assert not called
+
+    #: What the orchestrator prepends in a detected git project. Every line of
+    #: it matches a keyword rule — `git`, `npm`, `run … tests` — which is
+    #: exactly the hazard being tested.
+    PREAMBLE = (
+        "PROJECT: demo (/tmp/demo)\n"
+        "Type: node\n"
+        "Detected: language=javascript, package manager=npm, git repo on main\n"
+        "Commands (detected defaults — correct them if they look wrong):\n"
+        "  run: npm start\n"
+        "  test: npm test"
+    )
+
+    async def test_the_preamble_would_match_keyword_rules_by_itself(self):
+        """The control: prove the hazard is real, not theoretical."""
+        # Without splitting, the git/npm rules fire on the preamble alone — so
+        # the tests below are meaningful rather than vacuously green.
+        matched = [
+            intent
+            for pattern, intent, _conf in KEYWORD_ROUTES
+            if pattern.search(self.PREAMBLE.lower())
+        ]
+        assert "tools" in matched, "expected the preamble to match a keyword rule"
+
+    async def test_a_preamble_is_not_read_as_a_request(self):
+        """The misroute: a greeting in a git project must stay a greeting.
+
+        Full-text scanning gives `tools` (the git rule at 0.9 outranks the
+        catch-all); only the user's own message can produce `chat`.
+        """
+        agent = RouterAgent()
+
+        async def _fail(*args, **kwargs):
+            raise AssertionError("the LLM should not have been consulted")
+
+        agent.get_ai_response = _fail
+        result = await agent.route(f"{self.PREAMBLE}\n\ntell me a joke", [])
+
+        assert result["intent"] == "chat"
+        assert result["reasoning"] == "keyword_match"
+
+    async def test_a_greeting_after_a_preamble_is_still_a_greeting(self):
+        # The greeting rule is anchored (^…$) — it only ever matched bare
+        # messages, and only a split keeps it able to.
+        agent = RouterAgent()
+
+        async def _fail(*args, **kwargs):
+            raise AssertionError("the LLM should not have been consulted")
+
+        agent.get_ai_response = _fail
+        result = await agent.route(f"{self.PREAMBLE}\n\nhello", [])
+
+        assert result["intent"] == "chat"
+        assert result["confidence"] == 0.95
+
+    async def test_the_users_message_still_routes_with_a_preamble(self):
+        """Splitting must not lose the request itself — the point of the preamble."""
+        agent = RouterAgent()
+
+        async def _fail(*args, **kwargs):
+            raise AssertionError("the LLM should not have been consulted")
+
+        agent.get_ai_response = _fail
+        result = await agent.route(f"{self.PREAMBLE}\n\nwhat time is it", [])
+
+        assert result["intent"] == "tools"
+        assert result["reasoning"] == "keyword_match"
+
+    async def test_a_multi_paragraph_message_routes_from_its_last_part(self):
+        """A preamble-free message with blank lines still resolves, and the LLM
+        fallback (which sees the whole text) is the safety net for a keyword
+        that lives in an earlier paragraph."""
+        agent = RouterAgent()
+        seen = {}
+
+        async def _record(messages):
+            seen["message"] = messages[-1]["content"]
+            return '{"intent": "chat", "confidence": 0.5}'
+
+        agent.get_ai_response = _record
+        await agent.route("first paragraph about reminders\n\nhello there", [])
+
+        # The full message reached the LLM, so nothing was thrown away.
+        assert "reminders" in seen["message"]

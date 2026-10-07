@@ -272,10 +272,15 @@ function SettingsPanel({ open, onClose, language = "en" }) {
   const llm = health?.llm || {};
   const chain = Array.isArray(llm.chain) ? llm.chain : [];
   const metrics = llm.metrics || {};
-  // Tool-call telemetry, when the backend reports it: an object such as
-  // `{ calls, failed, avg_ms }`. Absent on older builds — nothing renders,
-  // rather than a row of zeroes claiming a measured zero.
-  const toolMetrics = metrics.tools && typeof metrics.tools === "object" ? metrics.tools : null;
+  // Tool-call telemetry lives at the health payload's **top** level
+  // (`health.metrics.tools`); `llm.metrics` has never carried it, so this
+  // row read nothing no matter what the backend reported. Absent on older
+  // builds — nothing renders, rather than a row of zeroes claiming a
+  // measured zero.
+  const toolMetrics =
+    health?.metrics && typeof health.metrics.tools === "object"
+      ? health.metrics.tools
+      : null;
   const rejected = Array.isArray(llm.rejected_models) ? llm.rejected_models : [];
   const voice = health?.voice || {};
   const safety = health?.safety || {};

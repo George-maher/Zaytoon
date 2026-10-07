@@ -39,11 +39,22 @@ const ICONS = [
   },
 ];
 
+//: The shell-focus shortcuts in the dock: ids match the inspector's panel
+//: ids (`log` and `diff` are centre-column jumps handled by the caller).
+const PANELS = [
+  { id: "terminal", label: "TERM" },
+  { id: "log", label: "LOG" },
+  { id: "diff", label: "DIFF" },
+  { id: "tasks", label: "TASK" },
+];
+
 function BottomDock({
   onMicToggle,
   onLanguageToggle,
   onSettingsToggle,
   onStop,
+  onPanelSelect,
+  activePanel,
   voiceMode,
   language,
   status,
@@ -121,6 +132,50 @@ function BottomDock({
           </button>
         );
       })}
+
+      {/* Panel shortcuts — a tab strip, not controls: these *move the focus*
+          (terminal, execution log, diff view, tasks) and nothing runs. Kept
+          as a separate group so the system buttons above — MIC/LANG/CONF/
+          STOP — are untouched: one row navigates, the other acts. */}
+      <div
+        className="flex items-center"
+        style={{
+          gap: "var(--space-1)",
+          marginInlineStart: "var(--space-2)",
+          paddingInlineStart: "var(--space-2)",
+          borderInlineStart: "var(--border-w) solid var(--hud-edge-faint)",
+        }}
+        role="tablist"
+        // Deliberately *not* "Panels": the narrow drawer's tab list already
+        // owns that name, and two tablists answering to one accessible name
+        // makes every `getByRole` ambiguous — for assistive technology too.
+        aria-label={language === "ar" ? "الوصول السريع" : "Quick access"}
+      >
+        {PANELS.map((panel) => {
+          const active = activePanel === panel.id;
+          return (
+            <button
+              key={panel.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => onPanelSelect?.(panel.id)}
+              className="hud-micro"
+              title={panel.label}
+              style={{
+                padding: "var(--space-1) var(--space-2)",
+                color: active ? "var(--hud-cyan)" : "var(--hud-text-mute)",
+                border: "var(--border-w) solid",
+                borderColor: active
+                  ? "var(--hud-edge-strong)"
+                  : "var(--hud-edge-faint)",
+              }}
+            >
+              {panel.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

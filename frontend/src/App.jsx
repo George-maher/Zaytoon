@@ -1,8 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import useWebSocket from "./hooks/useWebSocket";
+import useWorkspace from "./hooks/useWorkspace";
 import { statusLabel } from "./lib/statusLabels";
+import { desktop } from "./lib/desktop";
 import AICore from "./components/hud/AICore";
-import SystemStatus from "./components/hud/SystemStatus";
 import MissionStatus from "./components/hud/MissionStatus";
 import StatusIndicator from "./components/hud/StatusIndicator";
 import { resolveState } from "./components/hud/hudState";
@@ -15,21 +16,27 @@ import ChatTranscript from "./components/Chat/ChatTranscript";
 import ConfirmationDialog from "./components/ConfirmationDialog";
 import ReminderPanel from "./components/ReminderPanel";
 import SettingsPanel from "./components/SettingsPanel";
+import WorkspaceShell from "./components/workspace/WorkspaceShell";
 
 /**
- * Zaytoon command deck.
+ * Zaytoon: a workspace with a conversation in it, not a chat with panels
+ * attached.
  *
- * Composition, per docs/DESIGN_SYSTEM.md §5:
+ * Composition, per docs/DESIGN_SYSTEM.md §5 and docs/ARCHITECTURE.md §6:
  *
- *   header   identity · reminders · language · state LED
- *   left     live backend telemetry
- *   centre   AI core, with the conversation beneath it
- *   right    mission state and the engine's activity feed
- *   console  command input + system controls
+ *   shell     header, then three columns
+ *   left      projects · files · skills · models   — *what is this project*
+ *   centre    transcript + activity + console + editor — *what are we doing*
+ *   right     tasks · terminal                    — *what happened*
  *
- * The rails collapse into a tabbed drawer below 1024px rather than merely
- * shrinking: the core and the console are the two things that must survive on
- * a phone, and a 12px-wide squeezed rail helps nobody.
+ * The rails collapse into a tabbed drawer below 1280px rather than merely
+ * shrinking: the centre column is the two things that must survive on a phone,
+ * and a 12px-wide squeezed rail helps nobody.
+ *
+ * The confirmation dialog is mounted **here, above everything**, and is not part
+ * of the shell. That is deliberate and load-bearing: the approval gate is a
+ * security boundary, and a boundary that a layout decision could move or hide is
+ * not one.
  */
 
 /**
@@ -57,37 +64,6 @@ function useWide() {
   return wide;
 }
 
-function RailTabs({ tabs, active, onSelect, language }) {
-  const ar = language === "ar";
-  return (
-    <div
-      className="flex"
-      style={{ gap: "var(--space-1)", padding: "var(--space-1) var(--space-2) 0" }}
-      role="tablist"
-      aria-label={ar ? "اللوحات" : "Panels"}
-    >
-      {tabs.map((t) => (
-        <button
-          key={t.id}
-          role="tab"
-          aria-selected={active === t.id}
-          onClick={() => onSelect(t.id)}
-          className="hud-micro transition-colors"
-          style={{
-            padding: "var(--space-1) var(--space-3)",
-            color: active === t.id ? "var(--hud-cyan)" : "var(--hud-text-mute)",
-            border: "var(--border-w) solid",
-            borderColor: active === t.id ? "var(--hud-edge-strong)" : "var(--hud-edge-faint)",
-            background: active === t.id ? "color-mix(in srgb, var(--hud-cyan) 6%, transparent)" : "transparent",
-          }}
-        >
-          {t.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 export default memo(function App() {
   const {
     messages, isConnected, everConnected, isTyping, status, language, setLanguage,
@@ -95,12 +71,62 @@ export default memo(function App() {
     sendMessage, sendReminderCmd, refreshReminders, clearChat,
     startVoiceMode, stopVoiceMode, pendingConfirmation, respondToConfirmation,
     speakingVoice, plan, activeTool, activity, intent, requestStop,
+    tasks, activeTask, cancelTask, terminalLines, watchTerminal, fileChanges,
   } = useWebSocket();
 
+  // The workspace is a separate hook rather than more state here, so the file
+  // tree, the editor buffer and the terminal survive a transcript clear and can
+  // be tested without mounting the socket.
+  const workspace = useWorkspace(language);
+
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [tab, setTab] = useState("sys");
   const containerRef = useRef(null);
   const wide = useWide();
+
+  // The reminder list lives in hook state and is populated only by a
+  // `reminder_list` frame, so ask for one as soon as the socket is up.
+  // Without this the panel reads "No pending reminders" until someone finds
+  // the refresh button — a *false* statement whenever a reminder exists.
+  useEffect(() => {
+    if (isConnected) refreshReminders();
+  }, [isConnected, refreshReminders]);
+
+  // The shell's panel focus lives here because the bottom dock — rendered
+  // into the command console, *outside* WorkspaceShell — drives it too. The
+  // header nav inside the shell writes through the same two setters, so
+  // there is exactly one source of truth for "what is open".
+  const [shellTab, setShellTab] = useState("projects");
+  const [shellInspectorTab, setShellInspectorTab] = useState("tasks");
+
+  /**
+   * The dock's panel strip (TERM / LOG / DIFF / TASK).
+   *
+   * TERM and TASK move the inspector — and, below the breakpoint, the shared
+   * drawer tab, which is what `shellTab` is down there. LOG and DIFF are
+   * centre-column jumps (the execution log, the editor): there is no rail
+   * panel for them to switch *to*, so they scroll rather than pretend.
+   * `scrollIntoView?.()` is called optionally because jsdom does not
+   * implement it — a control that throws in a test browser would be a
+   * control that lies.
+   */
+  const handlePanelSelect = useCallback(
+    (id) => {
+      if (id === "log" || id === "diff") {
+        document
+          .getElementById(id === "log" ? "zaytoon-activity" : "zaytoon-editor")
+          ?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+        return;
+      }
+      setShellInspectorTab(id);
+      if (!wide) setShellTab(id);
+    },
+    [wide],
+  );
+
+  // Which strip button reads as active: the inspector when wide, the shared
+  // drawer tab when not. Centre jumps have no persistent panel and so never
+  // claim one; a left-rail id (files, …) matches no strip button.
+  const dockPanel = wide ? shellInspectorTab : shellTab;
 
   const state = useMemo(
     () => resolveState({ isConnected, pendingConfirmation, awaitingCommand, isListening, isTyping, isSpeaking, status }),
@@ -172,24 +198,32 @@ export default memo(function App() {
     return () => cancelAnimationFrame(raf);
   }, [language]);
 
+  // Native bridge integration: use OS notifications for reminders when running
+  // inside the desktop host. In a regular browser this is a no-op.
+  useEffect(() => {
+    if (!desktop.available) return;
+    if (reminders.length > 0) {
+      const latest = reminders[reminders.length - 1];
+      if (latest && latest.task) {
+        desktop.notify("Zaytoon Reminder", latest.task);
+      }
+    }
+  }, [reminders]);
+
   const ar = language === "ar";
 
-  const leftRail = (
-    <div
-      data-enter="left"
-      className="flex flex-col overflow-y-auto min-h-0"
-      style={{ gap: "var(--space-3)", padding: "var(--space-3)" }}
-    >
-      <SystemStatus language={language} />
-    </div>
-  );
-
-  const rightRail = (
-    <div
-      data-enter="right"
-      className="flex flex-col overflow-y-auto min-h-0"
-      style={{ gap: "var(--space-3)", padding: "var(--space-3)" }}
-    >
+  /**
+   * What the rails carry on top of their tabs.
+   *
+   * The mission summary stays above the inspector. Telemetry *moved*: `—
+   * SystemStatus` is now the inspector's **System** tab (a right-rail panel,
+   * where the command-centre map puts it), so the left rail starts at its
+   * tab list — which is what a workspace rail should open with — and the
+   * system figures are one click away instead of permanently occupying the
+   * top of the project list.
+   */
+  const extras = {
+    right: (
       <MissionStatus
         intent={intent}
         state={state}
@@ -199,16 +233,8 @@ export default memo(function App() {
         reminders={reminders}
         language={language}
       />
-      <Panel title={ar ? "نشاط التنفيذ" : "EXECUTION LOG"} code="LOG">
-        <ActivityFeed
-          plan={plan}
-          activeTool={activeTool}
-          activity={activity}
-          language={language}
-        />
-      </Panel>
-    </div>
-  );
+    ),
+  };
 
   return (
     <div
@@ -263,128 +289,116 @@ export default memo(function App() {
       </header>
 
       {/* ---------------------------------------------------------------- */}
-      <main className="flex-1 flex overflow-hidden min-h-0">
-        {/* Rails, from 1280px up. */}
-        {wide && (
-          <>
-            <aside
-              className="flex-none w-[268px] flex flex-col overflow-hidden"
-              style={{ borderInlineEnd: "var(--border-w) solid var(--hud-edge-faint)" }}
-              aria-label={ar ? "معلومات النظام" : "System information"}
-            >
-              {leftRail}
-            </aside>
-
-            <aside
-              className="flex-none w-[300px] flex flex-col overflow-hidden"
-              style={{ borderInlineStart: "var(--border-w) solid var(--hud-edge-faint)" }}
-              aria-label={ar ? "حالة المهمة" : "Mission state"}
-            >
-              {rightRail}
-            </aside>
-          </>
-        )}
-
-        {/* Below 1280px the rails become one tabbed drawer. */}
-        {!wide && (
-          <div
-            className="flex-none w-full max-h-[34vh] flex flex-col overflow-hidden"
-            style={{ borderBottom: "var(--border-w) solid var(--hud-edge-faint)" }}
-          >
-            <RailTabs
-              language={language}
-              active={tab}
-              onSelect={setTab}
-              tabs={[
-                { id: "sys", label: ar ? "النظام" : "SYSTEM" },
-                { id: "mission", label: ar ? "المهمة" : "MISSION" },
-              ]}
-            />
-            <div className="flex-1 overflow-y-auto min-h-0">
-              {tab === "sys" ? leftRail : rightRail}
-            </div>
-          </div>
-        )}
-
+      <WorkspaceShell
+        workspace={workspace}
+        socket={{ tasks, activeTask, cancelTask, terminalLines, watchTerminal, fileChanges }}
+        extras={extras}
+        language={language}
+        wide={wide}
+        tab={shellTab}
+        onTabChange={setShellTab}
+        inspectorTab={shellInspectorTab}
+        onInspectorTabChange={setShellInspectorTab}
+        onOpenSettings={() => setSettingsOpen((v) => !v)}
+      >
         {/* Core column. Never removed at any width. */}
-        <section className="flex-1 flex flex-col min-w-0 min-h-0">
-          <div
-            data-enter="center"
-            className="flex-1 flex items-center justify-center min-h-0"
-            style={{ padding: "var(--space-3) 0" }}
-          >
-            <AICore
-              state={state}
-              /* The core must never be the reason a 360px viewport scrolls:
-                 at phone widths it steps down from 260 to 180. */
-              size={wide ? 260 : 180}
-              language={language}
-              speakingVoice={speakingVoice}
-            />
-          </div>
+        <div
+          data-enter="center"
+          className="flex-1 flex items-center justify-center min-h-0"
+          style={{ padding: "var(--space-3) 0" }}
+        >
+          <AICore
+            state={state}
+            /* The core must never be the reason a 360px viewport scrolls:
+               at phone widths it steps down from 260 to 180. */
+            size={wide ? 260 : 180}
+            language={language}
+            speakingVoice={speakingVoice}
+          />
+        </div>
 
-          <div
-            data-enter="center"
-            className="flex-none flex flex-col min-h-0 mx-auto w-full max-w-3xl"
-            style={{ maxHeight: "42vh", padding: "0 var(--space-4)" }}
-          >
-            <div className="hud-panel hud-bracket flex-1 flex flex-col min-h-0">
-              <header className="hud-panel-head">
-                <span>{ar ? "السجل" : "TRANSCRIPT"}</span>
-                <span className="hud-micro ml-auto">
-                  {messages.length} {ar ? "رسالة" : "MSG"}
-                </span>
-                {messages.length > 0 && (
-                  <button
-                    onClick={clearChat}
-                    className="hud-micro"
-                    style={{
-                      padding: "var(--space-1) var(--space-2)",
-                      border: "var(--border-w) solid var(--hud-edge-faint)",
-                      color: "var(--hud-text-dim)",
-                    }}
-                    title={ar ? "مسح" : "Clear"}
-                  >
-                    {ar ? "مسح" : "CLR"}
-                  </button>
-                )}
-              </header>
-              <ChatTranscript
-                messages={messages}
-                isTyping={isTyping}
-                subtitle={subtitle}
-                language={language}
-                statusText={statusText}
-              />
-            </div>
-          </div>
-
-          <div
-            data-enter="center"
-            className="flex-none w-full max-w-3xl mx-auto"
-            style={{ padding: "var(--space-3) var(--space-4) var(--space-4)" }}
-          >
-            <CommandConsole
-              InputBar={InputBar}
-              BottomDock={BottomDock}
-              onSend={sendMessage}
-              isConnected={isConnected}
-              language={language}
-              onVoiceStart={startVoiceMode}
-              onVoiceStop={stopVoiceMode}
-              voiceMode={voiceMode}
-              isListening={isListening}
+        <div
+          data-enter="center"
+          className="flex-none flex flex-col min-h-0 mx-auto w-full max-w-3xl"
+          style={{ maxHeight: "38vh", padding: "0 var(--space-4)" }}
+        >
+          <div className="hud-panel hud-bracket flex-1 flex flex-col min-h-0">
+            <header className="hud-panel-head">
+              <span>{ar ? "السجل" : "TRANSCRIPT"}</span>
+              <span className="hud-micro ml-auto">
+                {messages.length} {ar ? "رسالة" : "MSG"}
+              </span>
+              {messages.length > 0 && (
+                <button
+                  onClick={clearChat}
+                  className="hud-micro"
+                  style={{
+                    padding: "var(--space-1) var(--space-2)",
+                    border: "var(--border-w) solid var(--hud-edge-faint)",
+                    color: "var(--hud-text-dim)",
+                  }}
+                  title={ar ? "مسح" : "Clear"}
+                >
+                  {ar ? "مسح" : "CLR"}
+                </button>
+              )}
+            </header>
+            <ChatTranscript
+              messages={messages}
+              isTyping={isTyping}
               subtitle={subtitle}
+              language={language}
               statusText={statusText}
-              statusTone={statusTone}
-              onStop={requestStop}
-              onSettingsToggle={() => setSettingsOpen((v) => !v)}
-              settingsOpen={settingsOpen}
-              onLanguageToggle={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}
             />
           </div>
-        </section>
-      </main>
+        </div>
+
+        {/* The activity feed lives under the transcript rather than in a rail:
+            it describes the turn that is happening now, and the rail it used to
+            occupy now holds the tasks that record it. */}
+        <div
+          data-enter="center"
+          id="zaytoon-activity"
+          className="flex-none w-full max-w-3xl mx-auto"
+          style={{ padding: "var(--space-3) var(--space-4) 0" }}
+        >
+          <Panel title={ar ? "نشاط التنفيذ" : "EXECUTION LOG"} code="LOG">
+            <ActivityFeed
+              plan={plan}
+              activeTool={activeTool}
+              activity={activity}
+              language={language}
+            />
+          </Panel>
+        </div>
+
+        <div
+          data-enter="center"
+          className="flex-none w-full max-w-3xl mx-auto"
+          style={{ padding: "var(--space-3) var(--space-4) var(--space-4)" }}
+        >
+          <CommandConsole
+            InputBar={InputBar}
+            BottomDock={BottomDock}
+            onSend={sendMessage}
+            isConnected={isConnected}
+            language={language}
+            onVoiceStart={startVoiceMode}
+            onVoiceStop={stopVoiceMode}
+            voiceMode={voiceMode}
+            isListening={isListening}
+            subtitle={subtitle}
+            statusText={statusText}
+            statusTone={statusTone}
+            onStop={requestStop}
+            onSettingsToggle={() => setSettingsOpen((v) => !v)}
+            settingsOpen={settingsOpen}
+            onLanguageToggle={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}
+            onPanelSelect={handlePanelSelect}
+            activePanel={dockPanel}
+          />
+        </div>
+      </WorkspaceShell>
 
       {/* High-risk tool approval gate. Unchanged: the security boundary does
           not move for a redesign. */}

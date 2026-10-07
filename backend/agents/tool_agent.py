@@ -153,9 +153,15 @@ class ToolAgent(BaseAgent):
         the user declined instead of the tool failing for no stated reason.
         """
 
+        # NOTE: the notices are *module-level* dicts (`_DECLINED`, ...), not
+        # instance attributes — `self._DECLINED` raised AttributeError on
+        # every non-approval branch, so the engine's approval handler logged
+        # `op=approval type=AttributeError` and fed an error string back to
+        # the model instead of the bilingual refusal. Found by the live E2E
+        # decline scenario, which no unit test covered.
         async def approve(tool_name: str, params: dict):
             if manager is None:
-                return self._DECLINED.get(language, self._DECLINED["en"])
+                return _DECLINED.get(language, _DECLINED["en"])
             try:
                 if await manager.request(tool_name, params, session_id):
                     return True
@@ -166,16 +172,16 @@ class ToolAgent(BaseAgent):
                     e, operation="confirmation", component="ToolAgent",
                     detail=f"for {tool_name}",
                 )
-                return self._ERROR.get(language, self._ERROR["en"])
+                return _ERROR.get(language, _ERROR["en"])
 
             outcome = getattr(manager, "last_outcome", None)
             if outcome == ConfirmationManager.OUTCOME_TIMEOUT:
-                return self._TIMEOUT.get(language, self._TIMEOUT["en"])
+                return _TIMEOUT.get(language, _TIMEOUT["en"])
             if outcome == ConfirmationManager.OUTCOME_UNAVAILABLE:
-                return self._UNAVAILABLE.get(language, self._UNAVAILABLE["en"])
+                return _UNAVAILABLE.get(language, _UNAVAILABLE["en"])
             if outcome == ConfirmationManager.OUTCOME_ERROR:
-                return self._ERROR.get(language, self._ERROR["en"])
-            return self._DECLINED.get(language, self._DECLINED["en"])
+                return _ERROR.get(language, _ERROR["en"])
+            return _DECLINED.get(language, _DECLINED["en"])
 
         return approve
 
@@ -186,6 +192,15 @@ class ToolAgent(BaseAgent):
         session_id: str = "",
         language: str = "en",
     ) -> str:
+        """Parse and run every tool call in a raw model response.
+
+        **Not on any request path** — `ToolAgent` routes through
+        `AgentEngine`, whose `_run_batch` runs gated calls as barriers under a
+        semaphore. This legacy fold gathers *all* matches concurrently with no
+        cap, which is fine for the test fixtures that call it and would be the
+        wrong shape for live traffic; it is retained for the safety suite
+        (`tests/test_tool_agent_safety.py`), not as an execution path.
+        """
         manager = confirmation_manager or self.confirmation_manager
         matches = re.findall(TOOL_CALL_RE, ai_response)
 

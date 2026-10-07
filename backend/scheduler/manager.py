@@ -86,7 +86,8 @@ class SchedulerManager:
     ) -> dict:
         return await self._reminder_service.create_from_natural(text, language, session_id, parsed_time=parsed_time)
 
-    async def list_reminders(self, session_id: str = "default", status: str = "pending") -> list[dict]:
+    async def list_reminders(self, session_id: Optional[str] = None, status: str = "pending") -> list[dict]:
+        """Workspace-wide by default; a named session filters (see the service)."""
         return await self._reminder_service.list(status=status, session_id=session_id)
 
     async def delete_reminder(self, reminder_id: int) -> bool:

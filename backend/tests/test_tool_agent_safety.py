@@ -332,3 +332,81 @@ class TestAgentServiceGating:
         result = await service._execute_tool_commands(text)
         executor.execute.assert_called_once()
         assert "OPEN_APP" in result
+
+
+class TestApprovalCallbackNotices:
+    """Every non-approval branch of `_make_approval` must return its notice.
+
+    The four notice dicts (`_DECLINED`, `_TIMEOUT`, `_UNAVAILABLE`,
+    `_ERROR`) are **module-level**; the closure once wrote `self._DECLINED`,
+    so every branch except "approved" raised `AttributeError` — the engine
+    logged `op=approval type=AttributeError` and fed an error string back to
+    the model instead of the bilingual refusal. The live E2E decline
+    scenario found it; no unit test had ever walked these branches, because
+    the WS suite stubs `ToolAgent` entirely and the engine suite supplies
+    its own callbacks.
+    """
+
+    @staticmethod
+    def _manager(outcome=None, raises=None):
+        class Manager:
+            last_outcome = outcome
+
+            async def request(self, *args, **kwargs):
+                if raises is not None:
+                    raise raises
+                return False
+
+        return Manager()
+
+    async def test_no_manager_returns_the_decline_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        approve = agent._make_approval(None, "sess_1", "en")
+        result = await approve("system_command", {"command": "rm -rf /"})
+        assert result == "Cancelled: user denied a high-risk action."
+
+    async def test_a_decline_returns_the_decline_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        manager = self._manager(ConfirmationManager.OUTCOME_DECLINED)
+        approve = agent._make_approval(manager, "sess_1", "en")
+        assert await approve("file_delete", {}) == (
+            "Cancelled: user denied a high-risk action."
+        )
+
+    async def test_a_timeout_returns_the_timeout_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        manager = self._manager(ConfirmationManager.OUTCOME_TIMEOUT)
+        approve = agent._make_approval(manager, "sess_1", "en")
+        assert await approve("file_delete", {}) == (
+            "Cancelled: no confirmation received in time."
+        )
+
+    async def test_no_channel_returns_the_unavailable_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        manager = self._manager(ConfirmationManager.OUTCOME_UNAVAILABLE)
+        approve = agent._make_approval(manager, "sess_1", "en")
+        assert "no approval channel" in await approve("file_delete", {})
+
+    async def test_a_failed_request_returns_the_error_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        manager = self._manager(raises=RuntimeError("bus is gone"))
+        approve = agent._make_approval(manager, "sess_1", "en")
+        assert await approve("file_delete", {}) == (
+            "Cancelled: the confirmation request could not be sent."
+        )
+
+    async def test_an_approval_still_returns_true(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+
+        class Yes:
+            async def request(self, *args, **kwargs):
+                return True
+
+        approve = agent._make_approval(Yes(), "sess_1", "en")
+        assert await approve("file_delete", {}) is True
+
+    async def test_arabic_gets_the_arabic_notice(self, assessor):
+        agent = ToolAgent(confirmation_manager=None, risk_assessor=assessor)
+        approve = agent._make_approval(None, "sess_1", "ar")
+        result = await approve("file_delete", {})
+        assert any("\u0600" <= ch <= "\u06FF" for ch in result)

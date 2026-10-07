@@ -23,6 +23,7 @@ from services.llm_client import (
     LLMError,
     LLMRequestError,
     LLMResponseError,
+    LLMMetrics,
     ProviderEndpoint,
 )
 
@@ -404,6 +405,19 @@ class TestHealthBreaker:
         assert stats["success"] == 1
         assert stats["requests"] == 1
         assert stats["by_model"]["qwen/qwen3.8-27b:free"] == 1
+        # Per-model mean: "how long does *this* model take?" is the question
+        # behind a fallback decision, and `by_model` only counted calls.
+        assert "by_model_latency_ms" in stats
+        assert stats["by_model_latency_ms"]["qwen/qwen3.8-27b:free"] >= 0
+
+    def test_per_model_latency_is_a_mean_of_its_own_samples(self):
+        metrics = LLMMetrics()
+        metrics.record_success("a:free", 100)
+        metrics.record_success("a:free", 300)
+        metrics.record_success("b:free", 50)
+        stats = metrics.to_dict()
+        assert stats["by_model_latency_ms"]["a:free"] == 200
+        assert stats["by_model_latency_ms"]["b:free"] == 50
 
     async def test_metrics_track_rate_limits(self, monkeypatch):
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)

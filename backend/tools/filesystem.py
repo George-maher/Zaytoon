@@ -148,6 +148,7 @@ def _read_capped(path: str) -> str:
 # ---------------------------------------------------------------------------
 class FileWrite(BaseTool):
     permission = "confirm"
+    mutates_files = True
 
     def name(self) -> str:
         return "file_write"
@@ -210,6 +211,7 @@ def _write_file(target: str, content: str, append: bool) -> None:
 
 class CreateFolder(BaseTool):
     permission = "confirm"
+    mutates_files = True
 
     def name(self) -> str:
         return "create_folder"
@@ -264,6 +266,7 @@ def _mkdir_one_level(target: str) -> None:
 
 class FileDelete(BaseTool):
     permission = "dangerous"
+    mutates_files = True
 
     def name(self) -> str:
         return "file_delete"
@@ -332,6 +335,7 @@ class FileDelete(BaseTool):
 
 class FileMove(BaseTool):
     permission = "confirm"
+    mutates_files = True
 
     def name(self) -> str:
         return "file_move"

@@ -1,6 +1,19 @@
-# Zaytoon desktop shell — development / test-only dependencies.
+# Zaytoon desktop — development / test-only dependencies.
 #   pip install -r requirements.txt -r requirements-dev.txt
+#
+# CI installs only this file, so it must carry everything the *test suite*
+# imports — not just what the shipped host runs. The shipped host needs only
+# requirements.txt (pywebview + websockets); the packages below exist for the
+# tests that still pin the retained legacy modules (app/audio, app/panel,
+# app/dialogs, app/sidepanel, app/hotkeys, app/app).
 
 -r requirements.txt
 
 pytest>=8.0.0
+
+# legacy module tests
+customtkinter>=5.0.0     # app/panel, app/dialogs, app/sidepanel, app/app, app/activity
+keyboard>=0.13.5         # app/hotkeys (imported behind try/except at runtime)
+numpy>=1.24              # tests/test_audio_pipeline.py imports it directly
+sounddevice>=0.4.6       # app/audio playback
+av>=10.0                 # app/audio MP3 decode (test_audio_pipeline decodes for real)

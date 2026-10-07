@@ -910,6 +910,15 @@ class AgentEngine:
         #: One corrective round for a placeholder that came *after* a tool
         #: already ran (the no-tool case is handled by ``tool_nags``).
         placeholder_nagged = False
+        #: Set when the user's gate refused a call in any earlier iteration.
+        #: After a *deliberate* refusal, prose is the right ending: the tool
+        #: must not run, so demanding another call only nags the model into
+        #: retrying (re-prompting the user) until the turn dies as
+        #: ``no_tool_taken`` — a confusing "I couldn't complete that" for a
+        #: turn the user chose to cancel. Only a real refusal sets this; a
+        #: model dodging a needed tool with prose cannot fake one, because
+        #: the flag is written solely from the gate's own decision.
+        gate_refused = False
 
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
@@ -981,7 +990,9 @@ class AgentEngine:
                 # the first nag explains the call format, the second insists
                 # on it. Two ignored nags and the prose is refused — see the
                 # refusal below — so a guessed fact is never delivered.
-                if expect_tool and not tool_names:
+                # A gate refusal exempts this: the user already declined, so
+                # prose declining in turn *is* the answer.
+                if expect_tool and not tool_names and not gate_refused:
                     if tool_nags >= 2:
                         # Third prose answer with no tool call. Delivering it
                         # is exactly how the fabricated clock reading above
@@ -1078,6 +1089,7 @@ class AgentEngine:
             for call, outcome in zip(calls, outcomes):
                 if isinstance(outcome, str):
                     # The gate declined; the model is told, not the user.
+                    gate_refused = True
                     observations.append(render_observation(call, {"error": outcome, "cancelled": True}))
                     continue
 
@@ -1313,9 +1325,22 @@ class AgentEngine:
                     await bus.tool_finished(call.name, False, summary=outcome)
                 elif outcome.get("success"):
                     status = STATUS_OK
+                    # `mutates`/`params` give the turn's recorder what it
+                    # needs to record a real file change — the tool's own
+                    # declaration plus the call's arguments — without the
+                    # recorder needing the registry (or re-deriving
+                    # "which tools mutate" from names, which never agrees
+                    # with the aliases). Attached on success only: a tool
+                    # that failed or was declined changed nothing. Both are
+                    # internal event fields — the transport builds its frames
+                    # from the fields it already knows, so neither reaches
+                    # the wire.
+                    resolved = self.registry.get(call.name)
                     await bus.tool_finished(
                         call.name, True,
                         summary=str(outcome.get("output") or "")[:200],
+                        params=dict(call.params or {}),
+                        mutates=bool(getattr(resolved, "mutates_files", False)),
                     )
                 elif outcome.get("timeout"):
                     status = STATUS_TIMED_OUT

@@ -157,7 +157,7 @@ class MessageRow(ctk.CTkFrame):
         self.style = row_style(role)
         self.timestamp = time.strftime("%H:%M:%S")
 
-        outer = ctk.CTkFrame(self, fg_color="transparent")
+        outer = ctk.CTkFrame(self, fg_color="transparent", height=1)
         outer.pack(fill="x")
 
         bubble = ctk.CTkFrame(
@@ -271,7 +271,7 @@ class ChatPanel(ctk.CTkToplevel):
         self._build_header()
 
         # Body: activity strip over the three-column content row.
-        body = ctk.CTkFrame(self, fg_color="transparent")
+        body = ctk.CTkFrame(self, fg_color="transparent", height=1)
         body.grid(row=BODY_ROW, column=BODY_COLUMN, sticky="nsew",
                   padx=theme.SPACE_3, pady=(0, 0))
         body.grid_columnconfigure(0, weight=1)
@@ -284,7 +284,7 @@ class ChatPanel(ctk.CTkToplevel):
         # feed appears only when the turn has something to report.
         self.activity.grid_remove()
 
-        content = ctk.CTkFrame(body, fg_color="transparent")
+        content = ctk.CTkFrame(body, fg_color="transparent", height=1)
         content.grid(row=1, column=0, sticky="nsew")
         self._content = content
         content.grid_rowconfigure(0, weight=1)
@@ -315,7 +315,7 @@ class ChatPanel(ctk.CTkToplevel):
     def _build_header(self) -> None:
         # Wrapped so the hairline sits *under* the bar at any window height
         # instead of at one magic pady (two widgets in one grid cell overlap).
-        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap = ctk.CTkFrame(self, fg_color="transparent", height=1)
         wrap.grid(row=HEADER_ROW, column=BODY_COLUMN, sticky="ew",
                   padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
         wrap.grid_columnconfigure(0, weight=1)
@@ -332,7 +332,7 @@ class ChatPanel(ctk.CTkToplevel):
         tk.Frame(wrap, height=1, bg=theme.HAIRLINE).pack(fill="x", pady=(theme.SPACE_2, 0))
 
     def _build_quick_actions(self) -> None:
-        quick = ctk.CTkFrame(self, fg_color="transparent")
+        quick = ctk.CTkFrame(self, fg_color="transparent", height=1)
         quick.grid(row=QUICK_ROW, column=BODY_COLUMN, sticky="ew",
                    padx=theme.SPACE_3, pady=(theme.SPACE_2, 0))
         ctk.CTkLabel(

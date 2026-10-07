@@ -20,6 +20,8 @@ import asyncio
 import json
 import logging
 
+import pytest
+
 from tests.test_websocket_interrupt import FakeWebSocket, run_handler, _empty_audio
 from unittest.mock import AsyncMock, MagicMock
 
@@ -161,3 +163,56 @@ class TestRequestDoneIsAlwaysLogged:
         # Every frame in this protocol carries the trace id, so a client can
         # correlate the failure with the log line that explains it.
         assert "trace_id" in errors[0]
+
+
+class TestTheTurnReachesTheTaskSystem:
+    """The whole point of the transport wiring: a live turn is a task.
+
+    Before the orchestrator owned the turn sequence, ``api/websocket.py``
+    executed turns with no task record at all — the task system could not see
+    live work, so ``/tasks`` showed nothing while the user was being answered.
+    """
+
+    @pytest.fixture
+    def turn_task_db(self, monkeypatch, tmp_path):
+        """A private core.db, so record identity is unambiguous.
+
+        Top-level tests otherwise write rows into the developer's real
+        ``data/core.db`` (the suite's historical default); an assertion like
+        "a record exists for this message" must not be satisfiable by an older
+        row from another run.
+        """
+        monkeypatch.setenv("CORE_DB_PATH", str(tmp_path / "core.db"))
+
+    async def test_a_live_turn_writes_a_completed_task_record(self, turn_task_db):
+        message = "a lineage probe only this test ever sends"
+        ws = FakeWebSocket([json.dumps({"type": "message", "message": message})])
+
+        await run_handler(ws, await make_deps())
+
+        from core.tasks import get_manager
+        from core.tasks.models import TaskStatus
+
+        # The record is written at turn start and completed at turn end; poll
+        # so the assertion does not depend on the loop's scheduling.
+        completed = None
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while asyncio.get_running_loop().time() < deadline:
+            records = await get_manager().list(limit=200)
+            mine = [
+                t for t in records
+                if message in (t.request or "") and t.status is TaskStatus.COMPLETED
+            ]
+            if mine:
+                completed = mine[0]
+                break
+            await asyncio.sleep(0.02)
+
+        assert completed is not None, (
+            "the transport's turn never produced a completed task record"
+        )
+        assert completed.result == "quick result"
+        assert completed.intent == "action"
+        # And the frame side still worked: the wiring did not swallow the reply.
+        contents = [e.get("content") for e in ws.events("message")]
+        assert "quick result" in contents, contents

@@ -1,7 +1,8 @@
 """Make the ``app`` package importable from the desktop test suite.
 
-The desktop shell is a standalone application with its own import root, so its
-tests need ``desktop/`` on ``sys.path`` exactly the way ``desktop/main.py`` does.
+The desktop application is a standalone package with its own import root, so
+its tests need ``desktop/`` on ``sys.path`` exactly the way ``desktop/main.py``
+does.
 """
 
 import sys

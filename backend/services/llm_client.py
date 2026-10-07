@@ -44,6 +44,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import httpx
 
+from common.tracing import get_trace_id
 from config import (
     PROVIDER_OLLAMA,
     PROVIDER_OPENROUTER,
@@ -55,6 +56,7 @@ from config import (
     config,
     is_allowed_model,
 )
+from core.events import CoreEventType, bus
 from services.completion_validator import (
     CHAT_CONTRACT,
     STREAM_CONTRACT,
@@ -180,6 +182,10 @@ class LLMMetrics:
     blocked: int = 0
     total_latency_ms: int = 0
     by_model: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    #: Cumulative latency per model. `by_model` counts calls — the pair gives
+    #: "how long does *this* model take?", which is the question behind a
+    #: fallback decision, and no counter here had it.
+    model_latency_ms: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     #: Contract-failure counts, keyed by verdict. This is the metric that would
     #: have caught the ``openrouter/free`` problem: a model that answers every
     #: request with valid-looking garbage shows up here, not in ``success``.
@@ -189,6 +195,7 @@ class LLMMetrics:
         self.success += 1
         self.total_latency_ms += latency_ms
         self.by_model[model] += 1
+        self.model_latency_ms[model] += latency_ms
 
     def record_invalid(self, verdict: str) -> None:
         self.invalid[verdict or "UNKNOWN"] += 1
@@ -224,6 +231,12 @@ class LLMMetrics:
                 self.total_latency_ms // self.success if self.success else 0
             ),
             "by_model": dict(self.by_model),
+            # Mean per model: the cumulative ms over the count `record_success`
+            # already incremented — one pair of counters, no drift.
+            "by_model_latency_ms": {
+                model: (self.model_latency_ms[model] // count) if count else 0
+                for model, count in self.by_model.items()
+            },
         }
 
 
@@ -624,12 +637,368 @@ class LLMClient:
             record.fallback_reason or record.detail[:120] or "-",
             record.latency_ms,
         )
+        self._emit_model_event(record)
+
+    def _emit_model_event(self, record: AttemptRecord) -> None:
+        """Publish this attempt's outcome on the core bus as ``model.*``.
+
+        The same diagnostic surface as the log line, and the same rule: model
+        id, provider, outcome, verdict, reason and latency — never
+        ``record.detail`` (it can hold a response body), never the key, never
+        message content. Fire-and-forget, so a slow or absent subscriber
+        cannot reach into the request path.
+
+        Granularity, stated plainly because it is not uniform:
+        ``model.started`` is emitted **per call** (one per ``complete()`` /
+        ``stream()`` entry) while the outcome events are **per attempt** — a
+        call that fell back produced several. ``request_id`` is the join key
+        for anyone counting: all events of one call share it.
+        """
+        common = {
+            "model": record.model,
+            "provider": record.provider,
+            "request_id": record.request_id,
+            "attempt": record.attempt,
+            "latency_ms": record.latency_ms,
+        }
+        if record.outcome == "ok":
+            bus.publish(
+                CoreEventType.MODEL_COMPLETED,
+                validation=record.validation or "",
+                tool_called=record.tool_called or "",
+                **common,
+            )
+        else:
+            bus.publish(
+                CoreEventType.MODEL_FAILED,
+                outcome=record.outcome,
+                reason=record.fallback_reason or "",
+                **common,
+            )
 
     def _cooldown_for(self, outcome: str) -> float:
         """429 benches a model for longer than a transient 5xx."""
         if outcome == "rate_limited":
             return max(self.provider_cooldown, config.LLM_RATE_LIMIT_COOLDOWN)
         return self.provider_cooldown
+
+    # ------------------------------------------------------------------
+    # Registry (router-first) path — same budget, same contract, no policy
+    # ------------------------------------------------------------------
+    async def _route_plan(self, tier: str, required: List[str]) -> Optional[Any]:
+        """Ask the registry which model it would use for this request.
+
+        ``None`` means "not answered here" — no provider, no models, an
+        unreadable kv row, a broken import, any of it. Routing must never be
+        the *reason* a request fails: the configured chain below is the
+        fallback by design, so every failure mode of this method collapses
+        into "use the chain".
+        """
+        try:
+            from core.providers import plan as registry_plan
+
+            decision = await registry_plan(required=required, tier=tier)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            logger.debug(
+                "Registry routing unavailable (%s); using the configured chain",
+                type(exc).__name__,
+            )
+            return None
+        if not decision.model or not decision.base_url:
+            logger.debug(
+                "Registry routing: %s", decision.error or "no usable model"
+            )
+            return None
+        return decision
+
+    def _registry_outcome(self, exc: Any) -> str:
+        """Map a transport failure onto the chain's attempt vocabulary."""
+        status = getattr(exc, "status", 0) or 0
+        if status:
+            return self._classify_status(status)
+        detail = str(exc)
+        if "Timeout" in detail:
+            return "timeout"
+        if "non-JSON" in detail or "no choices" in detail:
+            return "malformed"
+        return "connect_error"
+
+    async def _complete_registry(
+        self,
+        decision: Any,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+        tools: Optional[List[Dict[str, Any]]],
+        contract: CompletionContract,
+        extract: Optional[Callable[[str], Any]],
+        rid: str,
+        required: List[str],
+        budget: _AttemptBudget,
+        attempts: List[AttemptRecord],
+    ) -> Optional[str]:
+        """One pass over the registry's usable candidates.
+
+        Returns the validated text, or ``None`` — "not answered here" — which
+        hands the request to the configured chain with whatever budget is
+        left. One attempt per candidate: a transient failure's retry *is* the
+        fall-through, because the chain below already does its own backoff.
+
+        None of the three invariants are reimplemented here: the plan has
+        already applied free-only policy per candidate, ``budget`` and
+        ``attempts`` are the same objects the chain uses, and
+        ``validate_completion`` is the same contract check the chain makes.
+        """
+        from core.providers import (
+            OpenAICompatibleClient,
+            ProviderTransportError,
+            resolve_api_key,
+        )
+
+        api_key = await resolve_api_key(decision.provider_id)
+        transport = OpenAICompatibleClient(
+            decision.base_url, api_key=api_key, timeout=self.timeout
+        )
+        try:
+            for candidate in decision.usable:
+                number = budget.take()
+                if number is None:
+                    break
+                label = f"{candidate.provider_id}:{candidate.model_id}"
+                started = time.monotonic()
+                try:
+                    content = await transport.complete(
+                        messages, model=candidate.model_id,
+                        max_tokens=max_tokens, temperature=temperature,
+                        tools=tools,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except ProviderTransportError as exc:
+                    elapsed = int((time.monotonic() - started) * 1000)
+                    kind = self._registry_outcome(exc)
+                    detail = str(exc)
+                    record = AttemptRecord(
+                        label, candidate.provider_id, candidate.model_id,
+                        kind, getattr(exc, "status", 0) or 0, detail, elapsed,
+                        attempt=number, request_id=rid,
+                        required_capabilities=required,
+                        fallback_reason=kind.upper(),
+                    )
+                    self._log_attempt(record)
+                    attempts.append(record)
+                    self.metrics.record(kind, elapsed)
+                    self._health(candidate.model_id).record_failure(
+                        self._cooldown_for(kind), detail
+                    )
+                    # Candidates are different models behind one endpoint: a
+                    # 401 applies to all of them, a 404 does not — and the
+                    # budget decides how many are worth discovering. Next.
+                    continue
+
+                elapsed = int((time.monotonic() - started) * 1000)
+                verdict = validate_completion(content, contract, extract=extract)
+                if not verdict.ok:
+                    record = AttemptRecord(
+                        label, candidate.provider_id, candidate.model_id,
+                        OUTCOME_INVALID, 200, verdict.detail, elapsed,
+                        attempt=number, request_id=rid,
+                        validation=verdict.verdict,
+                        required_capabilities=required,
+                        tool_called=(
+                            getattr(verdict.tool_calls[0], "name", "")
+                            if verdict.tool_calls else ""
+                        ),
+                        fallback_reason=verdict.verdict,
+                    )
+                    self._log_attempt(record)
+                    attempts.append(record)
+                    self.metrics.record_invalid(verdict.verdict)
+                    self._health(candidate.model_id).record_failure(
+                        self.provider_cooldown, verdict.verdict
+                    )
+                    continue
+
+                self._health(candidate.model_id).record_success()
+                self.metrics.record_success(candidate.model_id, elapsed)
+                record = AttemptRecord(
+                    label, candidate.provider_id, candidate.model_id,
+                    "ok", 200, latency_ms=elapsed,
+                    attempt=number, request_id=rid,
+                    validation=verdict.verdict,
+                    required_capabilities=required,
+                    tool_called=(
+                        getattr(verdict.tool_calls[0], "name", "")
+                        if verdict.tool_calls else ""
+                    ),
+                )
+                self._log_attempt(record)
+                attempts.append(record)
+                logger.info(
+                    "LLM REGISTRY OK  model=%s latency=%dms",
+                    candidate.model_id, elapsed,
+                )
+                return content
+            return None
+        finally:
+            await transport.aclose()
+
+    async def _stream_registry(
+        self,
+        decision: Any,
+        messages: List[Dict[str, Any]],
+        on_delta: Optional[Callable[[str], Awaitable[None]]],
+        max_tokens: int,
+        temperature: float,
+        tools: Optional[List[Dict[str, Any]]],
+        contract: CompletionContract,
+        extract: Optional[Callable[[str], Any]],
+        rid: str,
+        required: List[str],
+        budget: _AttemptBudget,
+        attempts: List[AttemptRecord],
+        tier: str,
+    ) -> Optional[str]:
+        """Stream from the registry's candidates. ``None`` = nothing was
+        emitted, so the chain may stream from scratch.
+
+        The chain's fallback semantics are mirrored, because the reason they
+        exist does not change with the transport: a failure *after* the first
+        delta must not re-emit, so it recovers through a blocking call whose
+        result replaces the bubble (or, if that fails too, the partial — those
+        tokens are already on screen); a failure *before* any delta falls
+        through and the chain streams freely. Either way at most one stream
+        reaches the user.
+        """
+        from core.providers import (
+            OpenAICompatibleClient,
+            ProviderTransportError,
+            resolve_api_key,
+        )
+
+        api_key = await resolve_api_key(decision.provider_id)
+        transport = OpenAICompatibleClient(
+            decision.base_url, api_key=api_key, timeout=self.timeout
+        )
+        last_partial = ""
+        try:
+            for candidate in decision.usable:
+                number = budget.take()
+                if number is None:
+                    break
+                label = f"{candidate.provider_id}:{candidate.model_id}"
+                started = time.monotonic()
+                full = ""
+                got_delta = False
+                try:
+                    async for delta in transport.stream(
+                        messages, model=candidate.model_id,
+                        max_tokens=max_tokens, temperature=temperature,
+                        tools=tools,
+                    ):
+                        full += delta
+                        got_delta = True
+                        last_partial = full
+                        if on_delta:
+                            await on_delta(delta)
+
+                    if not full:
+                        raise LLMResponseError("stream completed with no content")
+
+                    verdict = validate_completion(full, contract, extract=extract)
+                    if verdict.ok:
+                        elapsed = int((time.monotonic() - started) * 1000)
+                        self._health(candidate.model_id).record_success()
+                        self.metrics.record_success(candidate.model_id, elapsed)
+                        record = AttemptRecord(
+                            label, candidate.provider_id, candidate.model_id,
+                            "ok", 200, latency_ms=elapsed,
+                            attempt=number, request_id=rid,
+                            validation=verdict.verdict,
+                            required_capabilities=required,
+                        )
+                        attempts.append(record)
+                        self._emit_model_event(record)
+                        logger.info(
+                            "LLM REGISTRY STREAM OK  model=%s chars=%d latency=%dms",
+                            candidate.model_id, len(full), elapsed,
+                        )
+                        return full
+                    record = AttemptRecord(
+                        label, candidate.provider_id, candidate.model_id,
+                        OUTCOME_INVALID, 200, verdict.detail,
+                        int((time.monotonic() - started) * 1000),
+                        attempt=number, request_id=rid,
+                        validation=verdict.verdict,
+                        required_capabilities=required,
+                        fallback_reason=verdict.verdict,
+                    )
+                    attempts.append(record)
+                    self._emit_model_event(record)
+                    self.metrics.record_invalid(verdict.verdict)
+                    self._health(candidate.model_id).record_failure(
+                        self.provider_cooldown, verdict.verdict
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except ProviderTransportError as exc:
+                    elapsed = int((time.monotonic() - started) * 1000)
+                    kind = self._registry_outcome(exc)
+                    record = AttemptRecord(
+                        label, candidate.provider_id, candidate.model_id,
+                        kind, getattr(exc, "status", 0) or 0, str(exc), elapsed,
+                        attempt=number, request_id=rid,
+                        required_capabilities=required,
+                        fallback_reason=kind.upper(),
+                    )
+                    attempts.append(record)
+                    self._emit_model_event(record)
+                    self.metrics.record(kind, elapsed)
+                    self._health(candidate.model_id).record_failure(
+                        self._cooldown_for(kind), str(exc)
+                    )
+                except LLMResponseError as exc:
+                    record = AttemptRecord(
+                        label, candidate.provider_id, candidate.model_id,
+                        "malformed", 200, str(exc),
+                        int((time.monotonic() - started) * 1000),
+                        attempt=number, request_id=rid,
+                    )
+                    attempts.append(record)
+                    self._emit_model_event(record)
+                    self.metrics.record("malformed")
+                    self._health(candidate.model_id).record_failure(
+                        self.provider_cooldown, str(exc)
+                    )
+
+                # This candidate is done. Tokens on screen mean a second
+                # stream would duplicate what the user already sees — the
+                # blocking recovery replaces the bubble instead.
+                if got_delta:
+                    logger.info(
+                        "LLM REGISTRY STREAM broke after first token on %s; "
+                        "completing via blocking call", candidate.model_id,
+                    )
+                    try:
+                        return await self.complete(
+                            messages, tier=tier, max_tokens=max_tokens,
+                            temperature=temperature, tools=tools,
+                            contract=contract, extract=extract,
+                            request_id=rid,
+                        )
+                    except LLMError:
+                        logger.warning(
+                            "recovery completion failed; returning %d chars of "
+                            "partial stream from %s", len(last_partial),
+                            candidate.model_id,
+                        )
+                        return last_partial
+                # Nothing emitted: the next candidate may still stream.
+            return None
+        finally:
+            await transport.aclose()
 
     # ------------------------------------------------------------------
     # Ollama (local) path — same contract, same budget, no cloud
@@ -659,19 +1028,28 @@ class LLMClient:
         contract: CompletionContract,
         extract: Optional[Callable[[str], Any]],
         rid: str,
+        budget: Optional[_AttemptBudget] = None,
+        attempts: Optional[List[AttemptRecord]] = None,
     ) -> str:
-        """Non-streaming local completion under the same contract + budget."""
+        """Non-streaming local completion under the same contract + budget.
+
+        ``budget`` and ``attempts`` arrive shared when a registry pass ran
+        first, so an exhausted ceiling is reported as one exhausted request
+        rather than two permissive ones.
+        """
         # ``tier`` may arrive as ``None`` (the engine has no tier to offer when
         # its LLM client carries none), and the OpenRouter ``build_chain``
         # normalises it the same way — defaulting to FAST rather than quietly
         # escalating a tool turn to the big general model on CPU.
         tier = tier if tier in (TIER_FAST, TIER_REASONING, TIER_FALLBACK) else TIER_FAST
-        attempts: List[AttemptRecord] = []
+        if attempts is None:
+            attempts = []
         required = list(contract.required_capabilities)
         model = config.ollama_model_for_tier(tier)
         label = f"ollama:{model}"
         client = self._ollama()
-        budget = _AttemptBudget(self.max_attempts)
+        if budget is None:
+            budget = _AttemptBudget(self.max_attempts)
         retries_allowed = max(1, self.max_retries if retries is None else retries)
         reachable = False
 
@@ -816,15 +1194,22 @@ class LLMClient:
         contract: CompletionContract,
         extract: Optional[Callable[[str], Any]],
         rid: str,
+        budget: Optional[_AttemptBudget] = None,
+        attempts: Optional[List[AttemptRecord]] = None,
     ) -> str:
-        """Streaming local completion; identical semantics to the SSE path."""
+        """Streaming local completion; identical semantics to the SSE path.
+
+        ``budget`` and ``attempts`` arrive shared when a registry pass ran
+        first — see :meth:`_complete_ollama`."""
         tier = tier if tier in (TIER_FAST, TIER_REASONING, TIER_FALLBACK) else TIER_FAST
-        attempts: List[AttemptRecord] = []
+        if attempts is None:
+            attempts = []
         required = list(contract.required_capabilities)
         model = config.ollama_model_for_tier(tier)
         label = f"ollama:{model}"
         client = self._ollama()
-        budget = _AttemptBudget(self.max_attempts)
+        if budget is None:
+            budget = _AttemptBudget(self.max_attempts)
         attempts_allowed = max(1, self.max_retries if retries is None else retries)
         emitted = False
         last_partial = ""
@@ -989,15 +1374,44 @@ class LLMClient:
         caller must treat that as "no answer", not as an error to show verbatim.
         """
         attempts: List[AttemptRecord] = []
-        rid = request_id or uuid.uuid4().hex[:12]
+        # The trace id, when one is bound to this request, correlates every
+        # attempt of this turn in the `LLM_ATTEMPT` log line. An explicit
+        # `request_id` still wins; a random id is the last resort, so the
+        # field is never empty.
+        rid = request_id or get_trace_id() or uuid.uuid4().hex[:12]
+        # `started` marks the *call*; the outcome events it produces are per
+        # attempt — join them on request_id (see `_emit_model_event`).
+        bus.publish(
+            CoreEventType.MODEL_STARTED,
+            request_id=rid, tier=tier, provider=config.PROVIDER,
+        )
+        required = list(contract.required_capabilities)
+        # One budget for the whole request. The registry path and the
+        # configured chain draw from the same counter, so router-first cannot
+        # multiply the attempt ceiling — the invariant `_AttemptBudget`
+        # exists to protect.
+        budget = _AttemptBudget(self.max_attempts)
+
+        # Router-first: the registry decides when it can answer. Every
+        # registry failure falls through to the configured chain below, which
+        # keeps its free-only policy, retries and contract validation exactly
+        # as they were — this path only ever adds a candidate set in front.
+        routed = await self._route_plan(tier, required)
+        if routed is not None:
+            content = await self._complete_registry(
+                routed, messages, max_tokens, temperature, tools,
+                contract, extract, rid, required, budget, attempts,
+            )
+            if content is not None:
+                return content
+
         if self._using_ollama():
             return await self._complete_ollama(
                 messages, tier, max_tokens, temperature, tools,
                 retries, contract, extract, rid,
+                budget=budget, attempts=attempts,
             )
-        required = list(contract.required_capabilities)
         chain = self.build_chain(tier, required)
-        budget = _AttemptBudget(self.max_attempts)
         retries_allowed = max(1, self.max_retries if retries is None else retries)
 
         for endpoint in chain:
@@ -1238,15 +1652,41 @@ class LLMClient:
         mitigation, and it is the reason the blocking recovery exists.
         """
         attempts: List[AttemptRecord] = []
-        rid = request_id or uuid.uuid4().hex[:12]
+        # The trace id, when one is bound to this request, correlates every
+        # attempt of this turn in the `LLM_ATTEMPT` log line. An explicit
+        # `request_id` still wins; a random id is the last resort, so the
+        # field is never empty.
+        rid = request_id or get_trace_id() or uuid.uuid4().hex[:12]
+        # `started` marks the *call*; the outcome events it produces are per
+        # attempt — join them on request_id (see `_emit_model_event`).
+        bus.publish(
+            CoreEventType.MODEL_STARTED,
+            request_id=rid, tier=tier, provider=config.PROVIDER,
+        )
+        required = list(contract.required_capabilities)
+        # Shared across the registry pass and the chain, as in `complete()`:
+        # router-first must not multiply the attempt ceiling.
+        budget = _AttemptBudget(self.max_attempts)
+
+        # Router-first, mirroring `complete()`. A `None` return guarantees
+        # nothing was emitted, so the stream below cannot duplicate what the
+        # user has already seen; a `str` is the authoritative full text.
+        routed = await self._route_plan(tier, required)
+        if routed is not None:
+            streamed = await self._stream_registry(
+                routed, messages, on_delta, max_tokens, temperature, tools,
+                contract, extract, rid, required, budget, attempts, tier,
+            )
+            if streamed is not None:
+                return streamed
+
         if self._using_ollama():
             return await self._stream_ollama(
                 messages, on_delta, tier, max_tokens, temperature, tools,
                 retries, contract, extract, rid,
+                budget=budget, attempts=attempts,
             )
-        required = list(contract.required_capabilities)
         chain = self.build_chain(tier, required)
-        budget = _AttemptBudget(self.max_attempts)
         attempts_allowed = max(1, self.max_retries if retries is None else retries)
         client = await self._get_client()
         emitted = False
@@ -1336,14 +1776,16 @@ class LLMClient:
                     elapsed = int((time.monotonic() - started) * 1000)
                     self._health(endpoint.model).record_success()
                     self.metrics.record_success(endpoint.model, elapsed)
-                    attempts.append(
-                        AttemptRecord(endpoint.label, endpoint.provider,
-                                      endpoint.model, "ok", 200,
-                                      latency_ms=elapsed,
-                                      attempt=number, request_id=rid,
-                                      validation=verdict.verdict,
-                                      required_capabilities=required)
+                    record = AttemptRecord(
+                        endpoint.label, endpoint.provider,
+                        endpoint.model, "ok", 200,
+                        latency_ms=elapsed,
+                        attempt=number, request_id=rid,
+                        validation=verdict.verdict,
+                        required_capabilities=required,
                     )
+                    attempts.append(record)
+                    self._emit_model_event(record)
                     logger.info(
                         "LLM STREAM OK  model=%s chars=%d latency=%dms",
                         endpoint.model, len(full), elapsed,
@@ -1351,11 +1793,14 @@ class LLMClient:
                     return full
 
                 except LLMResponseError as e:
-                    attempts.append(
-                        AttemptRecord(endpoint.label, endpoint.provider,
-                                      endpoint.model, "malformed", 200, str(e),
-                                      int((time.monotonic() - started) * 1000))
+                    record = AttemptRecord(
+                        endpoint.label, endpoint.provider,
+                        endpoint.model, "malformed", 200, str(e),
+                        int((time.monotonic() - started) * 1000),
+                        attempt=number, request_id=rid,
                     )
+                    attempts.append(record)
+                    self._emit_model_event(record)
                     self.metrics.record("malformed")
                     logger.error("LLM STREAM MALFORMED  model=%s: %s", endpoint.model, e)
                     self._health(endpoint.model).record_failure(
@@ -1364,11 +1809,14 @@ class LLMClient:
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as e:
                     elapsed = int((time.monotonic() - started) * 1000)
-                    attempts.append(
-                        AttemptRecord(endpoint.label, endpoint.provider,
-                                      endpoint.model, "stream_error", None,
-                                      str(e), elapsed)
+                    record = AttemptRecord(
+                        endpoint.label, endpoint.provider,
+                        endpoint.model, "stream_error", None,
+                        str(e), elapsed,
+                        attempt=number, request_id=rid,
                     )
+                    attempts.append(record)
+                    self._emit_model_event(record)
                     self.metrics.record("stream_error", elapsed)
                     logger.warning(
                         "LLM STREAM ERROR  model=%s after %dms: %s",
@@ -1381,11 +1829,14 @@ class LLMClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    attempts.append(
-                        AttemptRecord(endpoint.label, endpoint.provider,
-                                      endpoint.model, "stream_error", None,
-                                      str(e), int((time.monotonic() - started) * 1000))
+                    record = AttemptRecord(
+                        endpoint.label, endpoint.provider,
+                        endpoint.model, "stream_error", None,
+                        str(e), int((time.monotonic() - started) * 1000),
+                        attempt=number, request_id=rid,
                     )
+                    attempts.append(record)
+                    self._emit_model_event(record)
                     self.metrics.record("stream_error")
                     logger.warning(
                         "LLM STREAM FAILURE  model=%s: %s", endpoint.model, e

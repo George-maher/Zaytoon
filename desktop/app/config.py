@@ -172,6 +172,27 @@ class DesktopConfig:
         default_factory=lambda: _env_bool("ZAYTOON_SEND_WAKE_WORD", False)
     )
 
+    # --- WebView host ----------------------------------------------------
+    #: When true, connect to the Vite dev server instead of loading the
+    #: production build. Useful during development.
+    dev_mode: bool = field(
+        default_factory=lambda: _env_bool("ZAYTOON_DEV_MODE", False)
+    )
+    #: Port for the Vite dev server (dev mode only).
+    dev_port: int = field(default_factory=lambda: _env_int("ZAYTOON_DEV_PORT", 5173))
+    #: Path to the frontend production build directory.
+    frontend_dist: Path = field(
+        default_factory=lambda: Path(_env("ZAYTOON_FRONTEND_DIST", str(default_repo_root() / "frontend" / "dist")))
+    )
+    #: Default window width.
+    window_width: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_WIDTH", 1280))
+    #: Default window height.
+    window_height: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_HEIGHT", 800))
+    #: Minimum window width.
+    window_min_width: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_MIN_WIDTH", 800))
+    #: Minimum window height.
+    window_min_height: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_MIN_HEIGHT", 600))
+
     # --- derived ---------------------------------------------------------
     @property
     def host(self) -> str:

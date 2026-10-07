@@ -5,6 +5,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# A portable install keeps its configuration beside the application rather than
+# inside it, so `Config/.env` is loaded too. `override=False` throughout: a
+# variable already in the environment was set deliberately (the launchers set
+# ZAYTOON_HOME, a shell profile may set a key) and the file must not overwrite it.
+try:
+    from core import paths as _core_paths
+
+    _config_dir = _core_paths.config_dir()
+    if _config_dir is not None and (_config_dir / ".env").is_file():
+        load_dotenv(_config_dir / ".env", override=False)
+except Exception:  # pragma: no cover - a missing layout is not an error
+    pass
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -32,6 +45,31 @@ def _env_str(name: str, default: str) -> str:
     if value is None:
         return default
     return value.strip() or default
+
+
+def _default_workspace_root() -> Path:
+    """Where the workspace lives when nothing says otherwise.
+
+    Delegates to ``core.paths`` so there is exactly one answer to "where does
+    Zaytoon keep the user's files" — the same answer the database, the skills
+    and the secrets file get. Importing it here (rather than inlining the
+    ``ZAYTOON_HOME`` check) is deliberate: a second copy is how two modules end
+    up disagreeing, which is the bug ``tools/sandbox`` already had to be
+    rewritten to fix.
+
+    The import is guarded because ``config`` is imported by nearly everything,
+    including code paths that run before the package is on ``sys.path``. A
+    failure to resolve the layout must not stop the backend from starting.
+    """
+    try:
+        from core import paths as _paths
+
+        portable = _paths.workspaces_dir()
+        if portable is not None:
+            return portable
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return Path.home() / "ZaytoonWorkspace"
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +481,10 @@ class Config:
 
     WORKSPACE_ROOT: str = _env_str(
         "WORKSPACE_ROOT",
-        str(Path.home() / DEFAULT_WORKSPACE_DIRNAME),
+        # A portable install has a Workspaces/ directory beside Application/ and
+        # uses it. A development checkout does not, and keeps the dedicated home
+        # folder so the assistant is never granted its own source tree.
+        str(_default_workspace_root()),
     )
 
     #: Confine every file tool to the workspace even if a caller forgets to

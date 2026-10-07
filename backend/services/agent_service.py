@@ -135,7 +135,10 @@ class AgentService:
             return result.get("confirmation", str(result))
 
         elif action == "list":
-            reminders = await self.reminder_service.list(session_id=session_id)
+            # Workspace-wide, deliberately: "what are my reminders?" is not
+            # "what did *this socket* ask for" — the session id changes on
+            # every reconnect (see `ReminderService.list`).
+            reminders = await self.reminder_service.list()
             return await self.reminder_service.format_list_for_display(reminders, language)
 
         elif action == "delete":

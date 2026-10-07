@@ -426,10 +426,10 @@ describe('SettingsPanel', () => {
         ok: true,
         json: async () => ({
           ...health,
-          llm: {
-            ...health.llm,
-            metrics: { ...health.llm.metrics, tools: { calls: 9, failed: 2, avg_ms: 480 } },
-          },
+          // The row reads the payload's *top* level: `llm.metrics` never
+          // carried `tools`, which is exactly why the row used to be dead.
+          metrics: { tools: { calls: 9, failed: 2, avg_ms: 480 } },
+          llm: { ...health.llm },
         }),
       }
     })

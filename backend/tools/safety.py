@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from config import config
 from common.reporting import safe_error
+from core.events import CoreEventType, bus
 
 logger = logging.getLogger("Zaytoon.ToolSafety")
 
@@ -592,12 +593,25 @@ class ConfirmationManager:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending[pending.request_id] = future
+        # Published the moment the request exists — before the notify — so a
+        # failed frame still leaves a requested→resolved(error) trail instead
+        # of silence. Carries no parameters: the `require_confirmation` frame
+        # is what shows the user what they are approving, and this breadcrumb
+        # travels process-wide (filtered per session by the transport).
+        bus.publish(
+            CoreEventType.PERMISSION_REQUESTED,
+            request_id=pending.request_id,
+            action=action,
+            level=assessment.level.value,
+            session_id=session_id or "",
+        )
 
         try:
             await self._notify(pending)
         except Exception as e:
             self._pending.pop(pending.request_id, None)
             self._last_outcome = self.OUTCOME_ERROR
+            self._emit_resolved(pending, self.OUTCOME_ERROR)
             # The failed frame carries the *parameters* being confirmed, so
             # this is reported through the redacting logger, never `str(e)`.
             safe_error(
@@ -610,10 +624,12 @@ class ConfirmationManager:
             approved = await asyncio.wait_for(future, timeout=self.timeout)
         except asyncio.TimeoutError:
             self._last_outcome = self.OUTCOME_TIMEOUT
+            self._emit_resolved(pending, self.OUTCOME_TIMEOUT)
             logger.warning("Confirmation for %s timed out; denying", action)
             return False
         except asyncio.CancelledError:
             self._last_outcome = self.OUTCOME_DECLINED
+            self._emit_resolved(pending, self.OUTCOME_DECLINED)
             logger.info("Confirmation for %s cancelled; denying", action)
             return False
         finally:
@@ -622,8 +638,27 @@ class ConfirmationManager:
         self._last_outcome = (
             self.OUTCOME_APPROVED if approved else self.OUTCOME_DECLINED
         )
+        self._emit_resolved(pending, self._last_outcome)
         logger.info("Confirmation for %s: %s", action, self._last_outcome)
         return bool(approved)
+
+    @staticmethod
+    def _emit_resolved(pending: PendingConfirmation, outcome: str) -> None:
+        """One ``permission.resolved`` per request — never zero, never two.
+
+        Emitted at each terminal exit of :meth:`request` rather than in
+        :meth:`resolve`, because ``resolve`` only reports that a reply
+        *arrived*: the outcome the tool actually saw (timeout, cancel,
+        error) is decided here, and a breadcrumb that can say "approved" when
+        the tool never ran would be worse than none.
+        """
+        bus.publish(
+            CoreEventType.PERMISSION_RESOLVED,
+            request_id=pending.request_id,
+            action=pending.action,
+            outcome=outcome,
+            session_id=pending.session_id or "",
+        )
 
     def resolve(self, request_id: str, approved: bool) -> bool:
         """Complete a pending request. Returns False if the id is unknown."""

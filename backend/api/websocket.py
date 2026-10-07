@@ -12,17 +12,34 @@ from domain.models import SessionState, TokenBucketRateLimiter, SpokenSentenceTr
 from arabic import clean_and_detect, detect_language
 from agents.events import AgentEvent, AgentEventType, EventBus
 from common.reporting import client_error, safe_error
+from common.tracing import set_trace_id
 from services.wake_word_service import apply_wake_gate
 from tools.safety import ConfirmationManager, PendingConfirmation
+from core.events import bus as core_bus
+from core.orchestrator import Orchestrator
+from core.workspace.terminal import get_manager as get_terminal_manager
 
 logger = logging.getLogger("Zaytoon.WebSocket")
 
 MAX_SESSIONS = 100
 session_states: dict[str, SessionState] = {}
 
+#: The turn runner for each live session, keyed by session id. Each WebSocket
+#: connection builds its own from *that handler's* dependencies — the transport
+#: and the orchestrator must share one AgentService/RouterAgent instance, which
+#: is also what lets a test that stubs the agents exercise the real turn
+#: sequence instead of the module singleton's. Keyed by session so the `task`
+#: cancel frame can reach the same instance's handle registry.
+_SESSION_ORCHESTRATORS: dict[str, Orchestrator] = {}
+
 # Global request tracer: trace_id -> {user_message, response_id, started_at}
 _request_traces: dict[str, dict] = {}
 _MAX_TRACES = 1000
+
+#: Terminal sink unsubscribes, keyed by socket identity. A subscription with no
+#: way to detach is a leak that only shows up as a growing list of dead sockets,
+#: so they are tracked here and released when the socket closes.
+_TERMINAL_SUBSCRIPTIONS: dict = {}
 
 # Client-generated message ids already accepted, per session. A client that
 # retries a send — a double click, a reconnect replaying its last frame, a
@@ -170,6 +187,26 @@ async def create_websocket_handler(
         oldest = min(session_states.keys(), key=lambda k: session_states[k]._created_at)
         session_states.pop(oldest, None)
     session_states[session_id] = SessionState()
+    _SESSION_ORCHESTRATORS[session_id] = Orchestrator(
+        agent_service=agent_service,
+        router_agent=router_agent,
+        memory_agent=memory_agent,
+    )
+
+    # Core events (task.*, file.changed, terminal.output, …) reach this socket as
+    # frames. The core bus is process-wide and every session subscribes to it, so
+    # a task started from the browser is visible in the desktop shell and vice
+    # versa — which is the point of having one core. Each subscriber is filtered
+    # to its own session where the event carries a session id, so two open
+    # clients do not receive each other's task progress.
+    async def _relay_core(event) -> None:
+        data = event.data or {}
+        session_filter = data.get("session_id")
+        if session_filter and session_filter != session_id:
+            return
+        await connection_manager.send(websocket, event.to_dict())
+
+    unsubscribe_core = core_bus.subscribe(_relay_core)
 
     # Human-in-the-loop channel: forwards approval requests to this socket and
     # resolves them when the client replies with a `tool_confirm` message.
@@ -411,6 +448,32 @@ async def create_websocket_handler(
             elif msg_type == "ping":
                 await connection_manager.send(websocket, {"type": "pong"})
 
+            elif msg_type == "task":
+                # Cancel whatever this session is running: the current turn
+                # *and* its active task. Separate from `interrupt`, which stops
+                # the turn only — a task outlives a turn (a test suite can run
+                # after the answer was delivered), so it needs its own handle.
+                stopped = await _cancel_session_work(session_id)
+                await connection_manager.send(websocket, {
+                    "type": "task_result",
+                    "cancelled": bool(stopped),
+                    "error": "" if stopped else "Nothing is running for this session.",
+                })
+
+            elif msg_type == "terminal":
+                # Subscribe to one terminal session's output for this socket.
+                # Subscribing rather than filtering a global stream means a
+                # client is only sent lines from a terminal it asked about.
+                target = data.get("session_id")
+                if target:
+                    await _handle_terminal_sub(websocket, connection_manager, target)
+
+            else:
+                await connection_manager.send(websocket, {
+                    "type": "error",
+                    "content": f"Unknown message type: {msg_type!r}",
+                })
+
     except WebSocketDisconnect:
         connection_manager.disconnect(websocket)
     except json.JSONDecodeError:
@@ -419,6 +482,13 @@ async def create_websocket_handler(
         safe_error(e, operation="ws.receive", component="api.websocket")
         connection_manager.disconnect(websocket)
     finally:
+        # Unsubscribe before tearing the session down: a core event arriving
+        # after this point would find a closed socket and log a send failure for
+        # every one until the subscription was removed.
+        unsubscribe_core()
+        for detach in _TERMINAL_SUBSCRIPTIONS.pop(id(websocket), []):
+            detach()
+        _SESSION_ORCHESTRATORS.pop(session_id, None)
         state = session_states.pop(session_id, None)
         if state:
             if state.confirmation_manager:
@@ -652,13 +722,17 @@ async def _handle_message(
     status = "error"
     try:
         try:
-            await _run_turn(
+            outcome = await _run_turn(
                 websocket, user_message, session_id, connection_manager,
                 stt, tts, memory_agent, short_term_memory,
                 agent_service, router_agent, scheduler, config,
                 language_hint=language_hint, trace_id=trace_id,
             )
-            status = "ok"
+            # The turn reports its own failure when it has already told the
+            # client (the `error` + `done` frames go out inside `_run_turn`):
+            # re-raising here would send those frames a second time through
+            # this boundary's except.
+            status = outcome or "ok"
         except asyncio.CancelledError:
             status = "cancelled"
             raise
@@ -688,6 +762,174 @@ async def _handle_message(
         )
 
 
+async def _cancel_session_work(session_id: str) -> bool:
+    """Cancel a session's turn and its active task.
+
+    The registry is consulted first: live turns run on the connection's own
+    orchestrator (see ``_SESSION_ORCHESTRATORS``), so cancelling via the module
+    singleton would set an event nobody is reading. The singleton remains as
+    the fallback for a turn started outside a connection (REST), and both
+    paths are imported lazily rather than injected: this handler is
+    constructed with a long positional argument list already, and adding a
+    parameter for one frame would touch the signature every caller and test
+    passes.
+    """
+    runner = _SESSION_ORCHESTRATORS.get(session_id)
+    if runner is None:
+        try:
+            from api.main import orchestrator as runner
+        except Exception as exc:  # noqa: BLE001 - a failed cancel must not raise
+            logger.warning(
+                "Could not cancel session %s: %s", session_id, type(exc).__name__
+            )
+            return False
+    try:
+        return await runner.cancel_session_task(session_id)
+    except Exception as exc:  # noqa: BLE001 - a failed cancel must not raise
+        logger.warning(
+            "Could not cancel session %s: %s", session_id, type(exc).__name__
+        )
+        return False
+
+
+async def _handle_terminal_sub(
+    websocket: WebSocket,
+    connection_manager: ConnectionManager,
+    session_id: str,
+) -> None:
+    """Relay one terminal session's output until it exits.
+
+    The manager's sinks are process-wide, so this filters by session id: two
+    clients watching two different terminals both get their own lines and
+    neither gets the other's.
+    """
+    manager = get_terminal_manager()
+    session = manager.get(session_id)
+    if session is None:
+        await connection_manager.send(websocket, {
+            "type": "error",
+            "content": f"No such terminal: {session_id}",
+        })
+        return
+
+    async def sink(current, entry):
+        if current.id != session_id:
+            return
+        await connection_manager.send(websocket, {
+            "type": "terminal_output",
+            "session_id": current.id,
+            "stream": entry.get("stream", "stdout"),
+            "text": entry.get("text", ""),
+        })
+
+    unsubscribe = manager.add_sink(sink)
+    _TERMINAL_SUBSCRIPTIONS.setdefault(id(websocket), []).append(unsubscribe)
+
+    # Replayed on subscribe, so a client that connects late still sees what it
+    # missed rather than an empty panel until the next line arrives.
+    for entry in session.tail(200):
+        await connection_manager.send(websocket, {
+            "type": "terminal_output",
+            "session_id": session_id,
+            "stream": entry.get("stream", "stdout"),
+            "text": entry.get("text", ""),
+            "replay": True,
+        })
+
+    logger.info("Socket subscribed to terminal %s", session_id)
+
+
+async def _handle_reminder_cmd(
+    websocket: WebSocket,
+    connection_manager: ConnectionManager,
+    reminder_service,
+    data: dict,
+    session_id: str,
+) -> None:
+    """The reminder panel's list / delete / done commands.
+
+    This logic used to live inline in the receive loop. A refactor replaced
+    the call site with this function *without ever writing the function*:
+    every panel button raised NameError, fell through to the loop's
+    catch-all and **dropped the socket** — pressing "refresh" disconnected
+    the chat. Hence the defensive answer below: a failed reminder read sends
+    a message the panel can render, never a teardown.
+
+    ``session_id`` is kept for call-site compatibility as attribution
+    context, but ``list`` deliberately does not filter by it: a reminder must
+    outlive the socket that created it (the id changes on every reconnect).
+    The REST query keeps an explicit ``session_id`` filter for callers that
+    want one session's rows.
+    """
+    action = data.get("action", "")
+    rid = data.get("id")
+    lang = data.get("language", "en")
+    try:
+        if action == "list":
+            reminders = await reminder_service.list()
+            display = await reminder_service.format_list_for_display(reminders, lang)
+            await connection_manager.send(websocket, {
+                "type": "reminder_list",
+                "reminders": reminders,
+                "display": display,
+                "language": lang,
+            })
+            return
+
+        if action in ("delete", "done") and rid is not None:
+            reminder_id = int(rid)
+            if action == "delete":
+                ok = await reminder_service.delete(reminder_id)
+                frame_type = "reminder_deleted"
+            else:
+                ok = await reminder_service.mark_completed(reminder_id)
+                frame_type = "reminder_done"
+            if ok:
+                msg = (
+                    ("Deleted." if lang == "en" else "تم الحذف.")
+                    if action == "delete"
+                    else ("Marked as done." if lang == "en" else "تم.")
+                )
+            else:
+                # Never claim an action that did not happen: the client
+                # removes the row from its panel on success.
+                msg = "No such reminder." if lang == "en" else "لا يوجد تذكير بهذا المعرف."
+            await connection_manager.send(websocket, {
+                "type": frame_type,
+                "id": reminder_id,
+                "success": ok,
+                "message": msg,
+            })
+            return
+
+        await connection_manager.send(websocket, {
+            "type": "error",
+            "content": (
+                f"Unknown reminder command: {action!r}" if lang == "en"
+                else f"أمر تذكير غير معروف: {action!r}"
+            ),
+        })
+    except (TypeError, ValueError):
+        await connection_manager.send(websocket, {
+            "type": "error",
+            "content": (
+                "Reminder id must be a number." if lang == "en"
+                else "معرف التذكير يجب أن يكون رقماً."
+            ),
+        })
+    except WebSocketDisconnect:
+        raise
+    except Exception as e:  # noqa: BLE001 - answered, never fatal
+        safe_error(e, operation="ws.reminder_cmd", component="api.websocket")
+        await connection_manager.send(websocket, {
+            "type": "error",
+            "content": (
+                "Reminder command failed." if lang == "en"
+                else "تعذر تنفيذ أمر التذكير."
+            ),
+        })
+
+
 def _language_for(text: str) -> str:
     """Best-effort language for a client-facing sentence; never raises."""
     try:
@@ -711,10 +953,24 @@ async def _run_turn(
     config,
     language_hint: Optional[str] = None,
     trace_id: Optional[str] = None,
-):
+) -> Optional[str]:
+    """Run one turn. Returns ``"error"`` when the turn failed *after* the
+    client was told (the ``error`` + ``done`` frames are sent here), so the
+    request boundary can log ``status=error`` without re-sending anything.
+    Every other outcome returns ``None``.
+    """
     state = session_states.get(session_id)
     if state:
         state.reset()
+
+    # Bind the trace for everything this turn schedules: the orchestrator's
+    # inner task copies this context (asyncio.create_task copies contextvars),
+    # so every model attempt inside it logs `request=<trace>` in the
+    # `LLM_ATTEMPT` line and can be tied back to the turn that caused it. No
+    # reset on the way out — `_handle_message` runs in a task created per
+    # message, so the binding lives exactly as long as the request.
+    if trace_id:
+        set_trace_id(trace_id)
 
     cancel_event = state.cancel_event if state else None
     spoken_tracker = state.spoken_tracker if state else None
@@ -739,8 +995,6 @@ async def _run_turn(
     await memory_agent.store_message("user", cleaned_message, language=language, session_id=session_id)
     short_term_memory.put("last_query", cleaned_message, {"label": "user_query", "language": language})
 
-    context = await memory_agent.get_recent_context(session_id=session_id)
-
     asyncio.create_task(memory_agent.summarize_and_prune(session_id))
 
     if cancel_event and cancel_event.is_set():
@@ -749,22 +1003,6 @@ async def _run_turn(
         return
 
     await connection_manager.send(websocket, {"type": "status", "content": "thinking", "trace_id": trace_id})
-
-    route_result = await router_agent.route(cleaned_message, context)
-    intent = route_result.get("intent", "chat")
-
-    logger.warning(f"[HANDLE_MSG] intent={intent} for msg='{cleaned_message[:60]}'")
-
-    if cancel_event and cancel_event.is_set():
-        logger.warning(f"[HANDLE_MSG] CANCELLED after routing (msg='{cleaned_message[:40]}')")
-        _update_trace(trace_id, status="cancelled")
-        return
-
-    logger.info(f"Session {session_id}: intent={intent}, lang={language}")
-
-    await connection_manager.send(websocket, {
-        "type": "intent", "intent": intent, "language": language, "response_id": response_id, "trace_id": trace_id,
-    })
 
     token_buffer: list[str] = []
 
@@ -816,26 +1054,87 @@ async def _run_turn(
     bus = EventBus()
     bus.subscribe(progress)
 
+    async def on_event(kind: str, payload: dict) -> None:
+        # The orchestrator's vocabulary, translated frame by frame. Only
+        # `intent` maps to a frame: `task_created` / `task_updated` are already
+        # on the wire as raw core events (the `_relay_core` subscription
+        # forwards `event.to_dict()`), so relaying them here too would render
+        # every task twice — one owner per event class.
+        if kind != "intent":
+            return
+        intent = payload.get("intent", "chat")
+        logger.warning(f"[HANDLE_MSG] intent={intent} for msg='{cleaned_message[:60]}'")
+        logger.info(f"Session {session_id}: intent={intent}, lang={language}")
+        await connection_manager.send(websocket, {
+            "type": "intent", "intent": intent, "language": language,
+            "response_id": response_id, "trace_id": trace_id,
+        })
+
+    runner = _SESSION_ORCHESTRATORS.get(session_id)
+    if runner is None:
+        # Built from this call's own dependencies: nothing else in the process
+        # is guaranteed to know what this handler was given.
+        runner = Orchestrator(
+            agent_service=agent_service,
+            router_agent=router_agent,
+            memory_agent=memory_agent,
+        )
+        _SESSION_ORCHESTRATORS[session_id] = runner
+
     try:
-        agent_output = await agent_service.dispatch(
-            intent, cleaned_message, context, language, session_id,
+        # `run_turn_in_session` rather than `run_turn`: registering the handle
+        # is what lets the `task` cancel frame reach work that is sitting inside
+        # a long agent dispatch — cancelling the event alone only takes effect
+        # at the orchestrator's own checkpoints, and an eight-iteration tool
+        # loop is far past the next one.
+        handle = await runner.run_turn_in_session(
+            session_id,
+            user_message,
+            language_hint=language,
             stream_callback=stream_callback,
+            event_callback=on_event,
             confirmation_manager=confirmation_manager,
             event_bus=bus,
             response_id=response_id,
+            cancel_event=cancel_event,
         )
-        if agent_output:
-            final_content = agent_output
+        result = await handle
     except asyncio.CancelledError:
         logger.info(f"Session {session_id}: cancelled")
         _update_trace(trace_id, status="cancelled")
         return
 
+    if result is not None and result.error:
+        # One owner for failure reporting: the orchestrator has already logged
+        # it (`safe_error`, one structured line) and turned it into a fixed
+        # bilingual sentence carrying no exception text, no path and no
+        # implementation name. Checked before the token flush because the old
+        # exception path dropped the buffered partials too, so the wire
+        # sequence matches it exactly.
+        await connection_manager.send(websocket, {
+            "type": "error", "content": result.error, "trace_id": trace_id,
+        })
+        # A turn that dies must still terminate: without this the client waits
+        # on a `done` that is never coming.
+        await connection_manager.send(websocket, {
+            "type": "status", "content": "done",
+            "response_id": None, "trace_id": trace_id,
+        })
+        _update_trace(trace_id, status="error")
+        # Reported to the boundary so `REQUEST_DONE` logs `status=error`: the
+        # frames already went out, so raising would duplicate them — and a
+        # failure the log calls "ok" is a duration you cannot compare against.
+        return "error"
+
     await flush_tokens()
 
-    if cancel_event and cancel_event.is_set():
+    if (cancel_event and cancel_event.is_set()) or (result is not None and result.cancelled):
         _update_trace(trace_id, status="cancelled")
         return
+
+    if result is not None and result.reply:
+        final_content = result.reply
+    intent = result.intent if result is not None else "chat"
 
     if not final_content.strip():
         await connection_manager.send(websocket, {

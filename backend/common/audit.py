@@ -102,7 +102,15 @@ def _db_path() -> str:
     if override:
         path = override
     else:
-        data_dir = os.path.join(os.getcwd(), "data")
+        # `core.paths` so a portable install's Data/ is honoured. Guarded:
+        # `common` is imported by the tool layer, which must not depend on the
+        # core package being importable.
+        try:
+            from core import paths as _paths
+
+            data_dir = str(_paths.data_dir())
+        except Exception:  # pragma: no cover - defensive
+            data_dir = os.path.join(os.getcwd(), "data")
         path = os.path.join(data_dir, "audit.db")
     parent = os.path.dirname(os.path.abspath(path))
     if parent:

@@ -35,7 +35,7 @@ cd frontend && npm run dev                                   # Terminal 2
 - **Arabic / English** — Full bilingual support with Egyptian Arabic dialect detection
 - **Scheduling** — Parse natural time expressions in Arabic/English, persistent reminders across sessions
 - **Streaming Responses** — Real-time token streaming + early TTS trigger for immediate audio feedback
-- **Desktop App** — Python/customTkinter floating orb with global hotkeys (`Ctrl+Space` to summon, `Alt+Z` to expand panel) and PyInstaller `.exe` builds
+- **Desktop App** — a native window hosting the same React UI through pywebview (WebView2 on Windows), with a closed OS bridge (file dialogs, reveal-in-OS, notifications, clipboard) and PyInstaller `.exe` builds
 
 ## Architecture
 
@@ -48,9 +48,9 @@ root/
 │   ├── voice/      # STT (whisper) + TTS (edge-tts) + language routing
 │   ├── scheduler/  # Time parser + reminder manager
 │   ├── tools/      # OS toolkit (cmd, file, system) + safety sandbox
-│   └── tests/      # 1165 pytest tests
+│   └── tests/      # 2307 pytest tests
 ├── frontend/       # React + Vite web client
-└── desktop/        # Python/customTkinter desktop client (orb + global hotkeys)
+└── desktop/        # pywebview desktop host — wraps the React UI, spawns the backend
 ```
 
 ## Setup
@@ -102,12 +102,12 @@ request/response metrics.
 | TTS | edge-tts — auto-selected: `ar-EG-ShakirNeural` / `en-GB-RyanNeural` |
 | Database | SQLite via aiosqlite |
 | Frontend | React 18, Vite, Tailwind CSS, GSAP (JavaScript/JSX, not TypeScript) |
-| Desktop | Python 3.10+, customTkinter, pystray, keyboard, PyInstaller |
+| Desktop | Python 3.11+, pywebview (WebView2 / WebKit), websockets, PyInstaller |
 
 ## Development
 
 ```bash
-cd backend && python -m pytest tests/ -q      # 1165 tests
+cd backend && python -m pytest tests/ -q      # 2307 tests
 cd backend && python scripts/verify_final.py  # live smoke check
 cd desktop && python scripts/build_exe.py     # PyInstaller onefile build
 ```

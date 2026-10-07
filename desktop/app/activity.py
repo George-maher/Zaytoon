@@ -142,7 +142,7 @@ class ActivityFeed(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.model = ActivityModel()
 
-        self._body = ctk.CTkFrame(self, fg_color="transparent")
+        self._body = ctk.CTkFrame(self, fg_color="transparent", height=1)
         self._body.pack(fill="x")
         self._body.grid_columnconfigure(0, weight=1)
 

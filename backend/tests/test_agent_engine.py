@@ -82,6 +82,15 @@ class _Recorder(BaseTool):
         return ToolResult.ok(f"{self._name} ran")
 
 
+class _Mutator(_Recorder):
+    """A tool that declares it changes files on disk (see ``BaseTool.mutates_files``)."""
+
+    mutates_files = True
+
+    def schema(self):
+        return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+
 class _Failing(BaseTool):
     permission = "safe"
 
@@ -844,6 +853,40 @@ class TestLoopEvents:
         finished = next(e for e in seen if e.type is AgentEventType.TOOL_FINISHED)
         assert finished.data["success"] is True
 
+    async def test_a_tool_declares_what_it_changed(self, registry):
+        """`mutates`/`params` are the turn recorder's whole input.
+
+        The declaration travels with the event, so the recorder never needs
+        the registry and never re-derives a name list that could disagree
+        with the registered aliases. On a failure there is nothing to
+        declare: the tool did not run.
+        """
+        registry.register(_Mutator("mutator"))
+        llm = ScriptedLLM([
+            call("get_time") + "\n" + call("mutator", path="src/app.py"),
+            "Done.",
+        ])
+        bus, seen = collector()
+        await AgentEngine(llm, registry).run("change a file", bus=bus)
+
+        finished = [e for e in seen if e.type is AgentEventType.TOOL_FINISHED]
+        mut = next(e for e in finished if e.data["name"] == "mutator")
+        assert mut.data["mutates"] is True
+        assert mut.data["params"] == {"path": "src/app.py"}
+
+        # A tool that does not declare mutation says so plainly…
+        plain = next(e for e in finished if e.data["name"] == "get_time")
+        assert plain.data.get("mutates") is False
+
+        # …and a failure claims no change at all.
+        bus2, seen2 = collector()
+        await AgentEngine(ScriptedLLM([call("broken"), "It failed."]), registry).run(
+            "try it", bus=bus2
+        )
+        failed = [e for e in seen2 if e.type is AgentEventType.TOOL_FINISHED]
+        assert failed
+        assert not any(e.data.get("mutates") for e in failed)
+
     async def test_only_prose_is_a_response_chunk(self, registry):
         """The guarantee that keeps private reasoning off the wire."""
         llm = ScriptedLLM([call("get_time"), "The time is 3pm."])
@@ -980,6 +1023,34 @@ class TestExpectToolNudge:
         )
         assert "get_time" in first_nag
         assert "final attempt" in second_nag.lower()
+
+    async def test_a_decline_exempts_prose_from_the_tool_nag(self, registry):
+        """After the gate refuses, prose *is* the answer.
+
+        Live E2E: the decline turn went decline → nag → the model retried
+        the tool (re-prompting the user) → declined again → prose → the
+        no-tool-taken failure message — a confusing "I couldn't complete
+        that" for a turn the user deliberately cancelled. The nag exists to
+        stop a model dodging a *needed* tool; a refused tool must not run,
+        so prose declining in turn ends the loop immediately. Only the
+        gate's own decision sets the exemption — a model cannot fake it.
+        """
+        async def decline(name, params):
+            return "The user declined this action."
+
+        llm = ScriptedLLM([
+            '{"action": "file_write", "path": "a.txt", "content": "x"}',
+            "Understood — I did not write the file.",
+        ])
+        result = await AgentEngine(llm, registry).run(
+            "write", language="en", expect_tool=True, approval=decline
+        )
+
+        assert result.stopped_reason != "no_tool_taken"
+        assert result.text == "Understood — I did not write the file."
+        assert llm.calls == 2  # the call, then prose — no nag round
+        # The refusal still reached the model as an observation.
+        assert "declined" in json.dumps(llm.requests[1]).lower()
 
     async def test_without_the_flag_prose_is_accepted_immediately(self, registry):
         llm = ScriptedLLM(["Plain prose answer."])

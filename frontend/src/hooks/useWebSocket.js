@@ -100,6 +100,15 @@ export default function useWebSocket() {
   const [activity, setActivity] = useState([]);
   // Track current trace for correlation
   const [currentTraceId, setCurrentTraceId] = useState(null);
+  // -- The core runtime, over the same socket --------------------------
+  // Tasks, terminal output and file changes arrive as core events relayed by
+  // `api/websocket.py`. They live here rather than in a second hook because
+  // they arrive on the *same* frames: a socket per concern would double the
+  // connections and let the two disagree about ordering.
+  const [tasks, setTasks] = useState([]);
+  const [activeTask, setActiveTask] = useState(null);
+  const [terminalLines, setTerminalLines] = useState({});
+  const [fileChanges, setFileChanges] = useState([]);
 
   const wsRef = useRef(null);
   const activeVoiceRef = useRef(null);
@@ -564,6 +573,78 @@ export default function useWebSocket() {
           setIsTyping(false);
           isProcessingRef.current = false;
           break;
+
+        // -- Core runtime events --------------------------------------
+        // `CoreEvent.to_dict()` flattens the dotted type, so the frame type is
+        // the literal `task.created` / `terminal.output` and the payload sits
+        // alongside it. Unrecognised core events fall through the switch
+        // silently, which is the point: a newer backend adding an event must
+        // not break an older client.
+        case "task.created":
+          setTasks((prev) => [data.task, ...prev.filter((t) => t.id !== data.task?.id)]);
+          setActiveTask(data.task);
+          break;
+        case "task.updated":
+          setTasks((prev) => {
+            const known = prev.some((t) => t.id === data.task?.id);
+            return known
+              ? prev.map((t) => (t.id === data.task.id ? data.task : t))
+              : [data.task, ...prev];
+          });
+          // Cleared only on a terminal state, so a task stays on screen while
+          // it works and leaves when it is done.
+          if (data.task?.is_terminal) {
+            setActiveTask((current) => (current?.id === data.task.id ? null : current));
+          } else {
+            setActiveTask(data.task);
+          }
+          break;
+        case "task.step":
+          // A step event with no `step` is the plan being announced; the task's
+          // own `plan` field already carries it, so there is nothing to merge.
+          if (!data.step) break;
+          setTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== data.task_id) return t;
+              const steps = (t.steps || []).map((s) =>
+                s.seq === data.step.seq ? data.step : s,
+              );
+              return { ...t, steps };
+            }),
+          );
+          break;
+        case "task.log":
+          // Not added to the transcript: the transcript is user-facing prose,
+          // and a log line is diagnostic. The task panel shows it.
+          break;
+        case "file.changed":
+          // One row per path, newest first, capped: a long session touches
+          // many files and this list is held in memory and rendered as a
+          // count — unbounded growth for a badge would be its own bug.
+          setFileChanges((prev) =>
+            [
+              { path: data.path, action: data.action, at: Date.now() },
+              ...prev.filter((f) => f.path !== data.path),
+            ].slice(0, 50),
+          );
+          break;
+        case "terminal_output": {
+          const sessionId = data.session_id;
+          const entry = { text: data.text, stream: data.stream, replay: data.replay };
+          // Bounded per session so a flooding dev server cannot grow the
+          // React state without limit.
+          setTerminalLines((prev) => {
+            const existing = prev[sessionId] || [];
+            const merged = data.replay ? [...existing, entry] : [...existing, entry];
+            return { ...prev, [sessionId]: merged.slice(-2000) };
+          });
+          break;
+        }
+        case "task_result":
+          if (data.error) {
+            addMessage("system", data.error, { type: "error" });
+          }
+          break;
       }
     };
 
@@ -697,6 +778,39 @@ export default function useWebSocket() {
       }
     },
     [language, isSocketOpen],
+  );
+
+  /**
+   * Cancel the session's active task.
+   *
+   * Separate from `requestStop` because the two stop different things: an
+   * interrupt kills the current turn, while a task can outlive its turn (a test
+   * suite keeps running after the answer was delivered). Firing an interrupt
+   * and hoping the task stopped is how a test suite ends up orphaned.
+   */
+  const cancelTask = useCallback(() => {
+    if (isSocketOpen()) {
+      wsRef.current.send(JSON.stringify({ type: "task" }));
+      return true;
+    }
+    return false;
+  }, [isSocketOpen]);
+
+  /**
+   * Subscribe to one terminal session's output.
+   *
+   * Subscribing rather than filtering a global stream means a client is only
+   * sent lines from a terminal it asked about. The server replays the recent
+   * output on subscribe, so a panel opened late is not blank until the next
+   * line arrives.
+   */
+  const watchTerminal = useCallback(
+    (sessionId) => {
+      if (!sessionId || !isSocketOpen()) return false;
+      wsRef.current.send(JSON.stringify({ type: "terminal", session_id: sessionId }));
+      return true;
+    },
+    [isSocketOpen],
   );
 
   const refreshReminders = useCallback(() => {
@@ -982,5 +1096,12 @@ if (rms > threshold) {
     respondToConfirmation,
     cancelPendingConfirmation,
     currentTraceId,
+    // Core runtime
+    tasks,
+    activeTask,
+    cancelTask,
+    terminalLines,
+    fileChanges,
+    watchTerminal,
   };
 }

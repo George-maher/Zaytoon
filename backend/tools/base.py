@@ -97,6 +97,14 @@ class BaseTool(ABC):
     #: Default tier. Overridden per subclass; see :mod:`tools.safety`.
     permission: str = "safe"
 
+    #: Whether a successful run changes files on disk. The turn recorder reads
+    #: this to decide whether a ``file.changed`` event is warranted — without
+    #: a declaration, either every tool would announce a change (``search_files``
+    #: takes a path too) or none would, and the name list would be a second
+    #: copy of the tools' own knowledge. **Visibility, not security**: the
+    #: permission gate never reads it, so a wrong value cannot grant access.
+    mutates_files: bool = False
+
     @abstractmethod
     def name(self) -> str:
         """Stable identifier, e.g. ``file_read``."""
