@@ -159,6 +159,36 @@ def redact(text: Any) -> str:
     return result
 
 
+def redact_payload(value: Any) -> Any:
+    """``redact()`` for a structured payload: same rules, shape preserved.
+
+    ``redact()`` operates on text and returns text; an event payload or an
+    audit row is *nested*, and ``str(dict)`` would destroy the very structure
+    a diagnostics endpoint exists to provide. So the structure is walked and
+    every string goes through ``redact()``.
+
+    Dict **keys** are checked against ``_SENSITIVE_NAME``: a key like
+    ``token`` or ``api_key`` has its value masked regardless of shape, because
+    a bare credential (no ``token:`` prefix) is invisible to ``redact()``'s
+    text patterns. Numbers, booleans and ``None`` come back untouched:
+    masking a counter would be a bug, not a precaution.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            key: "***" if (
+                isinstance(item, str)
+                and len(item) >= _MIN_SECRET_LEN
+                and _SENSITIVE_NAME.search(key)
+            ) else redact_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    return value
+
+
 def _one_line(text: str) -> str:
     """Collapse newlines so one exception stays on one log line."""
     return " ".join(str(text).split())
@@ -295,4 +325,4 @@ def client_error(
     return bucket["ar"] if language == "ar" else bucket["en"]
 
 
-__all__ = ["redact", "safe_error", "client_error"]
+__all__ = ["redact", "redact_payload", "safe_error", "client_error"]

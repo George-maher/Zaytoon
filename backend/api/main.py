@@ -1,12 +1,14 @@
 import os
+import re
 import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Dict
 
-from fastapi import FastAPI, HTTPException, WebSocket, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, WebSocket, UploadFile, File
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -31,6 +33,7 @@ from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
 from tools.metrics import get_tool_metrics
 from common.reporting import client_error, redact, safe_error
+from common.tracing import new_trace_id, reset_trace_id, set_trace_id
 
 from api.websocket import (
     create_websocket_handler,
@@ -38,6 +41,23 @@ from api.websocket import (
 )
 from domain.models import TokenBucketRateLimiter
 from services.agent_service import AgentService
+
+# The Zaytoon core runtime: task system, projects, files, skills, providers,
+# permissions, terminal. Routers are mounted below; see `core/` for the design.
+from core.api.routers import (
+    files_router,
+    git_router,
+    projects_router,
+    providers_router,
+    skills_router,
+    system_router,
+    tasks_router,
+    terminal_router,
+)
+from core.orchestrator import Orchestrator
+from core.providers import ensure_builtins as ensure_builtin_providers
+from core.skills import sync_to_db as sync_skills_to_db
+from core.workspace.terminal import get_manager as get_terminal_manager
 
 logger = logging.getLogger("Zaytoon")
 
@@ -64,20 +84,26 @@ os_toolkit = OSToolkit()
 # as a safety net so high-risk tools are denied rather than run unchecked.
 risk_assessor = RiskAssessor()
 default_confirmation_manager = ConfirmationManager(notify=None, timeout=config.TOOL_CONFIRM_TIMEOUT)
-tool_agent = ToolAgent(
-    confirmation_manager=default_confirmation_manager,
-    risk_assessor=risk_assessor,
-)
 
 notification_mgr = NotificationManager()
 reminder_service = ReminderService(memory_agent)
 
 scheduler = SchedulerManager(reminder_service, notification_mgr)
 
+# One live registry for the whole process: `GET /tools`, `/health`'s
+# `tools_loaded`, the agent's tool catalogue and every execution all read the
+# same instance, so a tool cannot be advertised without being dispatchable —
+# and skill tools loaded into it at startup appear everywhere at once.
 tool_executor = ToolExecutor(
     toolkit=os_toolkit,
     reminder_service=reminder_service,
     scheduler=scheduler,
+    risk_assessor=risk_assessor,
+)
+tool_agent = ToolAgent(
+    confirmation_manager=default_confirmation_manager,
+    risk_assessor=risk_assessor,
+    registry=tool_executor.registry,
 )
 
 agent_service = AgentService(
@@ -102,11 +128,31 @@ rate_limiter = TokenBucketRateLimiter(
 
 manager = ConnectionManager()
 
+#: Sequences a request end to end and keeps the task record. The WebSocket
+#: handler supplies the socket; this owns the work — which is what lets a REST
+#: request and a WebSocket turn share one implementation instead of two copies.
+orchestrator = Orchestrator(
+    agent_service=agent_service,
+    router_agent=router_agent,
+    memory_agent=memory_agent,
+)
+
 
 @asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(scheduler.start())
-    
+
+    # A choice saved through the settings screen beats the environment
+    # default: the environment gives the *first* value, a deliberate save is
+    # newer information. Best-effort — a corrupt row logs and applies
+    # nothing, so a damaged preference degrades to the defaults instead of
+    # refusing to boot.
+    from services.ai_settings import apply_persisted_ai_settings
+    try:
+        await apply_persisted_ai_settings()
+    except Exception as e:
+        safe_error(e, operation="startup.ai_settings", component="api.startup")
+
     # Log provider configuration
     if config.PROVIDER == "ollama":
         logger.info(
@@ -150,6 +196,40 @@ async def lifespan(app):
                 "on" if config.TOOL_SAFETY_ENABLED else "off",
                 config.TOOL_CONFIRM_TIMEOUT)
 
+    # Core registry bootstrapping. Both are best-effort and both are logged
+    # rather than fatal: a fresh install with an unwritable data directory
+    # should still serve /health and let the user diagnose it, not refuse to
+    # start.
+    try:
+        created = await ensure_builtin_providers()
+        if created:
+            logger.info("Registered %d built-in AI provider(s)", created)
+    except Exception as e:
+        safe_error(e, operation="startup.providers", component="api.startup")
+
+    try:
+        found = await sync_skills_to_db()
+        if found:
+            logger.info("Loaded %d skill(s) from the skills directory", found)
+    except Exception as e:
+        safe_error(e, operation="startup.skills", component="api.startup")
+
+    # Skill tools join the one live registry: contained imports, a `confirm`
+    # tier floor, and every failure reported rather than raised — a broken
+    # skill must not stop the app from booting.
+    try:
+        from core.skills import load_skill_tools
+
+        skill_report = await load_skill_tools(tool_executor.registry)
+        if skill_report["tools"]:
+            logger.info(
+                "Loaded %d skill tool(s): %s",
+                len(skill_report["tools"]),
+                ", ".join(skill_report["tools"]),
+            )
+    except Exception as e:
+        safe_error(e, operation="startup.skill_tools", component="api.startup")
+
     loop = asyncio.get_running_loop()
 
     async def _load_stt():
@@ -176,6 +256,13 @@ async def lifespan(app):
 
     logger.info("Zaytoon AI started on %s:%s", config.BACKEND_HOST, config.BACKEND_PORT)
     yield
+    # Terminals before the scheduler: a dev server the user started should be
+    # told to stop while the event loop is still running, rather than being
+    # orphaned when the process exits.
+    try:
+        await get_terminal_manager().close_all("backend shutting down")
+    except Exception as e:
+        safe_error(e, operation="shutdown.terminals", component="api.shutdown")
     await scheduler.stop()
     await close_shared_client()
     await get_llm_client().aclose()
@@ -268,6 +355,22 @@ async def unhandled_exception_handler(request, exc):
         content={"error": client_error(exc, operation="request", component="api")},
     )
 
+# ---------------------------------------------------------------------------
+# Core runtime routers
+# ---------------------------------------------------------------------------
+# Mounted without a prefix, so the paths are exactly what the architecture
+# document specifies: /tasks, /projects, /files, /terminal, /skills, /providers,
+# /models, /permissions, /system.
+app.include_router(tasks_router)
+app.include_router(projects_router)
+app.include_router(files_router)
+app.include_router(git_router)
+app.include_router(terminal_router)
+app.include_router(skills_router)
+app.include_router(providers_router)
+app.include_router(system_router)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -275,14 +378,46 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:5174",
-        "tauri://localhost",
-        "https://tauri.localhost",
     ],
-    allow_origin_regex=r"http://localhost:517\d+",
+    # The desktop host serves its production build from a port in
+    # desktop/app/host.py's DESKTOP_PORT_RANGE (5175–5179) — a *pinned* port,
+    # because pywebview's random default produced an origin the API rejected
+    # and every REST call from the shipped UI failed silently. Keep the two
+    # ranges in step.
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):517\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request, call_next):
+    """Give every HTTP request a correlation id, in and out.
+
+    The header the caller sends is honoured (so a proxy or client can carry its
+    own trace through to our logs), but only after checking it is a plain
+    printable token of reasonable length — a header value lands verbatim in log
+    lines and response headers, and neither is a place to put arbitrary bytes.
+    A request without a usable one gets a fresh id.
+
+    The binding lives in a ContextVar for the duration of the request, which
+    is what lets `LLMClient` stamp its `LLM_ATTEMPT` log lines with the same
+    id without threading a parameter through every agent. WebSockets are not
+    covered by this middleware; the WebSocket handler binds its own trace per
+    turn (`_run_turn`).
+    """
+    incoming = (request.headers.get("x-request-id") or "").strip()
+    safe = all(ch.isprintable() and ch not in "\r\n" for ch in incoming)
+    rid = incoming[:64] if (incoming and safe) else new_trace_id()
+
+    token = set_trace_id(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        reset_trace_id(token)
+    response.headers["X-Request-ID"] = rid
+    return response
 
 
 @app.get("/tools")
@@ -381,26 +516,68 @@ async def health():
         "workspace": config.describe_workspace(),
         "tools_loaded": len(tool_executor.list_tools()),
         "tools_by_tier": tool_executor.tools_by_tier(),
+        # The core registry is a separate answer to a separate question: "is the
+        # model healthy?" is `llm`, and "can I open a folder / add a provider?"
+        # is `core`. Reporting only the first made the whole workspace look
+        # absent when it was merely on a different code path.
+        "core": await _core_health(),
         "uptime": time.time(),
     }
 
 
-@app.get("/tasks")
-async def list_tasks(session_id: str = "default", status: str = "pending"):
-    reminders = await reminder_service.list(status=status, session_id=session_id)
-    return {"tasks": reminders}
+async def _core_health() -> dict:
+    """What the core runtime has: providers, models, skills, projects."""
+    from core.providers import default_provider, list_models, list_providers
+    from core.projects import list_projects
+    from core.skills import discover
+
+    providers = await list_providers()
+    models = await list_models(enabled_only=True)
+    active = await default_provider()
+    skills = discover()
+    projects = await list_projects()
+    return {
+        "providers": len(providers),
+        "models": len(models),
+        "default_provider": active["name"] if active else None,
+        "default_model_ready": bool(active),
+        "skills": len(skills["skills"]),
+        "skill_errors": len(skills["errors"]),
+        "projects": len(projects),
+    }
 
 
-@app.get("/tasks/{task_id}")
-async def get_task(task_id: int):
+# ---------------------------------------------------------------------------
+# Reminders
+# ---------------------------------------------------------------------------
+# These used to live at /tasks, which now means agent tasks (see
+# ``core/api/tasks_api.py``). The move is deliberate: a task system and a
+# reminder list cannot both own "/tasks", and "/tasks" should mean what the spec
+# says it means. `/reminders` is the new home; every frontend call site was
+# updated with it.
+@app.get("/reminders")
+async def list_reminders(session_id: str = "", status: str = "pending"):
+    """Pending reminders, workspace-wide unless a session is named.
+
+    ``session_id`` records *who asked* when a reminder is created; it is not a
+    visibility partition — the socket id changes on every reconnect, so
+    filtering by it would hide a reminder from the next session's panel. An
+    explicit ``session_id`` query still filters.
+    """
+    reminders = await reminder_service.list(status=status, session_id=session_id or None)
+    return {"tasks": reminders, "reminders": reminders}
+
+
+@app.get("/reminders/{task_id}")
+async def get_reminder(task_id: int):
     reminder = await reminder_service.get(task_id)
     if not reminder:
         raise HTTPException(404, "not found")
     return reminder
 
 
-@app.post("/tasks", status_code=201)
-async def create_task(data: dict):
+@app.post("/reminders", status_code=201)
+async def create_reminder(data: dict):
     task = data.get("task") or data.get("title", "Task")
     time_str = data.get("time") or data.get("scheduled_time", "")
     recurring = data.get("recurring", "none")
@@ -425,16 +602,16 @@ async def create_task(data: dict):
     return result["reminder"]
 
 
-@app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int):
+@app.delete("/reminders/{task_id}")
+async def delete_reminder(task_id: int):
     ok = await reminder_service.delete(task_id)
     if not ok:
         raise HTTPException(404, "not found")
     return {"status": "deleted", "id": task_id}
 
 
-@app.patch("/tasks/{task_id}/done")
-async def mark_task_done(task_id: int):
+@app.patch("/reminders/{task_id}/done")
+async def mark_reminder_done(task_id: int):
     ok = await reminder_service.mark_completed(task_id)
     if not ok:
         raise HTTPException(404, "not found")
@@ -464,19 +641,28 @@ async def chat_endpoint(data: dict):
     message = cleaning["text"]
 
     await memory_agent.store_message("user", message, language=lang, session_id=session_id)
-    context = await memory_agent.get_recent_context(session_id=session_id)
-    route_result = await router_agent.route(message, context)
-    intent = route_result.get("intent", "chat")
 
-    reply = await agent_service.dispatch(intent, message, context, lang, session_id)
+    # The same sequence the WebSocket runs — task record, project preamble,
+    # skill context, route, dispatch, transitions — so a REST client gets the
+    # context and the task trail instead of a second, divergent copy of the
+    # turn. Memory stays here: the transport stores the user's message *before*
+    # the orchestrator fetches context, and the reply *after* it returns.
+    result = await orchestrator.run_turn(
+        message, session_id, language_hint=lang
+    )
+
+    if result.error:
+        return {"error": result.error, "speak": False}
+
+    reply = result.reply or ""
     if reply:
         await memory_agent.store_message("assistant", reply, language=lang, session_id=session_id)
 
     return {
-        "reply": reply or "",
-        "text": reply or "",
+        "reply": reply,
+        "text": reply,
         "lang": lang,
-        "intent": intent,
+        "intent": result.intent,
         "speak": bool(reply),
     }
 
@@ -565,6 +751,7 @@ async def set_workspace(data: dict):
 async def get_ai_settings():
     """Get current AI provider configuration and model status."""
     from services.ai_provider import get_provider
+    from services.ai_settings import is_persisted
     
     provider = get_provider()
     health = await provider.health_check()
@@ -573,6 +760,9 @@ async def get_ai_settings():
         "provider": config.PROVIDER,
         "endpoint": provider.base_url,
         "connected": health.connected,
+        # True when the screen is showing a choice the user saved (which
+        # overrode the environment default at startup), false for env-only.
+        "persisted": await is_persisted(),
         "version": health.version,
         "error": health.error,
         "models": [
@@ -659,7 +849,18 @@ async def set_ai_settings(data: dict):
         fallback = (data.get("fallback_model") or "").strip()
         if fallback:
             config.OPENROUTER_FALLBACK_MODEL = fallback
-    
+
+    # Persist the choice — this is what makes it survive a restart. The key
+    # goes to credential storage (core.secrets), never into kv; everything
+    # else goes to the settings row. Both are deliberate: a save that
+    # silently reverted on restart is the bug users report as "did not
+    # stick", and a key in kv would be a secret in a plain table.
+    from services.ai_settings import persist_ai_settings, save_api_key
+    api_key = (data.get("api_key") or "").strip()
+    if api_key and config.PROVIDER == "openrouter":
+        save_api_key(api_key)
+    saved = await persist_ai_settings()
+
     # Invalidate provider singleton so new settings take effect
     from services.ai_provider import close_provider
     await close_provider()
@@ -672,6 +873,7 @@ async def set_ai_settings(data: dict):
     return {
         "status": "saved",
         "provider": config.PROVIDER,
+        "persisted": saved,
         "connected": health.connected,
         "error": health.error,
         "models": [m.id for m in health.models],
@@ -706,28 +908,236 @@ async def validate_ai_settings(data: dict):
         }
 
 
+# Model ids accepted by the pull endpoint: a whitelist, so a model name can
+# never become a shell fragment or a path. `library/llama3:8b-instruct-q4_K_M`
+# and `hf.co/user/Repo:Q4_K_M` are the shapes that must pass; `..`, spaces,
+# `&`, `|`, `%` and a leading `-` must not.
+PULL_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?$")
+
+#: Pulls this process has run, keyed by model. Module state on purpose: a
+#: pull outlives the request that started it, and polling must see the same
+#: record. Bounded so polling cannot grow the map forever.
+_PULLS: Dict[str, Dict] = {}
+
+
+async def _run_pull(provider, model: str) -> None:
+    """Consume a pull stream into its status record. Never raises.
+
+    A pull has no deadline — a 40 GB download is legitimately slow — so the
+    honesty here is in the *record*, not in a timeout: every terminal state
+    (`done`, `failed`) says what actually happened, and a stream that ends
+    without Ollama's `success` line is reported as the failure it was.
+    """
+    state = _PULLS.get(model)
+    if state is None:
+        return
+    try:
+        async for progress in provider.pull_model(model):
+            state["status"] = progress.status
+            state["total"] = progress.total
+            state["completed"] = progress.completed
+        if state["state"] == "running":
+            if state["status"] == "success":
+                state["state"] = "done"
+            else:
+                state["state"] = "failed"
+                state["error"] = "Pull stream ended without a success status"
+    except asyncio.CancelledError:
+        state["state"] = "failed"
+        state["error"] = "Pull cancelled"
+        raise
+    except Exception as e:
+        safe_error(e, operation="settings.ai.pull", component="api.settings")
+        state["state"] = "failed"
+        state["error"] = redact(str(e))[:300]
+    finally:
+        state["finished_at"] = time.time()
+        if state["state"] == "done":
+            # The next `GET /settings/ai` must see the model just installed.
+            try:
+                provider.invalidate_cache()
+            except Exception:
+                pass
+
+
 @app.post("/settings/ai/pull")
 async def pull_model(data: dict):
-    """Pull a model from Ollama registry."""
-    if config.PROVIDER != "ollama":
+    """Start pulling a model — explicit, one at a time, never automatic.
+
+    Nothing else in Zaytoon calls `pull_model`; a health check or a probe
+    may *report* that a model is missing, and the user then asks for it.
+    Pulling gigabytes is a decision, not an installation step, which is why
+    `tests/test_api_routes.py` scans the tree to keep it that way.
+    """
+    if config.PROVIDER != PROVIDER_OLLAMA:
         raise HTTPException(400, "Model pulling only available with Ollama provider")
-    
+
     model = (data.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "Model name required")
-    
-    from services.ai_provider import get_provider
+    if ".." in model or not PULL_MODEL_RE.match(model):
+        raise HTTPException(400, "Invalid model name")
+
+    existing = _PULLS.get(model)
+    if existing is not None and existing["state"] == "running":
+        raise HTTPException(409, f"A pull of {model} is already running")
+
     provider = get_provider()
-    
     if not isinstance(provider, OllamaProvider):
         raise HTTPException(500, "Provider is not Ollama")
-    
-    # Return a streaming response or just start the pull
-    # For now, return immediately with status
-    return {
-        "status": "started",
+
+    # Bound the record: drop finished entries before the map outgrows it.
+    if len(_PULLS) >= 8:
+        for key in [k for k, v in _PULLS.items() if v["state"] != "running"]:
+            del _PULLS[key]
+
+    _PULLS[model] = {
         "model": model,
-        "message": f"Model pull started. Check logs for progress.",
+        "state": "running",
+        "status": "starting",
+        "total": 0,
+        "completed": 0,
+        "error": None,
+        "started_at": time.time(),
+        "finished_at": None,
+    }
+    asyncio.create_task(_run_pull(provider, model))
+    return {"status": "started", "model": model, "state": "running"}
+
+
+@app.get("/settings/ai/pull")
+async def pull_status(model: str = ""):
+    """Poll a pull's progress, or list every pull this process has run."""
+    if model:
+        state = _PULLS.get(model)
+        if state is None:
+            raise HTTPException(404, f"No pull recorded for {model}")
+        return state
+    return {
+        "pulls": sorted(
+            _PULLS.values(), key=lambda s: s["started_at"], reverse=True
+        )
+    }
+
+
+@app.post("/settings/ai/probe")
+async def probe_model(data: dict):
+    """Probe a model's real capabilities and record them in the registry.
+
+    A claim in a capability list is only worth what measured it: this asks
+    the model to stream and to call a tool, then writes what happened. The
+    probe sends test prompts — it never downloads anything, and it only
+    ever touches an *installed* model, so a miss says "pull it first"
+    rather than quietly recording a model that is not there.
+    """
+    from core.providers import (
+        ProviderError,
+        default_provider,
+        get_provider as get_provider_row,
+        list_models,
+        save_model,
+    )
+    from services.ollama_client import OllamaClient
+
+    wanted = (data.get("model") or "").strip()
+    if not wanted:
+        raise HTTPException(400, "Model name required")
+    provider_id = (data.get("provider_id") or "").strip()
+
+    if provider_id:
+        row = await get_provider_row(provider_id)
+        if row is None:
+            raise HTTPException(404, f"No such provider: {provider_id}")
+    else:
+        row = await default_provider()
+        if row is None:
+            raise HTTPException(400, "No AI provider is configured")
+        provider_id = row["id"]
+
+    if row["kind"] != "ollama":
+        raise HTTPException(
+            400, "Capability probing is only supported for Ollama providers"
+        )
+
+    # The default provider follows the live setting (a base_url edited in
+    # the UI is newer than the row written at install time); an explicitly
+    # named provider is probed at its own endpoint.
+    default = await default_provider()
+    if default is not None and provider_id == default["id"]:
+        base_url = config.OLLAMA_BASE_URL.rstrip("/")
+    else:
+        base_url = (row.get("base_url") or config.OLLAMA_BASE_URL).rstrip("/")
+
+    client = OllamaClient(base_url, timeout=config.OLLAMA_TIMEOUT)
+    try:
+        health = await client.health_check()
+        if not health.connected:
+            raise HTTPException(
+                400, f"Cannot probe: Ollama unreachable at {base_url}"
+            )
+        installed = None
+        for m in health.models:
+            if m.id == wanted or m.name == wanted:
+                installed = m.id or m.name
+                break
+        if installed is None:
+            raise HTTPException(
+                404,
+                f"Model {wanted} is not installed on {base_url} — pull it "
+                "first with POST /settings/ai/pull",
+            )
+        caps = await client.probe_capabilities(installed)
+    finally:
+        await client.aclose()
+
+    capability_list = []
+    if (
+        caps.supports_streaming
+        or caps.supports_tools
+        or caps.supports_structured_output
+    ):
+        # It answered a probe at all — that *is* a chat model.
+        capability_list.append("chat")
+    if caps.supports_streaming:
+        capability_list.append("streaming")
+    if caps.supports_tools:
+        capability_list.append("tools")
+    if caps.supports_structured_output:
+        capability_list.append("structured_output")
+
+    recorded = False
+    try:
+        existing = {
+            m["id"]: m
+            for m in await list_models(provider_id, enabled_only=False)
+        }
+        prior = existing.get(installed)
+        await save_model(
+            provider_id,
+            installed,
+            capabilities=capability_list,
+            context_length=caps.context_window or None,
+            # A probe updates *capabilities* only: a row the user disabled
+            # stays disabled, and their priority order is not the probe's
+            # to rewrite (`save_model`'s upsert overwrites both).
+            enabled=bool(prior["enabled"]) if prior else True,
+            priority=prior["priority"] if prior else 100,
+        )
+        recorded = True
+    except ProviderError as e:
+        logger.warning("Probe result not recorded: %s", e)
+
+    return {
+        "model": installed,
+        "provider_id": provider_id,
+        "capabilities": capability_list,
+        "supports": {
+            "streaming": caps.supports_streaming,
+            "tools": caps.supports_tools,
+            "structured_output": caps.supports_structured_output,
+        },
+        "context_window": caps.context_window,
+        "recorded": recorded,
     }
 
 
@@ -927,6 +1337,37 @@ async def clear_audit():
     cleared = await audit.clear()
     logger.info("Execution audit cleared: %s entries", cleared)
     return {"cleared": cleared}
+
+
+@app.get("/events/recent")
+async def recent_events(limit: int = 20, event_type: str = Query("", alias="type")):
+    """The core event bus's ring buffer, for diagnostics (§33).
+
+    `core.events` already keeps the last 100 events in-process; this makes
+    them inspectable *after* a turn fails instead of only while a socket is
+    attached — a debugger's view, not a message queue.
+
+    - **Bounded by construction**: `EventBus.recent()` clamps `limit` to the
+      buffer's own cap, so no query shape can widen it.
+    - **Redacted on the way out** (`redact_payload`): a `task.log` message can
+      quote a command line that carried a credential, and a diagnostics
+      endpoint is exactly where such a line gets pasted.
+    - An unknown `type` returns an empty list with 200: filtering for an event
+      class that has not happened yet is a normal diagnostic query, not a
+      client error.
+    """
+    from common.reporting import redact_payload
+    from core.events import get_bus
+
+    bus = get_bus()
+    events = [redact_payload(event.to_dict()) for event in bus.recent(limit)]
+    if event_type:
+        events = [event for event in events if event.get("type") == event_type]
+    return {
+        "events": events,
+        "count": len(events),
+        "subscribers": bus.subscriber_count,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

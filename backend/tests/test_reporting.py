@@ -23,7 +23,7 @@ import logging
 import pytest
 
 from common.concurrency import ReentrantAsyncLock
-from common.reporting import client_error, redact, safe_error
+from common.reporting import client_error, redact, redact_payload, safe_error
 from tools.base import BaseTool, ToolResult
 from tools.registry import ToolRegistry
 
@@ -87,6 +87,62 @@ class TestRedact:
     def test_does_not_mangle_an_ordinary_download_url(self):
         out = redact("fetching https://example.com/reports/2026-summary.json")
         assert "2026-summary.json" in out
+
+
+# ---------------------------------------------------------------------------
+# redact_payload() — the structured variant
+# ---------------------------------------------------------------------------
+class TestRedactPayload:
+    def test_masks_values_but_keeps_the_keys(self):
+        """A key is a contract the client reads; a value is data."""
+        payload = redact_payload({"OPENROUTER_API_KEY": "sk-live-abcdef123456"})
+        assert payload == {"OPENROUTER_API_KEY": "***"}
+
+    def test_walks_nesting_without_flattening_it(self):
+        payload = redact_payload(
+            {
+                "task": {"title": "Run with token ghp_abcdefgh1234567890", "id": 7},
+                "log": [{"message": "export api_key=sk-test-0123456789"}],
+            }
+        )
+        assert payload["task"]["id"] == 7
+        # `_SECRET_ASSIGN` masks keyword + value as one match, so the whole
+        # assignment goes — not just the key shape behind it.
+        assert payload["log"][0]["message"] == "export ***"
+
+    def test_non_strings_pass_through_untouched(self):
+        """Masking a counter would be a bug, not a precaution."""
+        assert redact_payload(42) == 42
+        assert redact_payload(True) is True
+        assert redact_payload(None) is None
+        assert redact_payload(["sk-abcdefghij", 1, None]) == ["***", 1, None]
+
+    def test_an_empty_container_stays_empty(self):
+        assert redact_payload({}) == {}
+        assert redact_payload([]) == []
+
+    def test_sensitive_keys_mask_bare_credential_values(self):
+        """A key like ``token`` masks its value even without a ``token:`` prefix.
+
+        ``redact()`` masks text *patterns* (``token: <value>``, ``Bearer …``),
+        so a bare credential stored under a sensitive key name passed through
+        unmasked — a token in an event payload or audit row would have been
+        visible to anyone reading the diagnostics feed.
+        """
+        payload = redact_payload(
+            {
+                "token": "ghp_abcdEFGHijklMNOP123456",
+                "api_key": "sk-or-v1-abcdef1234567890",
+                "nested": {"access_token": "eyJhbGciOiJIUzI1NiJ9"},
+                "message": "safe text",
+                "count": 42,
+            }
+        )
+        assert payload["token"] == "***"
+        assert payload["api_key"] == "***"
+        assert payload["nested"]["access_token"] == "***"
+        assert payload["message"] == "safe text"
+        assert payload["count"] == 42
 
 
 # ---------------------------------------------------------------------------
