@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Zaytoon Purple HUD Preview</title>
+<style>
+/* Replicated design tokens for visual verification */
+:root{
+  --hud-void:#0a0510;--hud-deep:#110a1a;--hud-raised:#180f24;--hud-line:#1a0e2a;
+  --hud-cyan:#d946ef;--hud-cyan-core:#c026d3;--hud-green:#35d399;--hud-amber:#f2b84b;--hud-red:#ff6b6b;
+  --hud-text:#f3eef9;--hud-text-dim:#b4a7c2;--hud-text-mute:#7a6c8a;
+  --hud-edge:rgba(217,70,239,0.15);--hud-edge-strong:rgba(217,70,239,0.35);--hud-edge-faint:rgba(217,70,239,0.07);
+  --hud-glow-soft:rgba(240,171,252,0.22);--hud-glow-hard:rgba(240,171,252,0.45);
+  --input-bg:#140c1e;--input-text:#f3eef9;--input-placeholder:#5c4f6b;
+  --input-border:rgba(217,70,239,0.25);--input-border-focus:rgba(217,70,239,0.70);
+  --font-mono:"JetBrains Mono",monospace;--font-body:system-ui,sans-serif;--font-display:"Orbitron",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--hud-void);color:var(--hud-text);font-family:var(--font-body);padding:32px;line-height:1.5}
+.section{max-width:960px;margin:0 auto;padding:24px;border:1px solid var(--hud-edge);background:var(--hud-deep);border-radius:6px;margin-bottom:24px}
+h2{font-family:var(--font-display);font-size:14px;letter-spacing:0.2em;text-transform:uppercase;color:var(--hud-cyan-core);margin-bottom:12px;text-shadow:0 0 10px var(--hud-glow-soft)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.card{padding:16px;border:1px solid var(--hud-edge);background:var(--hud-raised);border-radius:4px}
+.card h3{font-family:var(--font-mono);font-size:10px;letter-spacing:0.14em;text-transform:uppercase;color:var(--hud-text-dim);margin-bottom:8px}
+/* Input */
+.hud-input{width:100%;padding:10px 12px;background:var(--input-bg);border:1px solid var(--input-border);color:var(--input-text);font-family:var(--font-mono);font-size:11px;border-radius:2px;outline:none;transition:border-color .15s,box-shadow .15s}
+.hud-input::placeholder{color:var(--input-placeholder);opacity:1}
+.hud-input:focus{border-color:var(--input-border-focus);box-shadow:0 0 0 1px rgba(217,70,239,0.45),0 0 12px rgba(217,70,239,0.18)}
+/* AI Orb */
+.orb-wrap{position:relative;width:72px;height:72px;margin:0 auto}
+.orb-wrap .ring{position:absolute;inset:0;border-radius:50%;border:1px solid rgba(217,70,239,0.45)}
+.orb-wrap .ring2{inset:8px;border-color:rgba(217,70,239,0.25);animation:hud-orbit 10s linear infinite}
+@keyframes hud-orbit{to{transform:rotate(360deg)}}
+.orb-wrap .center{position:absolute;inset:22px;border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(217,70,239,0.35),transparent 70%);box-shadow:0 0 20px rgba(240,171,252,0.35)}
+/* Hex node */
+.hex{display:inline-block;width:10px;height:10px;background:var(--hud-cyan);clip-path:polygon(50% 0%,100% 50%,50% 100%,0% 50%);box-shadow:0 0 6px var(--hud-glow-soft)}
+/* Cut corner message */
+.msg{padding:12px 14px;background:var(--hud-raised);border:1px solid var(--hud-edge);color:var(--hud-text);max-width:75%;font-size:12px;clip-path:polygon(0 10px,10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%)}
+.msg-user{margin-left:auto;background:color-mix(in srgb,var(--hud-cyan) 10%,var(--hud-raised))}
+/* Status ring */
+.ring-box{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;position:relative}
+.ring-box svg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
+.ring-box .pct{font-family:var(--font-mono);font-size:10px;color:var(--hud-cyan);font-weight:700}
+/* Scanline texture background */
+.scan-bg{position:fixed;inset:0;pointer-events:none;opacity:0.04;background-image:linear-gradient(var(--hud-edge-faint) 1px,transparent 1px),linear-gradient(90deg,var(--hud-edge-faint) 1px,transparent 1px);background-size:48px 48px;z-index:-1}
+</style>
+</head>
+<body>
+<div class="scan-bg" aria-hidden="true"></div>
+
+<div class="section">
+  <h2>Theme / Tokens Verified</h2>
+  <p style="font-family:var(--font-mono);font-size:11px;color:var(--hud-text-dim);margin-bottom:8px">Primary accent: <span style="color:var(--hud-cyan)">#d946ef</span> · Background: <span style="color:var(--hud-text-mute)">#0a0510</span> · Input fill: <span style="color:var(--hud-text-dim)">#140c1e</span></p>
+</div>
+
+<div class="section">
+  <h2>Inputs — Global Visibility</h2>
+  <div class="grid">
+    <div class="card"><h3>Chat Composer</h3><input class="hud-input" placeholder="ENTER COMMAND…" /></div>
+    <div class="card"><h3>Model Selector</h3><select class="hud-input"><option>auto</option><option>gpt-4</option></select></div>
+    <div class="card"><h3>API Key</h3><input class="hud-input" type="password" placeholder="leave blank to keep" /></div>
+    <div class="card"><h3>Skill Editor</h3><textarea class="hud-input" rows="3" placeholder="skill instructions…"></textarea></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>AI Presence Orb (Active)</h2>
+  <div style="display:flex;align-items:center;gap:24px;justify-content:center">
+    <div class="orb-wrap" aria-label="AI status: processing" role="img">
+      <div class="ring"></div><div class="ring ring2"></div><div class="center"></div>
+    </div>
+    <div style="font-family:var(--font-mono);font-size:10px;color:var(--hud-text-dim);letter-spacing:0.12em;text-transform:uppercase">PROCESSING · ACTIVE</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Message Frame + Hex Status</h2>
+  <div style="display:flex;flex-direction:column;gap:10px;align-items:flex-start">
+    <div class="msg"><strong style="color:var(--hud-cyan);font-family:var(--font-mono);font-size:10px">AI</strong> <span style="color:var(--hud-text-dim);font-family:var(--font-mono);font-size:9px">12:01</span><br>Task completed. Status ring shows 100%.</div>
+    <div class="msg msg-user"><strong style="color:var(--hud-text-dim);font-family:var(--font-mono);font-size:10px">YOU</strong> <span style="color:var(--hud-text-mute);font-family:var(--font-mono);font-size:9px">12:00</span><br>Check the workspace folder.</div>
+    <div style="display:flex;align-items:center;gap:8px;padding-left:6px"><span class="hex" aria-label="ok"></span><span style="font-family:var(--font-mono);font-size:10px;color:var(--hud-text-dim)">CONNECTED · ENABLED</span></div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Real Status Ring (Companion to Computer Page)</h2>
+  <div class="grid">
+    <div class="card"><h3>Task Completion</h3><div class="ring-box"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16" fill="none" stroke="var(--hud-edge-faint)" stroke-width="1.5"/><circle cx="20" cy="20" r="16" fill="none" stroke="var(--hud-cyan)" stroke-width="1.5" stroke-dasharray="80 100" stroke-linecap="butt" transform="rotate(-90 20 20)"/></svg><span class="pct">80%</span></div></div>
+    <div class="card"><h3>Connection</h3><div class="ring-box"><svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="16" fill="none" stroke="var(--hud-edge-faint)" stroke-width="1.5"/><circle cx="20" cy="20" r="16" fill="none" stroke="var(--hud-green)" stroke-width="1.5" stroke-dasharray="100 100" stroke-linecap="butt" transform="rotate(-90 20 20)"/></svg><span class="pct">100%</span></div></div>
+  </div>
+</div>
+
+<div class="section" style="text-align:center;color:var(--hud-text-mute);font-family:var(--font-mono);font-size:10px;letter-spacing:0.1em">PURPLE HUD DERIVED FROM REFERENCE IMAGE · NO FAKE DATA · REAL BACKEND STATE ONLY</div>
+</body>
+</html>

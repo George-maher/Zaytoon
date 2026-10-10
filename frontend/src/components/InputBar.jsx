@@ -80,7 +80,7 @@ export default memo(function InputBar({
     const form = formRef.current;
     if (!form) return;
     form.style.borderColor = on ? "var(--input-border-focus)" : "var(--hud-edge)";
-    form.style.boxShadow = on ? "0 0 12px color-mix(in srgb, var(--hud-cyan) 8%, transparent)" : "inset 0 1px 0 color-mix(in srgb, var(--hud-cyan) 4%, transparent)";
+    form.style.boxShadow = on ? "0 0 12px color-mix(in srgb, var(--zt-accent) 18%, transparent)" : "inset 0 1px 0 color-mix(in srgb, var(--zt-accent) 8%, transparent)";
   };
 
   const sharedProps = {
@@ -92,12 +92,13 @@ export default memo(function InputBar({
     className: "w-full",
     style: {
       padding: "var(--space-3) var(--space-4)",
-      background: "transparent",
-      border: "none",
-      color: "var(--hud-cyan)",
-      caretColor: "var(--hud-cyan)",
-      fontFamily: "var(--font-mono)",
-      fontSize: "var(--font-lg)",
+      background: "var(--zt-bg-input)",
+      border: "1px solid var(--zt-border-default)",
+      borderRadius: "var(--zt-radius-sm)",
+      color: "var(--zt-text-primary)",
+      caretColor: "var(--zt-accent)",
+      fontFamily: "var(--font-ui)",
+      fontSize: "var(--font-md)",
       letterSpacing: "0.02em",
       ...(multiline
         ? { resize: "none", overflowY: "auto", minHeight: "44px", lineHeight: 1.5 }

@@ -44,12 +44,12 @@ LINE = "#121924"
 
 # --- accents ---------------------------------------------------------------
 # The accent is the reference's own cyan: 96% of its saturated pixels are in
-# the blue/cyan family and its brightest measured accent is #8bffff. The name
+# the blue/cyan family and its brightest measured accent is #e879f9. The name
 # stays ``CYAN`` because test_design_parity pins it against the stylesheet;
 # renaming it would move the drift, not remove it.
-CYAN = "#22D3EE"
+CYAN = "#D946EF"
 CYAN_CORE = "#67E8F9"
-BLUE = "#0EA5E9"
+BLUE = "#8B2A9E"
 INDIGO = "#2563EB"
 # Amber is the reference's only warm element (its two orange bars) and is kept
 # deliberately scarce so it still reads as an alert rather than as decoration.
@@ -175,7 +175,7 @@ TEXT_FAINT = "#55697d"         # timestamps, disabled, placeholders
 #: The assistant hue. In the reference the "hotter" tone is the near
 #: white-cyan rim on its circular dial rather than a second hue, so the AI
 #: state reads as *brighter* — which also survives greyscale.
-VIOLET = "#8bffff"
+VIOLET = "#e879f9"
 
 #: Every accent the shell may colour something with, in one place.
 ACCENTS: dict[str, str] = {

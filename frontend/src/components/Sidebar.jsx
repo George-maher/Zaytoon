@@ -240,8 +240,10 @@ export default memo(function Sidebar({
                       color: "var(--zt-text-muted)",
                       cursor: "pointer",
                       textAlign: "start",
-                      transition: "color var(--zt-duration-fast), border-color var(--zt-duration-fast)",
+                      transition: "color var(--zt-duration-fast), border-color var(--zt-duration-fast), background-color var(--zt-duration-fast)",
                     }}
+                    onMouseEnter={(e) => { e.currentTarget.style.borderLeft = "2px solid var(--zt-accent-dim)"; e.currentTarget.style.background = "color-mix(in srgb, var(--zt-accent) 6%, transparent)"; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.borderLeft = "2px solid transparent"; e.currentTarget.style.background = "transparent"; }}
                   >
                     <span aria-hidden="true" style={{ fontSize: "var(--font-sm)", flex: "none" }}>
                       ▸

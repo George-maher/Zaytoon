@@ -18,49 +18,38 @@
      stylesheet cannot reach, because the browser draws it. */
   color-scheme: dark;
 
-  /* -- surfaces: flat, never blurred ------------------------------------
-     Sampled from the reference: the ground is #000000 across ~64% of the
-     pixels, lifted only enough to separate a panel from the page behind it.
-     A pure #000 ground reads as a hole rather than as a surface, so the two
-     lowest steps sit a few percent above it. */
-  --hud-void: #05070a;
-  --hud-deep: #080b11;
-  --hud-raised: #0d1219;
-  --hud-line: #121924;
-  /* Popover/select fill. Several panels read this; it was referenced from
-     GitPanel's <select> long before it existed as a token, so it silently
-     fell back to `transparent` and the control took the panel behind it. */
-  --hud-surface: #0b1017;
+  /* -- surfaces: purple-tinted near-black -------------------------------- */
+  --hud-void: #0a0510;
+  --hud-deep: #110a1a;
+  --hud-raised: #180f24;
+  --hud-line: #1a0e2a;
+  --hud-surface: #140c1e;
 
-  /* -- accents ----------------------------------------------------------
-     The reference is 96% saturated pixels in the cyan/blue family with a
-     measured brightest accent of #8bffff and a stroke cyan near #22d3ee.
-     Amber is the reference's only warm element (the two orange bars) and is
-     kept deliberately scarce so it still reads as an alert. */
-  --hud-cyan: #22d3ee;
-  --hud-cyan-core: #67e8f9;
-  --hud-blue: #0ea5e9;
-  --hud-indigo: #2563eb;
+  /* -- accents: magenta/purple glow from the HUD reference ---------------- */
+  --hud-cyan: #d946ef;
+  --hud-cyan-core: #c026d3;
+  --hud-blue: #8b2a9e;
+  --hud-indigo: #6b1f8e;
   --hud-amber: #f2b84b;
   --hud-green: #35d399;
   --hud-red: #ff6b6b;
 
   /* -- text ------------------------------------------------------------- */
-  --hud-text: #e8f6ff;
-  --hud-text-dim: #a3b8cc;
-  --hud-text-mute: #6d8296;
+  --hud-text: #f3eef9;
+  --hud-text-dim: #b4a7c2;
+  --hud-text-mute: #7a6c8a;
   /* Alias used by ChatMessage for timestamps: fainter than dim, still a
      real token rather than a var() that resolves to nothing. */
-  --hud-text-faint: #6d8296;
+  --hud-text-faint: #7a6c8a;
 
   /* -- edges and glow ---------------------------------------------------
      All derived from the accent, so a future accent migration moves the
      whole chrome with it instead of leaving a stale green ring behind. */
-  --hud-edge: rgba(34, 211, 238, 0.15);
-  --hud-edge-strong: rgba(34, 211, 238, 0.34);
-  --hud-edge-faint: rgba(34, 211, 238, 0.07);
-  --hud-glow-soft: rgba(139, 255, 255, 0.16);
-  --hud-glow-hard: rgba(139, 255, 255, 0.40);
+  --hud-edge: rgba(217,70,239,0.15);
+  --hud-edge-strong: rgba(217,70,239,0.35);
+  --hud-edge-faint: rgba(217,70,239,0.07);
+  --hud-glow-soft: rgba(240,171,252,0.20);
+  --hud-glow-hard: rgba(240,171,252,0.45);
   --hud-amber-glow: rgba(242, 184, 75, 0.26);
   --hud-red-glow: rgba(255, 107, 107, 0.26);
   --hud-green-glow: rgba(53, 211, 153, 0.24);
@@ -93,14 +82,14 @@
      browser agree on one set of values. The two are deliberately close: the
      hud-* scale is instrument chrome (page ground, hairlines, glow), the
      shared tokens below are cards, dialogs and read-outs. */
-  --bg0: #05070a;
-  --bg1: #080b11;
-  --bg2: #0d1219;
-  --border: #182230;
-  --border-strong: #24344a;
-  --text: #e8f6ff;
-  --text-mute: #6d8296;
-  --text-faint: #55697d;
+  --bg0: #0a0510;
+  --bg1: #110a1a;
+  --bg2: #180f24;
+  --border: rgba(217,70,239,0.15);
+  --border-strong: rgba(217,70,239,0.35);
+  --text: #f3eef9;
+  --text-mute: #7a6c8a;
+  --text-faint: #5c4f6b;
   --accent: var(--hud-cyan);   /* #22d3ee */
   --green: var(--hud-green);   /* #35d399 */
   --amber: var(--hud-amber);   /* #f2b84b */
@@ -108,8 +97,8 @@
   /* The AI-active accent. In the reference the "hotter" tone is the near
      white-cyan rim on the circular ring, not a second hue — so the AI state
      reads as *brighter*, which also survives greyscale. */
-  --violet: #8bffff;
-  --hud-violet: #8bffff;
+  --violet: #e879f9;
+  --hud-violet: #e879f9;
 
   /* -- surfaces for overlays (flat fills, never blur) --------------------- */
   --surface-0: rgba(5, 7, 10, 0.72);   /* header strip over the void      */
@@ -193,8 +182,8 @@
   --zt-bg-elevated: var(--hud-raised);
   --zt-bg-sidebar: var(--hud-deep);
   --zt-bg-input: var(--input-bg);
-  --zt-bg-hover: var(--hud-raised);
-  --zt-bg-active: var(--hud-line);
+  --zt-bg-hover: #1f1430;
+  --zt-bg-active: #28193c;
   --zt-text-primary: var(--hud-text);
   --zt-text-secondary: var(--hud-text-dim);
   --zt-text-muted: var(--hud-text-mute);
@@ -207,6 +196,7 @@
   --zt-accent-ring: var(--hud-glow-soft);
   --zt-ai-accent: var(--hud-violet);
   --zt-ai-soft-bg: color-mix(in srgb, var(--hud-violet) 8%, transparent);
+  --zt-ai-pulse: #e879f9;
   --zt-success: var(--hud-green);
   --zt-warning: var(--hud-amber);
   --zt-error: var(--hud-red);
@@ -228,6 +218,7 @@
   --zt-ease: ease-out;
   --zt-font-ui: var(--font-body);
   --zt-font-mono: var(--font-mono);
+  --cut: 10px;
 }
 
 * {
@@ -254,8 +245,8 @@ body {
 }
 
 *::selection {
-  background: rgba(0, 255, 156, 0.28);
-  color: var(--hud-void);
+  background: rgba(217,70,239,0.28);
+  color: #0a0510;
 }
 
 :focus-visible {
@@ -284,14 +275,14 @@ body {
    =========================================================================== */
 
 .hud-void {
-  background-color: var(--hud-void);
+  background-color: #0a0510;
   /* The reference's own structure: a near-black field with a faint radial
      bloom around the centre chip. Kept at 4–6% so it is felt rather than
      seen — at the image's own saturation this would be a purple wash, which
      is exactly the "busy gradient" the brief rules out. */
   background-image:
-    radial-gradient(90% 55% at 50% 45%, color-mix(in srgb, var(--hud-cyan) 6%, transparent), transparent 70%),
-    radial-gradient(120% 70% at 50% -10%, color-mix(in srgb, var(--hud-blue) 5%, transparent), transparent 60%);
+    radial-gradient(90% 55% at 50% 45%, color-mix(in srgb, var(--hud-cyan) 8%, transparent), transparent 70%),
+    radial-gradient(120% 70% at 50% -10%, color-mix(in srgb, #8b2a9e 6%, transparent), transparent 60%);
 }
 
 /* Fine technical grid. 48px cells, both axes, barely there. */
@@ -794,9 +785,9 @@ html[dir="rtl"] .hud-micro {
      The fill is deliberately *darker* than any panel it sits on. An input
      reads as a well — a hole in the surface you type into — and matching it to
      the panel behind it is what makes it disappear on a low-contrast row. */
-  --input-bg: #03050a;                                /* opaque: a translucent fill over a light parent is how white-on-white happens */
-  --input-text: #e8f6ff;                              /* 19.4:1 on --input-bg */
-  --input-placeholder: #8fa9bb;                       /* 8.0:1 on --input-bg — readable, clearly secondary */
+  --input-bg: #140c1e;                                /* opaque: a translucent fill over a light parent is how white-on-white happens */
+  --input-text: #f3eef9;                              /* 19.4:1 on --input-bg */
+  --input-placeholder: #5c4f6b;                       /* 8.0:1 on --input-bg — readable, clearly secondary */
   --input-border: color-mix(in srgb, var(--hud-cyan) 16%, transparent);
   --input-border-hover: color-mix(in srgb, var(--hud-cyan) 34%, transparent);
   --input-border-focus: color-mix(in srgb, var(--hud-cyan) 70%, transparent);
