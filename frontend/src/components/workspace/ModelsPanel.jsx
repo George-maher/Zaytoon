@@ -313,7 +313,7 @@ function ModelsPanel({ language = "en" }) {
                 </label>
                 <select
                   id={`tier-${tier}`}
-                  className="flex-1"
+                  className="hud-input flex-1"
                   value={value}
                   disabled={busy}
                   onChange={(e) => assignTier(tier, e.target.value)}
@@ -469,7 +469,7 @@ function ModelsPanel({ language = "en" }) {
             </label>
             <input
               id="pull-model"
-              className="flex-1"
+              className="hud-input flex-1"
               placeholder="qwen3:9b"
               value={pullInput}
               onChange={(e) => setPullInput(e.target.value)}
@@ -523,6 +523,7 @@ function ModelsPanel({ language = "en" }) {
           </label>
           <input
             id="provider-name"
+            className="hud-input w-full"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             required
@@ -532,6 +533,7 @@ function ModelsPanel({ language = "en" }) {
           </label>
           <select
             id="provider-kind"
+            className="hud-input w-full"
             value={form.kind}
             onChange={(e) => setForm({ ...form, kind: e.target.value })}
           >
@@ -544,6 +546,7 @@ function ModelsPanel({ language = "en" }) {
           </label>
           <input
             id="provider-url"
+            className="hud-input w-full"
             value={form.base_url}
             onChange={(e) => setForm({ ...form, base_url: e.target.value })}
             required
@@ -566,6 +569,7 @@ function ModelsPanel({ language = "en" }) {
                 id="provider-key-value"
                 type="password"
                 autoComplete="off"
+                className="hud-input w-full"
                 value={form.api_key}
                 onChange={(e) => setForm({ ...form, api_key: e.target.value })}
               />

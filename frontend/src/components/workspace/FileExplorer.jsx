@@ -508,14 +508,9 @@ function FileExplorer({
           onChange={(e) => setQuery(e.target.value)}
           placeholder={ar ? "بحث في الملفات…" : "Search files…"}
           aria-label={ar ? "بحث في الملفات" : "Search files"}
+          /* Was `.hud-input` plus five inline declarations re-stating it;
+             they also overrode the class's placeholder and focus styles. */
           className="w-full hud-input"
-          style={{
-            background: "var(--bg0)",
-            border: "var(--border-w) solid var(--hud-edge-faint)",
-            color: "var(--hud-text)",
-            padding: "var(--space-2) var(--space-3)",
-            fontSize: "var(--font-sm)",
-          }}
         />
       </form>
 

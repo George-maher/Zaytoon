@@ -69,10 +69,53 @@ describe("GitPanel", () => {
 
   it("hides itself when the folder is not a repository", async () => {
     // 404 is the answer to "is there a panel to show", not a failure to report.
-    mockApi(respond({ getGitStatus: vi.fn(async () => ({ error: "not a git repository" })) }));
+    // The stub carries the status code because `getGitStatus` now attaches one:
+    // without it the panel cannot tell this apart from the failures below, and
+    // that conflation was the bug.
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({ error: "not a git repository", status: 404 })),
+    }));
     render(<GitPanel path="." />);
     expect(await screen.findByText(/not a git repository/i)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps the panel and says why when the failure is not a 404", async () => {
+    // Every status used to collapse into `present = false`, so a containment
+    // refusal hid the panel behind "This folder is not a git repository" —
+    // a confident statement about the folder that had nothing to do with it.
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({ error: "outside the workspace", status: 403 })),
+    }));
+    render(<GitPanel path="." />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("outside the workspace");
+    expect(screen.queryByText(/not a git repository/i)).not.toBeInTheDocument();
+    // A containment decision cannot be retried — the boundary does not move
+    // because the user asked again.
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it("offers a retry when re-reading could plausibly succeed", async () => {
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({ error: "backend restarting", status: 503 })),
+    }));
+    render(<GitPanel path="." />);
+    fireEvent.click(await screen.findByRole("button", { name: /retry/i }));
+    expect(api.getGitStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops saying 'Reading…' forever when the fetch itself throws", async () => {
+    // No status code exists to classify, so the panel has nothing but the
+    // message — and leaving it on the loading line would be the one state
+    // with no way out at all.
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    }));
+    render(<GitPanel path="." />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("network down");
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
   });
 
   it("renders each changed entry with its status", async () => {
@@ -421,5 +464,42 @@ describe("GitPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "CONFLICT (content): Merge conflict in a.py",
     );
+  });
+
+  it("says an empty history is empty rather than showing nothing", async () => {
+    mockApi(respond());
+    render(<GitPanel path="." />);
+    expect(
+      await screen.findByText(/no commits yet on this branch/i),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps 'loading history' on screen until the history arrives", async () => {
+    let resolveLog;
+    mockApi(respond({
+      getGitLog: vi.fn(() => new Promise((resolve) => { resolveLog = resolve; })),
+    }));
+    render(<GitPanel path="." />);
+
+    expect(await screen.findByText(/loading history/i)).toBeInTheDocument();
+    await waitFor(() => expect(api.getGitLog).toHaveBeenCalled());
+    expect(screen.queryByText(/no commits yet/i)).not.toBeInTheDocument();
+
+    resolveLog({ commits: [{ sha: "abc1234", short: "abc1234", subject: "init" }] });
+    await waitFor(() => expect(screen.getByText("init")).toBeInTheDocument());
+    expect(screen.queryByText(/loading history/i)).not.toBeInTheDocument();
+  });
+
+  it("separates a failed history read from an empty repository", async () => {
+    // A bare `[]` used to mean all three at once, so a repository with a long
+    // history whose log request failed rendered as a brand-new one — a claim
+    // the panel had no basis for.
+    mockApi(respond({
+      getGitLog: vi.fn(async () => ({ error: "git log failed: bad object" })),
+    }));
+    render(<GitPanel path="." />);
+
+    expect(await screen.findByText(/git log failed: bad object/)).toBeInTheDocument();
+    expect(screen.queryByText(/no commits yet/i)).not.toBeInTheDocument();
   });
 });

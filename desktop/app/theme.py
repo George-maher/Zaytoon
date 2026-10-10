@@ -33,22 +33,32 @@ from __future__ import annotations
 import os
 
 # --- surfaces: flat, never blurred -----------------------------------------
-VOID = "#03070D"
-DEEP = "#06111A"
-RAISED = "#081722"
-LINE = "#0C1E2C"
+# Measured from the reference image: its ground is #000000 across ~64% of
+# pixels, lifted only enough that a panel reads as a surface rather than a
+# hole. These names are pinned token-for-token against
+# frontend/src/styles/theme.css by tests/test_design_parity.py.
+VOID = "#05070A"
+DEEP = "#080B11"
+RAISED = "#0D1219"
+LINE = "#121924"
 
 # --- accents ---------------------------------------------------------------
-CYAN = "#00E5FF"
-CYAN_CORE = "#00CFFF"
-BLUE = "#168DFF"
-INDIGO = "#2878FF"
-AMBER = "#FFB020"
-GREEN = "#00FF9C"
-RED = "#FF3B5C"
+# The accent is the reference's own cyan: 96% of its saturated pixels are in
+# the blue/cyan family and its brightest measured accent is #8bffff. The name
+# stays ``CYAN`` because test_design_parity pins it against the stylesheet;
+# renaming it would move the drift, not remove it.
+CYAN = "#22D3EE"
+CYAN_CORE = "#67E8F9"
+BLUE = "#0EA5E9"
+INDIGO = "#2563EB"
+# Amber is the reference's only warm element (its two orange bars) and is kept
+# deliberately scarce so it still reads as an alert rather than as decoration.
+AMBER = "#F2B84B"
+GREEN = "#35D399"
+RED = "#FF6B6B"
 
 ACCENT = CYAN
-ACCENT_DIM = "#0A7D99"
+ACCENT_DIM = "#0E7490"
 SUCCESS = GREEN
 WARNING = AMBER
 DANGER = RED
@@ -57,10 +67,10 @@ DANGER = RED
 BG = VOID
 BG_PANEL = DEEP
 BG_ELEVATED = RAISED
-BORDER = "#12283A"
-TEXT = "#E8F7FF"
-TEXT_MUTED = "#63879A"
-TEXT_DIM = "#A8C7D8"
+BORDER = "#182230"
+TEXT = "#E8F6FF"
+TEXT_MUTED = "#6D8296"
+TEXT_DIM = "#A3B8CC"
 
 #: Corner radius for instrument chrome. Square is the point: a rounded panel
 #: reads as a card, and the design language is an instrument bay, not a
@@ -77,10 +87,10 @@ RADIUS = 0
 RADIUS_SM = 2
 
 #: Hex colour plus the 1px edge tints used for frames, borders and focus.
-EDGE = "#123246"
-EDGE_STRONG = "#1D5C7D"
-EDGE_FAINT = "#0C1E2C"
-GLOW = "#0E4A63"
+EDGE = "#182230"
+EDGE_STRONG = "#24344A"
+EDGE_FAINT = "#121924"
+GLOW = "#164E5C"
 
 # --- density: the compact HUD ----------------------------------------------
 # Every spacing / font / thickness decision in the chat panel lives here, so
@@ -146,22 +156,26 @@ WRAP_MIN = 180                 # never wrap narrower than this
 # together.
 
 # --- surfaces ---------------------------------------------------------------
-BG0 = "#05080d"                # app background
-BG1 = "#0a1119"                # panels
-BG2 = "#0e1926"                # raised cards
+# Same reference-derived scale as the HUD palette above, so the shell and the
+# browser are one product rather than two dark themes.
+BG0 = "#05070a"                # app background
+BG1 = "#080b11"                # panels
+BG2 = "#0d1219"                # raised cards
 
 # --- edges ------------------------------------------------------------------
-HAIRLINE = "#1b2a3a"           # 1px separators, card borders
-BORDER_STRONG = "#24405a"      # focused / emphasized frames
+HAIRLINE = "#182230"           # 1px separators, card borders
+BORDER_STRONG = "#24344a"      # focused / emphasized frames
 
 # --- text -------------------------------------------------------------------
-TEXT_BASE = "#d7e3f4"          # body copy
-TEXT_MUTE = "#7f93ad"          # secondary labels
-TEXT_FAINT = "#4c5f78"         # timestamps, disabled, placeholders
+TEXT_BASE = "#e8f6ff"          # body copy
+TEXT_MUTE = "#6d8296"          # secondary labels
+TEXT_FAINT = "#55697d"         # timestamps, disabled, placeholders
 
 # --- accents ----------------------------------------------------------------
-#: Violet is the assistant/model hue and is used sparingly, per the spec.
-VIOLET = "#7c5cff"
+#: The assistant hue. In the reference the "hotter" tone is the near
+#: white-cyan rim on its circular dial rather than a second hue, so the AI
+#: state reads as *brighter* — which also survives greyscale.
+VIOLET = "#8bffff"
 
 #: Every accent the shell may colour something with, in one place.
 ACCENTS: dict[str, str] = {

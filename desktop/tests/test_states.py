@@ -154,7 +154,15 @@ class TestHudMapping:
             assert states.status_to_state(raw) is state, (state, raw)
 
     def test_accents_come_from_the_theme(self):
-        allowed = {"#00e5ff", "#00ff9c", "#ffb020", "#ff3b5c", "#7c5cff"}
+        # The accent is the reference's cyan (#22d3ee), measured from the
+        # source image. The set is closed on purpose: an accent here that is
+        # not a theme token is a colour the two clients cannot agree on.
+        #
+        # Green is in the set on its own account. It used to be omitted because
+        # CYAN and GREEN shared a value, so a distinct entry would have been
+        # redundant; the reference-derived palette separates them, and
+        # `listening` legitimately paints green.
+        allowed = {"#22d3ee", "#35d399", "#f2b84b", "#ff6b6b", "#8bffff"}
         for state in UiState:
             assert states.accent(state).lower() in allowed, (state, states.accent(state))
 

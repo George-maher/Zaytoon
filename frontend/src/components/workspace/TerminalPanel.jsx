@@ -83,15 +83,10 @@ function TerminalPanel({
             onChange={(e) => setCommand(e.target.value)}
             placeholder="npm run dev"
             aria-describedby="terminal-help"
-            className="w-full hud-mono"
-            style={{
-              marginTop: "var(--space-2)",
-              background: "var(--bg0)",
-              border: "var(--border-w) solid var(--hud-edge-faint)",
-              color: "var(--hud-text)",
-              padding: "var(--space-2) var(--space-3)",
-              fontSize: "var(--font-sm)",
-            }}
+            /* The shared class carries the fill, hairline, monospace face and
+               placeholder colour; only the vertical offset stays inline. */
+            className="w-full hud-input"
+            style={{ marginTop: "var(--space-2)" }}
           />
           <p id="terminal-help" className="hud-micro" style={{ marginTop: "var(--space-2)", color: "var(--hud-text-mute)" }}>
             {ar
@@ -208,16 +203,10 @@ function TerminalPanel({
           value={command}
           onChange={(e) => setCommand(e.target.value)}
           disabled={!active || active.status !== "running"}
-          className="w-full hud-mono"
-          style={{
-            marginTop: "var(--space-2)",
-            background: "var(--bg0)",
-            border: "var(--border-w) solid var(--hud-edge-faint)",
-            color: "var(--hud-text)",
-            padding: "var(--space-2) var(--space-3)",
-            fontSize: "var(--font-sm)",
-            opacity: active?.status === "running" ? 1 : 0.5,
-          }}
+          /* The running/not-running dimming is the :disabled state from the
+             shared class, not a second opacity rule here. */
+          className="w-full hud-input"
+          style={{ marginTop: "var(--space-2)" }}
         />
       </form>
     </div>

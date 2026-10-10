@@ -193,6 +193,189 @@ class TestCommandRoutes:
         assert not body.get("requires_confirmation")
 
 
+class TestComputerAppsRoute:
+    """`GET /computer/apps` is a *view* of the launcher's allow-list.
+
+    The Computer screen's app grid is built from this payload, so the two
+    invariants below are the whole reason the route exists: a panel that
+    advertises a name the launcher refuses is a button that fails, and one
+    that omits a name it accepts is a capability the product hides from
+    itself. Both are silent failures in a screenshot, hence the exact-set
+    assertion rather than a length check.
+    """
+
+    def test_answers_with_a_well_formed_catalogue(self, client):
+        body = client.get("/computer/apps").json()
+        assert body["total"] == len(body["apps"]) > 0
+        for app in body["apps"]:
+            assert set(app) == {"id", "label", "category"}
+            assert app["id"] and app["label"] and app["category"]
+        # Categories arrive in first-seen order and contain no duplicates, so
+        # the panel's grouping is stable between refreshes.
+        assert body["categories"] == list(
+            dict.fromkeys(a["category"] for a in body["apps"])
+        )
+        for cat in body["categories"]:
+            assert any(a["category"] == cat for a in body["apps"])
+
+    def test_the_catalogue_is_the_allow_list_and_nothing_more(self, client):
+        from api.main import APP_CATALOG, APP_WHITELIST
+
+        advertised = [n for e in APP_CATALOG for n in e["names"]]
+        # Both directions in one assertion: a name the launcher accepts but the
+        # catalogue omits, and a name the catalogue offers but the launcher
+        # refuses, each fail here.
+        assert sorted(advertised) == sorted(APP_WHITELIST)
+        assert len(advertised) == len(set(advertised)), "a name claimed twice"
+        for entry in APP_CATALOG:
+            # `id` is what the client sends, so it must be one of the names.
+            assert entry["id"] in entry["names"]
+
+    def test_every_id_is_a_name_the_launcher_accepts(self, client):
+        """The `id` is what the client sends, so it has to be the accepted spelling.
+
+        Stated as a membership check against the allow-list rather than by
+        calling `POST /command/open-app` — that route really launches things,
+        and a test that opens the user's browser and Word on every run would
+        be worse than no test.
+        """
+        from api.main import APP_WHITELIST
+
+        body = client.get("/computer/apps").json()
+        ids = [a["id"] for a in body["apps"]]
+        assert len(ids) == len(set(ids)), "duplicate ids"
+        for app_id in ids:
+            assert app_id in APP_WHITELIST
+
+
+class TestComputerAppAvailability:
+    """`?resolve=true` reports positive evidence — and says which answer it gave.
+
+    The grid is only worth having if a lit tile means something. Two rules
+    are pinned here because both fail silently: a verdict the route never
+    computed (a field that is always there and always right-looking), and a
+    verdict derived from a *table of how to launch* rather than from anything
+    observed on the machine. The second one would light up the whole panel on
+    a machine with nothing installed, which is a green grid that means
+    nothing — worse than no grid at all.
+    """
+
+    def test_the_default_stays_static(self, client):
+        body = client.get("/computer/apps").json()
+        assert body["resolved"] is False
+        # No field that looks like a verdict the route did not compute.
+        assert all("installed" not in app for app in body["apps"])
+        assert "found" not in body
+
+    def test_resolved_reports_a_verdict_for_every_app(self, client):
+        body = client.get("/computer/apps?resolve=true").json()
+        assert body["resolved"] is True
+        assert body["total"] == len(body["apps"])
+        for app in body["apps"]:
+            assert isinstance(app["installed"], bool), app
+            assert app["via"], app
+        # The tally is derived from the payload, not asserted beside it.
+        assert body["found"] == sum(1 for a in body["apps"] if a["installed"])
+        assert 0 <= body["found"] <= body["total"]
+
+    def test_a_target_is_not_evidence_that_it_is_installed(self, monkeypatch):
+        """The builtin URI table says *how* to launch, never *that* it exists.
+
+        `spotify:` resolves only when Spotify is installed. Reporting
+        `found: true` for every entry in that table would be a clean, uniform,
+        completely meaningless answer.
+        """
+        import tools.applications as apps
+
+        monkeypatch.setattr(apps.shutil, "which", lambda *a, **k: None)
+        monkeypatch.setattr(apps, "_find_start_menu_shortcut", lambda *a, **k: None)
+
+        detail = apps.resolve_app_detail("spotify")
+        assert detail["target"].startswith("spotify:")  # still launchable
+        assert detail["found"] is False  # but not claimed present
+
+    def test_observed_evidence_turns_the_verdict_on(self, monkeypatch):
+        import tools.applications as apps
+
+        monkeypatch.setattr(
+            apps.shutil, "which", lambda *a, **k: r"C:\fake\spotify.exe"
+        )
+        monkeypatch.setattr(apps, "_find_start_menu_shortcut", lambda *a, **k: None)
+
+        detail = apps.resolve_app_detail("spotify")
+        assert detail["found"] is True
+        # The target stays the builtin form: that is what the launcher wants,
+        # and the evidence is only ever consulted for the verdict.
+        assert detail["target"].startswith("spotify:")
+
+    def test_a_rejected_name_is_never_reported_as_present(self):
+        from tools.applications import resolve_app_detail
+
+        detail = resolve_app_detail("calc & calc")
+        assert detail["target"] is None
+        assert detail["found"] is False
+        assert detail["via"] == "rejected"
+
+    def test_the_verdict_is_produced_by_the_resolver_the_launcher_uses(self):
+        """One decision tree — not a probe that can disagree with the launch.
+
+        Every name the panel shows must resolve through `resolve_app_detail`,
+        which is exactly what `resolve_windows_app` returns a field of. If the
+        probe ever grew its own rules, "available" and "will launch" would be
+        two answers to the same question.
+        """
+        from tools.applications import resolve_app_detail, resolve_windows_app
+
+        for name in ("notepad", "explorer", "control panel", "some_random_app_12345"):
+            assert resolve_windows_app(name) == resolve_app_detail(name)["target"]
+
+    def test_the_batch_walks_the_start_menu_exactly_once(self, client, monkeypatch):
+        """Twenty applications, one filesystem walk.
+
+        The probe runs on the event loop of a server that is also streaming
+        tokens, and `resolve_app_detail` takes `shortcut_index` precisely so a
+        batch does not walk the same tree twenty times. Without the shared
+        index this test still passes functionally — it is a cost, not a
+        correctness bug, which is why it needs its own assertion.
+        """
+        walks = []
+        monkeypatch.setattr(
+            main_module, "build_shortcut_index", lambda: walks.append(1) or []
+        )
+        monkeypatch.setattr(
+            main_module,
+            "resolve_app_detail",
+            lambda app_id, shortcut_index=None: {
+                "target": None,
+                "found": False,
+                "via": "none",
+            },
+        )
+        body = client.get("/computer/apps?resolve=true").json()
+        assert body["resolved"] is True
+        assert walks == [1], f"Start Menu walked {len(walks)} times for one request"
+
+    def test_a_missing_index_is_still_a_valid_request(self, client, monkeypatch):
+        """A probe that fails must not take the panel down with it.
+
+        The Computer screen loads four panels at once; if the availability
+        probe raised, the route would 500 and the whole Apps section would
+        render empty. Instead the verdict is withheld and the response says
+        why — the same honest "I did not find out" the field always gives.
+        """
+        monkeypatch.setattr(
+            main_module, "build_shortcut_index", lambda: (_ for _ in ()).throw(
+                OSError("Start Menu is unreadable")
+            )
+        )
+        body = client.get("/computer/apps?resolve=true").json()
+        assert body["total"] > 0, "the static catalogue must survive a failed probe"
+        assert body["resolved"] is False
+        assert body["resolve_error"]
+        # No half-computed verdict: either every app has one or none does.
+        assert all("installed" not in app for app in body["apps"])
+
+
 class _FakeProvider:
     """Minimal AIProvider stand-in so /settings/ai never opens a socket."""
 

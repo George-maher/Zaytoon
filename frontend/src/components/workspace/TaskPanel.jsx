@@ -11,20 +11,41 @@ import { TASK_LIFECYCLE, isTaskActive, taskLabel, taskPercent, taskSummary } fro
  * four files should say so, because that is the answer to "what did you just
  * do" without the user opening anything.
  *
- * `task.*` frames arrive over the socket, so the list is live without polling.
- * Polling is only used for the initial fill and after a cancel, because the
- * socket only tells you about changes it made.
+ * **Two sources, with a stated precedence.** `task.*` frames arrive over the
+ * socket, so the list is live without polling — but the socket only knows about
+ * this session. The store (`GET /tasks`) holds everything else, and it is read
+ * on mount and after every cancel. Live rows come first (they carry the freshest
+ * state, and the task in flight belongs at the top); the store fills in the
+ * rest, with the two deduplicated by id so an overlapping task never renders
+ * twice — once as "queued" and once as "Running", which would read as two.
+ *
+ * The empty state has three answers, because it is three questions: still
+ * loading, genuinely none, or the load failed. Only the middle one is allowed
+ * to say "No tasks yet".
  */
 function TaskPanel({ tasks, activeTask, onCancel, language = "en" }) {
   const [expanded, setExpanded] = useState(() => new Set());
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState(null);
+  /**
+   * The persisted history, or `null` while it has not been read yet.
+   *
+   * This panel used to fetch 50 tasks and keep only the error, so every row on
+   * screen came from the socket — which only knows about tasks started *this
+   * session*. Opening the panel on a second day said "No tasks yet" above a
+   * database full of them. The socket stays authoritative for what is running
+   * (it is an event stream and carries the freshest state); the store fills in
+   * everything the socket was never there to see.
+   */
+  const [fetched, setFetched] = useState(null);
   const ar = language === "ar";
 
   const load = useCallback(async () => {
     const result = await api.getTasks({ limit: 50 });
-    if (result.error) setError(result.error);
-    else setError(null);
+    // Written even on failure, so a failed refresh stops looking like a load
+    // in progress — the error below is the answer, not an endless spinner.
+    setFetched(result.tasks || []);
+    setError(result.error || null);
   }, []);
 
   useEffect(() => {
@@ -68,7 +89,23 @@ function TaskPanel({ tasks, activeTask, onCancel, language = "en" }) {
     else setDetail(result);
   }, []);
 
-  const rows = useMemo(() => tasks || [], [tasks]);
+  /**
+   * Live first, then history — deduplicated by id.
+   *
+   * The two sources overlap for tasks started in this session, and the socket's
+   * copy of those wins because it is updated by the event stream while the REST
+   * snapshot was taken a moment ago. Putting the live rows first also keeps the
+   * task that is running at the top, which is where the eye already is.
+   */
+  const rows = useMemo(() => {
+    const live = tasks || [];
+    const history = fetched || [];
+    const liveIds = new Set(live.filter(Boolean).map((t) => String(t.id)));
+    return [
+      ...live.filter(Boolean),
+      ...history.filter((t) => t && !liveIds.has(String(t.id))),
+    ];
+  }, [tasks, fetched]);
 
   return (
     <div className="hud-panel flex-1 flex flex-col min-h-0">
@@ -203,9 +240,26 @@ function TaskPanel({ tasks, activeTask, onCancel, language = "en" }) {
             </li>
           );
         })}
-        {rows.length === 0 && (
-          <li className="hud-micro" style={{ padding: "var(--space-4)", color: "var(--hud-text-mute)" }}>
-            {ar ? "لا مهام بعد" : "No tasks yet"}
+        {/* Three answers, not one. A bare "No tasks yet" over a request that is
+            still in flight, or over one that just failed, is a claim about the
+            store that the store never made. The `<li>` keeps its listitem role —
+            putting `role="status"` on it would remove it from the list — so the
+            announcement lives on a span inside it. */}
+        {rows.length === 0 && !error && (
+          <li style={{ padding: "var(--space-4)" }}>
+            <span
+              role="status"
+              className="hud-micro"
+              style={{ color: "var(--hud-text-mute)" }}
+            >
+              {fetched === null
+                ? ar
+                  ? "جارٍ تحميل المهام…"
+                  : "Loading tasks…"
+                : ar
+                  ? "لا مهام بعد"
+                  : "No tasks yet"}
+            </span>
           </li>
         )}
       </ul>

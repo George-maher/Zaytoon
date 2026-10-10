@@ -121,6 +121,7 @@ function SkillsPanel({ language = "en" }) {
           </label>
           <input
             id="skill-name"
+            className="hud-input w-full"
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="laravel-security"
@@ -131,6 +132,7 @@ function SkillsPanel({ language = "en" }) {
           </label>
           <input
             id="skill-description"
+            className="hud-input w-full"
             value={form.description}
             onChange={(e) => setForm({ ...form, description: e.target.value })}
             placeholder="Laravel security review"

@@ -66,14 +66,16 @@ export default memo(function ChatMessage({ msg, language }) {
           maxWidth: "85%",
           padding: "var(--space-3) var(--space-4)",
           background: isUser
-            ? "color-mix(in srgb, var(--hud-cyan) 5%, transparent)"
+            ? "color-mix(in srgb, var(--hud-cyan) 6%, var(--surface-1))"
             : "var(--surface-1)",
           border: "var(--border-w) solid var(--hud-edge-faint)",
           // Spine on the anchored side; in RTL that flips with the document.
           borderInlineStart: `2px solid ${isUser ? "var(--hud-cyan)" : "var(--hud-blue)"}`,
           borderInlineEnd: isUser ? "none" : undefined,
           borderInlineStartWidth: 2,
-          boxShadow: msg.streaming ? "0 0 14px color-mix(in srgb, var(--hud-cyan) 5%, transparent)" : "none",
+          boxShadow: msg.streaming
+            ? "0 0 18px color-mix(in srgb, var(--hud-cyan) 12%, transparent)"
+            : "none",
         }}
         dir={isArabic(msg.content) ? "rtl" : "ltr"}
       >

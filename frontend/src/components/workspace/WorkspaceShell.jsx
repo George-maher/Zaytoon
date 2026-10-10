@@ -63,6 +63,33 @@ const NAV = [
 //: union. Splitting it into two lists would mean the second is unreachable.
 const NARROW_TABS = [...TABS, ...INSPECTOR_TABS];
 
+/**
+ * The panel half of the tabs contract — see `tabBar`.
+ *
+ * The wrapper is `flex-1 min-h-0 flex flex-col`, which is exactly what each
+ * panel already was as a direct child of the rail: a panel that fills
+ * (GitPanel's column, TaskPanel's scroll region) still fills, and one that
+ * sizes to its own content still sits at that height. The wrapper exists so
+ * that a role can be attached without editing every panel to carry one.
+ *
+ * `tabIndex=0` is on the panel rather than a scroll region inside it because
+ * the panels are not uniformly focusable — a keyboard user has to be able to
+ * reach the thing a tab selected even when it contains no control of its own.
+ */
+function tabPanel(node, prefix, tabId) {
+  return (
+    <div
+      role="tabpanel"
+      id={`${prefix}-panel-${tabId}`}
+      aria-labelledby={`${prefix}-tab-${tabId}`}
+      tabIndex={0}
+      className="flex-1 min-h-0 flex flex-col"
+    >
+      {node}
+    </div>
+  );
+}
+
 export default memo(function WorkspaceShell({
   workspace,
   socket,
@@ -70,6 +97,11 @@ export default memo(function WorkspaceShell({
   children,
   language = "en",
   wide: wideProp,
+  // App owns the media queries and hands both down, because this shell renders
+  // *inside* App's header context: two components independently reading the
+  // same viewport is two components that can disagree about it after a resize.
+  // Defaults to false so a shell rendered on its own keeps its full header.
+  narrow = false,
   // Controlled when something *outside* this component drives the focus —
   // the header nav lives here, but the bottom dock does not (App renders it
   // into the command console). Uncontrolled when rendered on its own, so a
@@ -137,6 +169,9 @@ export default memo(function WorkspaceShell({
     error,
     sessions,
     terminalLines,
+    openFiles,
+    activeFileId,
+    saving,
   } = workspace;
 
   // The terminal's lines come from the socket while it is watched, and from a
@@ -168,12 +203,18 @@ export default memo(function WorkspaceShell({
     [workspace],
   );
 
+  /**
+   * Typing goes straight to the buffer store.
+   *
+   * It used to rebuild `openFile` here and set a separate `dirty` flag — two
+   * writes in one place, both of which had to be remembered by whoever called
+   * it, and neither of which reached the tab the buffer belonged to. The hook
+   * owns both now: one call, and the tab bar, the header and the SAVE button
+   * all see the same answer.
+   */
   const setContent = useCallback(
-    (content) => {
-      workspace.setOpenFile({ ...openFile, content });
-      workspace.setDirty(true);
-    },
-    [workspace, openFile],
+    (content) => workspace.setContent(content),
+    [workspace],
   );
 
   const left = useMemo(() => {
@@ -270,20 +311,51 @@ export default memo(function WorkspaceShell({
 
   const right = inspector;
 
-  const tabBar = (items, active, onSelect, label) => (
+  /**
+   * A tab bar that points somewhere.
+   *
+   * `role="tab"` with no `tabpanel` behind it is a half-finished contract: the
+   * screen reader is told "these are tabs" and then never told which thing a
+   * tab controls, so the content it lands in is announced as unlabelled. Both
+   * ends are wired here — the tab names its panel, the panel names its tab —
+   * and the ids are prefixed per rail so the left rail and the drawer can never
+   * claim the same one.
+   *
+   * `aria-controls` is set on every tab, including the unselected ones whose
+   * panel is not rendered. That is deliberate: the panel is present exactly
+   * when its tab is selected, and pointing a tab at a panel that appears on
+   * selection is what the reference means. Only the *active* tab's target
+   * resolves in the DOM at any moment, and that is the relationship the
+   * announcement describes.
+   *
+   * The bar scrolls rather than wraps. The narrow drawer carries **eight**
+   * tabs — both rails' unions — in a `36vh` strip, so wrapping would spend the
+   * drawer's height on rows of tabs instead of on the panel the user asked
+   * for. Nothing becomes unreachable: each tab is `flex-none`, and the bar is
+   * a scroll container, so focusing an off-screen tab brings it into view.
+   */
+  const tabBar = (items, active, onSelect, label, prefix) => (
     <div
       className="flex"
-      style={{ gap: "var(--space-1)", padding: "var(--space-1) var(--space-2) 0" }}
+      style={{
+        gap: "var(--space-1)",
+        padding: "var(--space-1) var(--space-2) 0",
+        overflowX: "auto",
+        flexWrap: "nowrap",
+      }}
       role="tablist"
       aria-label={label}
     >
       {items.map((item) => (
         <button
           key={item.id}
+          type="button"
           role="tab"
+          id={`${prefix}-tab-${item.id}`}
           aria-selected={active === item.id}
+          aria-controls={`${prefix}-panel-${item.id}`}
           onClick={() => onSelect(item.id)}
-          className="hud-micro"
+          className="hud-micro flex-none"
           style={{
             padding: "var(--space-1) var(--space-3)",
             color: active === item.id ? "var(--hud-cyan)" : "var(--hud-text-mute)",
@@ -313,7 +385,7 @@ export default memo(function WorkspaceShell({
         <nav
           className="flex flex-none items-center"
           style={{ gap: "var(--space-1)" }}
-          aria-label={ar ? "التنقل الرئيسي" : "Main navigation"}
+          aria-label={ar ? "تنقل مساحة العمل" : "Workspace navigation"}
         >
           {NAV.map((item) => {
             const active = INSPECTOR_TABS.some((t) => t.id === item.id)
@@ -361,17 +433,48 @@ export default memo(function WorkspaceShell({
                 : "Open a project to begin"}
           </p>
         </div>
-        <div className="flex-none" style={{ minWidth: "12rem" }}>
-          <span className="hud-micro" style={{ color: "var(--hud-text-mute)" }}>
-            {workspace.root?.root || ""}
-          </span>
-        </div>
+        {/* The workspace root. It sits behind a 12rem *floor* in a header that
+            is already spending ~220px on four nav buttons, so at phone widths
+            it is the block that runs past the edge — and it is the weaker of
+            the two path readouts here: the project line beside it is the one
+            in use, while the workspace root is one command-palette round trip
+            away in Settings. Hidden rather than squeezed, because squeezed it
+            would be an ellipsis nobody could read either way. */}
+        {!narrow && (
+          <div className="flex-none" style={{ minWidth: "12rem" }}>
+            <span className="hud-micro" style={{ color: "var(--hud-text-mute)" }}>
+              {workspace.root?.root || ""}
+            </span>
+          </div>
+        )}
       </header>
 
       {error && (
-        <p role="alert" style={{ padding: "var(--space-2) var(--space-4)", color: "var(--hud-red)" }}>
-          {error}
-        </p>
+        <div
+          role="alert"
+          className="flex items-center"
+          style={{
+            gap: "var(--space-3)",
+            padding: "var(--space-2) var(--space-4)",
+            color: "var(--hud-red)",
+          }}
+        >
+          <span style={{ minWidth: 0, flex: "1" }}>{error}</span>
+          {/* Dismissable: this banner is cleared only by the next *successful*
+              operation, so without a close button a single refused save stays
+              on screen for the rest of the session — red text that no longer
+              describes anything, which is exactly what a status panel must
+              never be. */}
+          <button
+            type="button"
+            className="hud-micro flex-none"
+            aria-label={ar ? "إخفاء الرسالة" : "Dismiss message"}
+            onClick={() => workspace.report(null)}
+            style={{ color: "var(--hud-red)" }}
+          >
+            ✕
+          </button>
+        </div>
       )}
 
       <main className="flex-1 flex overflow-hidden min-h-0">
@@ -383,8 +486,8 @@ export default memo(function WorkspaceShell({
               aria-label={ar ? "مساحة العمل" : "Workspace"}
             >
               {extras?.left && <div style={{ padding: "var(--space-3)" }}>{extras.left}</div>}
-              {tabBar(TABS, tab, setTab, ar ? "مساحة العمل" : "Workspace")}
-              {left}
+              {tabBar(TABS, tab, setTab, ar ? "مساحة العمل" : "Workspace", "ws-left")}
+              {tabPanel(left, "ws-left", tab)}
             </aside>
             <aside
               className="flex-none w-[320px] flex flex-col overflow-hidden"
@@ -392,8 +495,8 @@ export default memo(function WorkspaceShell({
               aria-label={ar ? "المفتش" : "Inspector"}
             >
               {extras?.right && <div style={{ padding: "var(--space-3)" }}>{extras.right}</div>}
-              {tabBar(INSPECTOR_TABS, inspectorTab, setInspectorTab, ar ? "المفتش" : "Inspector")}
-              {right}
+              {tabBar(INSPECTOR_TABS, inspectorTab, setInspectorTab, ar ? "المفتش" : "Inspector", "ws-right")}
+              {tabPanel(right, "ws-right", inspectorTab)}
             </aside>
           </>
         ) : (
@@ -410,12 +513,16 @@ export default memo(function WorkspaceShell({
                 lists: the right-hand block used to vanish on a phone while
                 the desktop rail kept it. */}
             {extras?.right && <div style={{ padding: "var(--space-3)" }}>{extras.right}</div>}
-            {tabBar(NARROW_TABS, tab, setTab, ar ? "اللوحات" : "Panels")}
+            {tabBar(NARROW_TABS, tab, setTab, ar ? "اللوحات" : "Panels", "ws-drawer")}
             {/* `tab` here is the *drawer's* tab id, and below the breakpoint it
                 is shared with the left rail's — which is why the inspector
                 panels are reached through the same ids (`tasks`, `git`,
                 `terminal`) that the wide layout uses. */}
-            {INSPECTOR_TABS.some((item) => item.id === tab) ? inspector : left}
+            {tabPanel(
+              INSPECTOR_TABS.some((item) => item.id === tab) ? inspector : left,
+              "ws-drawer",
+              tab,
+            )}
           </div>
         )}
 
@@ -449,6 +556,11 @@ export default memo(function WorkspaceShell({
               onSetContent={setContent}
               onError={reportError}
               language={language}
+              openFiles={openFiles}
+              activeFileId={activeFileId}
+              onCloseFile={workspace.closeFile}
+              onSwitchFile={workspace.switchFile}
+              saving={saving}
             />
           </div>
         </section>

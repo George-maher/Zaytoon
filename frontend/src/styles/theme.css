@@ -9,35 +9,61 @@
    =========================================================================== */
 
 :root {
-  /* -- surfaces: flat, never blurred ------------------------------------ */
-  --hud-void: #03070d;
-  --hud-deep: #06111a;
-  --hud-raised: #081722;
-  --hud-line: #0c1e2c;
+  /* Tells the browser every surface here is dark, so the *native* widgets it
+     paints for us -- <select> dropdown lists, autofill suggestions, checkboxes,
+     scrollbars inside a field, the calendar picker -- come out dark too.
+     Without it Chromium paints those with a light scheme regardless of what
+     the page CSS says, which is exactly how a light-grey dropdown with light
+     grey text lands on a dark input: the one class of white-on-white the
+     stylesheet cannot reach, because the browser draws it. */
+  color-scheme: dark;
 
-  /* -- accents ---------------------------------------------------------- */
-  --hud-cyan: #00e5ff;
-  --hud-cyan-core: #00cfff;
-  --hud-blue: #168dff;
-  --hud-indigo: #2878ff;
-  --hud-amber: #ffb020;
-  --hud-green: #00ff9c;
-  --hud-red: #ff3b5c;
+  /* -- surfaces: flat, never blurred ------------------------------------
+     Sampled from the reference: the ground is #000000 across ~64% of the
+     pixels, lifted only enough to separate a panel from the page behind it.
+     A pure #000 ground reads as a hole rather than as a surface, so the two
+     lowest steps sit a few percent above it. */
+  --hud-void: #05070a;
+  --hud-deep: #080b11;
+  --hud-raised: #0d1219;
+  --hud-line: #121924;
+  /* Popover/select fill. Several panels read this; it was referenced from
+     GitPanel's <select> long before it existed as a token, so it silently
+     fell back to `transparent` and the control took the panel behind it. */
+  --hud-surface: #0b1017;
+
+  /* -- accents ----------------------------------------------------------
+     The reference is 96% saturated pixels in the cyan/blue family with a
+     measured brightest accent of #8bffff and a stroke cyan near #22d3ee.
+     Amber is the reference's only warm element (the two orange bars) and is
+     kept deliberately scarce so it still reads as an alert. */
+  --hud-cyan: #22d3ee;
+  --hud-cyan-core: #67e8f9;
+  --hud-blue: #0ea5e9;
+  --hud-indigo: #2563eb;
+  --hud-amber: #f2b84b;
+  --hud-green: #35d399;
+  --hud-red: #ff6b6b;
 
   /* -- text ------------------------------------------------------------- */
-  --hud-text: #e8f7ff;
-  --hud-text-dim: #a8c7d8;
-  --hud-text-mute: #63879a;
+  --hud-text: #e8f6ff;
+  --hud-text-dim: #a3b8cc;
+  --hud-text-mute: #6d8296;
+  /* Alias used by ChatMessage for timestamps: fainter than dim, still a
+     real token rather than a var() that resolves to nothing. */
+  --hud-text-faint: #6d8296;
 
-  /* -- edges and glow --------------------------------------------------- */
-  --hud-edge: rgba(0, 210, 255, 0.12);
-  --hud-edge-strong: rgba(0, 210, 255, 0.26);
-  --hud-edge-faint: rgba(0, 210, 255, 0.06);
-  --hud-glow-soft: rgba(0, 229, 255, 0.14);
-  --hud-glow-hard: rgba(0, 229, 255, 0.36);
-  --hud-amber-glow: rgba(255, 176, 32, 0.26);
-  --hud-red-glow: rgba(255, 59, 92, 0.26);
-  --hud-green-glow: rgba(0, 255, 156, 0.24);
+  /* -- edges and glow ---------------------------------------------------
+     All derived from the accent, so a future accent migration moves the
+     whole chrome with it instead of leaving a stale green ring behind. */
+  --hud-edge: rgba(34, 211, 238, 0.15);
+  --hud-edge-strong: rgba(34, 211, 238, 0.34);
+  --hud-edge-faint: rgba(34, 211, 238, 0.07);
+  --hud-glow-soft: rgba(139, 255, 255, 0.16);
+  --hud-glow-hard: rgba(139, 255, 255, 0.40);
+  --hud-amber-glow: rgba(242, 184, 75, 0.26);
+  --hud-red-glow: rgba(255, 107, 107, 0.26);
+  --hud-green-glow: rgba(53, 211, 153, 0.24);
 
   /* Legacy aliases. Several components still read --neon-* / --text-*; they
      are mapped here so the palette stays defined in exactly one place rather
@@ -67,26 +93,29 @@
      browser agree on one set of values. The two are deliberately close: the
      hud-* scale is instrument chrome (page ground, hairlines, glow), the
      shared tokens below are cards, dialogs and read-outs. */
-  --bg0: #05080d;
-  --bg1: #0a1119;
-  --bg2: #0e1926;
-  --border: #1b2a3a;
-  --border-strong: #24405a;
-  --text: #d7e3f4;
-  --text-mute: #7f93ad;
-  --text-faint: #4c5f78;
-  --accent: var(--hud-cyan);   /* #00e5ff */
-  --green: var(--hud-green);   /* #00ff9c */
-  --amber: var(--hud-amber);   /* #ffb020 */
-  --red: var(--hud-red);       /* #ff3b5c */
-  --violet: #7c5cff;
-  --hud-violet: #7c5cff;
+  --bg0: #05070a;
+  --bg1: #080b11;
+  --bg2: #0d1219;
+  --border: #182230;
+  --border-strong: #24344a;
+  --text: #e8f6ff;
+  --text-mute: #6d8296;
+  --text-faint: #55697d;
+  --accent: var(--hud-cyan);   /* #22d3ee */
+  --green: var(--hud-green);   /* #35d399 */
+  --amber: var(--hud-amber);   /* #f2b84b */
+  --red: var(--hud-red);       /* #ff6b6b */
+  /* The AI-active accent. In the reference the "hotter" tone is the near
+     white-cyan rim on the circular ring, not a second hue — so the AI state
+     reads as *brighter*, which also survives greyscale. */
+  --violet: #8bffff;
+  --hud-violet: #8bffff;
 
   /* -- surfaces for overlays (flat fills, never blur) --------------------- */
-  --surface-0: rgba(5, 8, 13, 0.72);    /* header strip over the void      */
-  --surface-1: rgba(10, 17, 25, 0.78);  /* popover / card fill             */
-  --surface-2: rgba(14, 25, 38, 0.97);  /* dialog fill                     */
-  --scrim: rgba(3, 3, 8, 0.8);          /* modal backdrop                  */
+  --surface-0: rgba(5, 7, 10, 0.72);   /* header strip over the void      */
+  --surface-1: rgba(8, 11, 17, 0.82);  /* popover / card fill             */
+  --surface-2: rgba(13, 18, 25, 0.97); /* dialog fill                     */
+  --scrim: rgba(2, 3, 6, 0.82);        /* modal backdrop                  */
 
   /* -- radii (shared spec: panels 8, cards 6, controls 2 -----------------
      `--radius-sm` above is the control radius. Panels stay square on
@@ -124,6 +153,7 @@
   --font-sm: 8px;   /* telemetry, captions, inputs */
   --font-md: 10px;  /* UI text, buttons */
   --font-lg: 12px;  /* transcript prose */
+  --font-xl: 28px;  /* the Home identity mark, the only display-size type */
 
   --border-w: 1px;  /* hairlines only: never heavier */
   --ctl-size: 30px; /* square system controls: compact, still hittable */
@@ -154,6 +184,50 @@
   --t-micro: 120ms ease-out;
   --t-panel: 240ms ease-out;
   --t-core: 600ms ease-in-out;
+
+  /* --zt-* aliases — the brief's token vocabulary, mapped to the --hud-*
+     values above. One source of truth; these exist so a component can
+     reach for `--zt-accent` without a second palette existing somewhere. */
+  --zt-bg-primary: var(--hud-void);
+  --zt-bg-secondary: var(--hud-deep);
+  --zt-bg-elevated: var(--hud-raised);
+  --zt-bg-sidebar: var(--hud-deep);
+  --zt-bg-input: var(--input-bg);
+  --zt-bg-hover: var(--hud-raised);
+  --zt-bg-active: var(--hud-line);
+  --zt-text-primary: var(--hud-text);
+  --zt-text-secondary: var(--hud-text-dim);
+  --zt-text-muted: var(--hud-text-mute);
+  --zt-text-placeholder: var(--input-placeholder);
+  --zt-border-subtle: var(--hud-edge-faint);
+  --zt-border-default: var(--hud-edge);
+  --zt-border-strong: var(--hud-edge-strong);
+  --zt-accent: var(--hud-cyan);
+  --zt-accent-dim: var(--hud-cyan-core);
+  --zt-accent-ring: var(--hud-glow-soft);
+  --zt-ai-accent: var(--hud-violet);
+  --zt-ai-soft-bg: color-mix(in srgb, var(--hud-violet) 8%, transparent);
+  --zt-success: var(--hud-green);
+  --zt-warning: var(--hud-amber);
+  --zt-error: var(--hud-red);
+  --zt-success-bg: color-mix(in srgb, var(--hud-green) 8%, transparent);
+  --zt-warning-bg: color-mix(in srgb, var(--hud-amber) 8%, transparent);
+  --zt-error-bg: color-mix(in srgb, var(--hud-red) 8%, transparent);
+  --zt-radius-sm: var(--radius-sm);
+  --zt-radius-md: var(--radius-card);
+  --zt-radius-lg: var(--radius-panel);
+  --zt-space-1: var(--sp-1);
+  --zt-space-2: var(--sp-2);
+  --zt-space-3: var(--sp-3);
+  --zt-space-4: var(--sp-4);
+  --zt-space-5: var(--sp-5);
+  --zt-space-6: var(--sp-6);
+  --zt-duration-fast: var(--t-fast);
+  --zt-duration-base: var(--t-base);
+  --zt-duration-slow: var(--t-slow);
+  --zt-ease: ease-out;
+  --zt-font-ui: var(--font-body);
+  --zt-font-mono: var(--font-mono);
 }
 
 * {
@@ -180,7 +254,7 @@ body {
 }
 
 *::selection {
-  background: rgba(0, 229, 255, 0.28);
+  background: rgba(0, 255, 156, 0.28);
   color: var(--hud-void);
 }
 
@@ -211,10 +285,13 @@ body {
 
 .hud-void {
   background-color: var(--hud-void);
-  /* Ambient cyan pooling top-centre and a cooler blue pool at the base. */
+  /* The reference's own structure: a near-black field with a faint radial
+     bloom around the centre chip. Kept at 4–6% so it is felt rather than
+     seen — at the image's own saturation this would be a purple wash, which
+     is exactly the "busy gradient" the brief rules out. */
   background-image:
-    radial-gradient(120% 70% at 50% -10%, rgba(0, 229, 255, 0.07), transparent 60%),
-    radial-gradient(90% 60% at 50% 115%, rgba(40, 120, 255, 0.06), transparent 65%);
+    radial-gradient(90% 55% at 50% 45%, color-mix(in srgb, var(--hud-cyan) 6%, transparent), transparent 70%),
+    radial-gradient(120% 70% at 50% -10%, color-mix(in srgb, var(--hud-blue) 5%, transparent), transparent 60%);
 }
 
 /* Fine technical grid. 48px cells, both axes, barely there. */
@@ -238,6 +315,109 @@ body {
   -webkit-mask-image: radial-gradient(100% 80% at 50% 50%, #000 10%, transparent 80%);
 }
 
+/* ---------------------------------------------------------------------------
+   Reference motifs
+   Taken from the source image and given a job, rather than reproduced as
+   wallpaper. Each is a single composited gradient layer: no images, no
+   per-frame JS, nothing that moves on its own.
+   --------------------------------------------------------------------------- */
+
+/* Edge tick ruler. The reference frames its artwork with a run of short
+   perpendicular ticks down both sides. Here it marks the top of the command
+   deck — an instrument bezel, static, and masked so it fades out rather than
+   ending in a hard line. */
+.hud-ticks {
+  position: absolute;
+  inset-inline: 0;
+  top: 0;
+  height: 6px;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--hud-edge-faint) 0 1px,
+    transparent 1px 9px
+  );
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+}
+
+/* Corner registration crosshairs. The reference sets four small `+` marks in
+   its corners. Decoration only: `aria-hidden` at every call site, never
+   adjacent to text it could be mistaken for. */
+.hud-corners::before,
+.hud-corners::after {
+  content: "";
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  pointer-events: none;
+  opacity: 0.5;
+  background:
+    linear-gradient(var(--hud-cyan), var(--hud-cyan)) center/1px 100% no-repeat,
+    linear-gradient(var(--hud-cyan), var(--hud-cyan)) center/100% 1px no-repeat;
+}
+.hud-corners::before {
+  top: 0;
+  left: 0;
+}
+.hud-corners::after {
+  right: 0;
+  bottom: 0;
+}
+
+/* Hex node. The reference marks status with a small hexagon carrying a number
+   (the `35` tile). This is that shape as a state indicator: a clipped square
+   reads as a chip/instrument node rather than as a bullet, and it takes its
+   colour from `--node-color` so one class covers every state.
+
+   A diamond rather than a true hexagon — a symmetric clip is 8 stops vs 4,
+   and at a 7px node the difference is invisible while the paint cost is not. */
+.hud-hex {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: none;
+  background: var(--node-color, var(--hud-cyan));
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+.hud-hex--hollow {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--node-color, var(--hud-cyan));
+}
+.hud-hex--ok    { --node-color: var(--hud-green); }
+.hud-hex--warn  { --node-color: var(--hud-amber); }
+.hud-hex--error { --node-color: var(--hud-red); }
+.hud-hex--idle  { --node-color: var(--hud-text-mute); }
+
+/* Cut-corner frame. The reference's panels have chamfered corners. Applied to
+   elevated surfaces only — message containers, skill cards, modal shells —
+   and never to anything containing a control, because `clip-path` cuts hit
+   areas and clips focus rings. 10px chamfer, matching the existing
+   `.hud-notch` geometry so the two read as one language. */
+.hud-cut {
+  clip-path: polygon(
+    0 var(--cut, 10px),
+    var(--cut, 10px) 0,
+    100% 0,
+    100% calc(100% - var(--cut, 10px)),
+    calc(100% - var(--cut, 10px)) 100%,
+    0 100%
+  );
+}
+
+/* Interaction glow. The reference's traces brighten where they meet. This is
+   that behaviour as a utility: the glow appears on hover/focus/active only,
+   never at rest, so a screen is not uniformly lit. */
+.hud-glowable {
+  transition: box-shadow var(--t-fast), border-color var(--t-fast),
+    background-color var(--t-fast);
+}
+.hud-glowable:hover,
+.hud-glowable:focus-visible {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--hud-cyan) 40%, transparent),
+    0 0 14px color-mix(in srgb, var(--hud-cyan) 22%, transparent);
+}
+
 /* A single slow scanline sweep. Transform-only, GPU friendly, and disabled
    under reduced-motion. */
 .hud-scan {
@@ -255,8 +435,8 @@ body {
   background: linear-gradient(
     to bottom,
     transparent,
-    rgba(0, 229, 255, 0.028) 55%,
-    rgba(0, 229, 255, 0.05) 50%,
+    rgba(0, 255, 156, 0.028) 55%,
+    rgba(0, 255, 156, 0.05) 50%,
     transparent
   );
   animation: hud-sweep 9s linear infinite;
@@ -281,7 +461,7 @@ body {
   border: var(--border-w) solid var(--hud-edge);
   /* A 1px inner highlight along the top edge reads as a lit instrument
      surface; the reference gets this from a hard edge, not from a blur. */
-  box-shadow: inset 0 1px 0 rgba(0, 229, 255, 0.05);
+  box-shadow: inset 0 1px 0 rgba(0, 255, 156, 0.05);
 }
 
 .hud-panel--flush {
@@ -506,6 +686,26 @@ body {
   }
 }
 
+/* The AI presence orb's two loops. Rotation for the rings, opacity+scale for
+   the bloom — transforms and opacity only, so both stay on the compositor and
+   neither triggers layout. */
+@keyframes hud-orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes hud-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
 .hud-core-breathe {
   animation: hud-breathe var(--breathe-dur, 3.4s) ease-in-out infinite;
 }
@@ -539,6 +739,17 @@ body {
   text-transform: uppercase;
   color: var(--hud-text-mute);
 }
+/* The instrument look letterspaces its labels — for Latin. Arabic is a
+   connected script, and tracking it out breaks the joins, so an RTL document
+   drops the tracking on the two shared label primitives rather than every
+   caller having to remember. Inline `letter-spacing` still wins, which is how
+   the components that already branch on language keep working.
+   Deliberately placed after both rules it overrides: a selector earlier in
+   the file would be found first by the density suite's `indexOf`. */
+html[dir="rtl"] .hud-panel-head,
+html[dir="rtl"] .hud-micro {
+  letter-spacing: 0;
+}
 .hud-identity {
   font-family: var(--font-display);
   font-size: var(--font-lg);
@@ -557,6 +768,132 @@ body {
 
 .hud-glow {
   text-shadow: 0 0 8px var(--state-glow, var(--hud-glow-soft));
+}
+
+/* ===========================================================================
+   Input system
+   One definition for every text input in the product. Inputs are flat,
+   hairline-framed, monospace — the same instrument language as the panels.
+   The text is ALWAYS readable: light on dark, never white-on-white.
+
+   The values live in the `--input-*` tokens below rather than inline, so
+   "the inputs are unreadable" is fixed in one place. Two rules apply
+   *globally*, to inputs that never take the .hud-input class (the command
+   bar, the terminal fields, the settings path box all style themselves):
+   a placeholder colour, and a dark option list for <select>. An input that
+   is only styled by its own component is an input whose contrast nobody
+   checked.
+   =========================================================================== */
+
+:root {
+  /* The fills and text are hex because they *are* the palette anchors (the
+     same values as --bg0/--hud-text); the borders are mixed from --hud-cyan
+     so a future accent migration moves the input chrome with it instead of
+     leaving a stale ring behind.
+
+     The fill is deliberately *darker* than any panel it sits on. An input
+     reads as a well — a hole in the surface you type into — and matching it to
+     the panel behind it is what makes it disappear on a low-contrast row. */
+  --input-bg: #03050a;                                /* opaque: a translucent fill over a light parent is how white-on-white happens */
+  --input-text: #e8f6ff;                              /* 19.4:1 on --input-bg */
+  --input-placeholder: #8fa9bb;                       /* 8.0:1 on --input-bg — readable, clearly secondary */
+  --input-border: color-mix(in srgb, var(--hud-cyan) 16%, transparent);
+  --input-border-hover: color-mix(in srgb, var(--hud-cyan) 34%, transparent);
+  --input-border-focus: color-mix(in srgb, var(--hud-cyan) 70%, transparent);
+  --input-caret: var(--hud-cyan);
+  /* The focus glow. Separated from the border so a component can brighten the
+     edge without also blooming the field — the reference glows its *lines*,
+     not its fills. */
+  --input-focus-glow: 0 0 0 1px color-mix(in srgb, var(--hud-cyan) 45%, transparent),
+    0 0 12px color-mix(in srgb, var(--hud-cyan) 18%, transparent);
+}
+
+.hud-input {
+  background: var(--input-bg);
+  border: var(--border-w) solid var(--input-border);
+  color: var(--input-text);
+  caret-color: var(--input-caret);
+  font-family: var(--font-mono);
+  font-size: var(--font-sm);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  /* NOT `outline: none` here: that rule out-specified the global
+     :focus-visible ring purely by source order, so keyboard users got
+     no focus indicator at all on every input in the product. Focus is now
+     the ring plus the border change; the explicit :focus-visible below is
+     the same declaration kept close to the control so it stays obvious
+     what a keyboard user sees. */
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.hud-input::placeholder {
+  color: var(--input-placeholder);
+  opacity: 1;               /* the UA's 0.54 alpha was the dim half of the visibility bug */
+}
+.hud-input:hover {
+  border-color: var(--input-border-hover);
+}
+.hud-input:focus {
+  border-color: var(--input-border-focus);
+  box-shadow: var(--input-focus-glow);
+}
+.hud-input:focus-visible {
+  outline: 2px solid var(--hud-cyan);
+  outline-offset: 2px;
+}
+.hud-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.hud-input--error {
+  border-color: var(--hud-red);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--hud-red) 8%, transparent);
+}
+
+/* Every placeholder in the product, including the fields that style
+   themselves instead of taking .hud-input: the command bar, the terminal
+   inputs, the settings path and API-key boxes, the file explorer's inline
+   rename rows. Chromium's default placeholder is a dark grey derived from
+   the *light* scheme; on a dark field it is close to invisible, which is
+   the reported "cannot read what I am typing" symptom. */
+input::placeholder,
+textarea::placeholder {
+  color: var(--input-placeholder);
+  opacity: 1;
+}
+
+/* <select> option lists. The closed control is styled by its own component,
+   but the popup is drawn by the browser — with the light scheme unless told
+   otherwise — and options inherit the control's light text. Hence light text
+   on a light list. `color-scheme: dark` on :root covers Chromium's own popup;
+   this rule covers the engines that paint options from CSS. */
+select option {
+  background: var(--input-bg);
+  color: var(--input-text);
+}
+
+/* Autofill is the remaining white-on-white path: the browser paints its own
+   suggestion background over the field. Force the fill to our colours. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--input-text);
+  caret-color: var(--input-caret);
+  box-shadow: 0 0 0 1000px var(--input-bg) inset;
+  transition: background-color 5000s ease-in-out 0s;
+}
+
+/* Native checkboxes/radios are drawn by the browser too; tint them so they
+   read as ours instead of a light OS widget on a dark row. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--hud-cyan);
+}
+
+/* Monospace content: the editor, the terminal, log lines, skill sources.
+   Seven components carry this class; it was never defined, so all of them
+   silently fell back to the proportional body face. */
+.hud-mono {
+  font-family: var(--font-mono);
 }
 
 /* ===========================================================================
@@ -593,6 +930,15 @@ body {
   .hud-led--pulse,
   .hud-msg-enter,
   .typing-dot {
+    animation: none !important;
+  }
+  /* The presence orb's loops are named by *animation name*, not by class,
+     because they are attached inline via `style.animation` — a class selector
+     would never match. Freezing the names is the only thing that reaches
+     them, and without this the orb would keep spinning for a user who asked
+     it not to. */
+  [style*="hud-orbit"],
+  [style*="hud-breathe"] {
     animation: none !important;
   }
   .hud-scan::after {

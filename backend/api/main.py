@@ -23,7 +23,7 @@ from memory import ShortTermMemory, UserPreferences
 from scheduler import SchedulerManager
 from reminder import ReminderService, NotificationManager
 from tools.base import OSToolkit
-from tools.executor import ToolExecutor
+from tools.executor import ToolExecutor, build_shortcut_index, resolve_app_detail
 from config import config, PROVIDER_OLLAMA, TIER_FAST, TIER_REASONING
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
@@ -1228,6 +1228,156 @@ APP_WHITELIST = [
     "outlook", "word", "excel", "powerpoint", "paint", "regedit",
     "task manager", "control panel", "settings", "fxsound",
 ]
+
+#: Display metadata for the allow-list above.
+#:
+#: One entry per *application*; `names` holds every spelling
+#: `POST /command/open-app` accepts for it (the canonical one first, which is
+#: what `id` is and what a client should send). Two invariants, both asserted in
+#: `tests/test_api_routes.py::TestComputerAppsRoute`:
+#:
+#:   * every allow-listed name appears in exactly one entry, so the Computer
+#:     view can never hide an app the launcher would accept;
+#:   * every name an entry carries is on the allow-list, so the view can never
+#:     advertise an app the launcher will refuse.
+#:
+#: The second rule is why this cannot be a constant duplicated into the
+#: frontend: the panel must be a *view* of the allow-list, not a second copy of
+#: it that drifts the first time someone edits one of them.
+#:
+#: Which of these apps are *installed* is a separate question and an opt-in
+#: one — `GET /computer/apps?resolve=true`. `PATH` alone answers it wrongly in
+#: both directions (Word is installed and is not on PATH; `cmd` is on PATH
+#: because it belongs to Windows), so the probe walks `PATH` *and* the Start
+#: Menu using the same resolver the launcher uses, and reports **positive
+#: evidence** rather than a guess: see `tools.applications.resolve_app_detail`
+#: for why `found: false` is "I found nothing", not "not installed". The
+#: default response stays static because a filesystem walk is a cost, and
+#: because a caller that only wants the list should not pay for it.
+APP_CATALOG = [
+    {"id": "chrome", "label": "Google Chrome", "category": "browser",
+     "names": ["chrome", "google chrome"]},
+    {"id": "firefox", "label": "Firefox", "category": "browser",
+     "names": ["firefox"]},
+    {"id": "edge", "label": "Microsoft Edge", "category": "browser",
+     "names": ["edge", "microsoft edge"]},
+    {"id": "vscode", "label": "Visual Studio Code", "category": "editor",
+     "names": ["vscode", "vs code", "visual studio code"]},
+    {"id": "notepad", "label": "Notepad", "category": "editor",
+     "names": ["notepad"]},
+    {"id": "notepad++", "label": "Notepad++", "category": "editor",
+     "names": ["notepad++"]},
+    {"id": "cmd", "label": "Command Prompt", "category": "terminal",
+     "names": ["cmd", "command prompt"]},
+    {"id": "powershell", "label": "PowerShell", "category": "terminal",
+     "names": ["powershell"]},
+    {"id": "terminal", "label": "Terminal", "category": "terminal",
+     "names": ["terminal"]},
+    {"id": "explorer", "label": "File Explorer", "category": "system",
+     "names": ["file explorer", "explorer"]},
+    {"id": "calculator", "label": "Calculator", "category": "system",
+     "names": ["calculator"]},
+    {"id": "settings", "label": "Settings", "category": "system",
+     "names": ["settings"]},
+    {"id": "control panel", "label": "Control Panel", "category": "system",
+     "names": ["control panel"]},
+    {"id": "task manager", "label": "Task Manager", "category": "system",
+     "names": ["task manager"]},
+    {"id": "regedit", "label": "Registry Editor", "category": "system",
+     "names": ["regedit"]},
+    {"id": "spotify", "label": "Spotify", "category": "media",
+     "names": ["spotify"]},
+    {"id": "paint", "label": "Paint", "category": "media",
+     "names": ["paint"]},
+    {"id": "fxsound", "label": "FxSound", "category": "media",
+     "names": ["fxsound"]},
+    {"id": "discord", "label": "Discord", "category": "chat",
+     "names": ["discord"]},
+    {"id": "slack", "label": "Slack", "category": "chat",
+     "names": ["slack"]},
+    {"id": "zoom", "label": "Zoom", "category": "chat",
+     "names": ["zoom"]},
+    {"id": "teams", "label": "Microsoft Teams", "category": "chat",
+     "names": ["teams", "microsoft teams"]},
+    {"id": "outlook", "label": "Outlook", "category": "office",
+     "names": ["outlook"]},
+    {"id": "word", "label": "Word", "category": "office",
+     "names": ["word"]},
+    {"id": "excel", "label": "Excel", "category": "office",
+     "names": ["excel"]},
+    {"id": "powerpoint", "label": "PowerPoint", "category": "office",
+     "names": ["powerpoint"]},
+]
+
+
+@app.get("/computer/apps")
+async def computer_apps(resolve: bool = False):
+    """The applications this build may launch, as display metadata.
+
+    Read-only: it reports the allow-list `POST /command/open-app` enforces, so
+    a panel built from it cannot offer a name the launcher will refuse.
+
+    `?resolve=true` additionally reports, per application, whether this machine
+    has **positive evidence** of it (`installed`, `via`) — produced by the very
+    resolver the launcher will call, so the panel and the launcher cannot
+    disagree about what "available" means. Two things keep this honest:
+
+    * it is opt-in, because it costs a filesystem walk of the Start Menu, and
+      a caller that only wants the list should not pay for it;
+    * the batch shares one walk (`build_shortcut_index` passed down as
+      `shortcut_index`), rather than twenty callers walking the same tree.
+
+    `installed: false` is not a claim that the application is missing — see
+    `resolve_app_detail`. The response says which answer it carried in
+    `resolved`, so a caller never has to infer it from the fields, and reports
+    `resolve_error` when it asked and could not find out.
+    """
+    apps = [
+        {"id": e["id"], "label": e["label"], "category": e["category"]}
+        for e in APP_CATALOG
+    ]
+    # First-seen order, so the panel's grouping never reshuffles between calls.
+    categories = list(dict.fromkeys(e["category"] for e in APP_CATALOG))
+
+    if not resolve:
+        return {"apps": apps, "categories": categories, "total": len(apps),
+                "resolved": False}
+
+    try:
+        # `resolve_app_detail` is sync filesystem work; off the event loop it
+        # goes, and once for the whole batch.
+        index = await asyncio.to_thread(build_shortcut_index)
+        for app in apps:
+            detail = await asyncio.to_thread(
+                resolve_app_detail, app["id"], shortcut_index=index
+            )
+            app["installed"] = bool(detail["found"])
+            app["via"] = detail["via"]
+    except Exception as exc:  # noqa: BLE001 - degrade, never 500
+        # One unreadable directory must not take the panel with it. The
+        # Computer screen loads four panels at once, and a route that raises
+        # here renders as a blank section — so the verdict is withheld and
+        # *says* it was withheld. `resolved: false` with a reason is the same
+        # honest answer the field always gives: "I did not find out".
+        logger.warning("availability probe failed: %s", exc)
+        for app in apps:
+            app.pop("installed", None)
+            app.pop("via", None)
+        return {
+            "apps": apps,
+            "categories": categories,
+            "total": len(apps),
+            "resolved": False,
+            "resolve_error": "probe failed",
+        }
+
+    return {
+        "apps": apps,
+        "categories": categories,
+        "total": len(apps),
+        "resolved": True,
+        "found": sum(1 for a in apps if a["installed"]),
+    }
 
 
 @app.post("/command/open-app")

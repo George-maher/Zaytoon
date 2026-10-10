@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   getAiSettings,
   getWorkspace,
@@ -7,6 +7,7 @@ import {
   setWorkspace,
   validateAiSettings,
 } from "../lib/api";
+import { enterOverlay } from "../lib/motion";
 import ExecutionHistory from "./ExecutionHistory";
 
 /**
@@ -99,6 +100,8 @@ function SettingsPanel({ open, onClose, language = "en" }) {
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
   const inputRef = useRef(null);
+  const scrimRef = useRef(null);
+  const panelRef = useRef(null);
 
   // AI provider: status (from the poll) plus a draft of the editable fields.
   const [ai, setAi] = useState(null);
@@ -154,6 +157,14 @@ function SettingsPanel({ open, onClose, language = "en" }) {
 
   useEffect(() => {
     if (open) inputRef.current?.focus();
+  }, [open]);
+
+  // Enter motion, keyed on `open`. Focus runs in its own effect above so a
+  // settings panel is typeable on the first frame — the animation is the last
+  // thing that may be unfinished, never the first thing that has to happen.
+  useLayoutEffect(() => {
+    if (!open) return undefined;
+    return enterOverlay(scrimRef.current, panelRef.current, { duration: 0.24 });
   }, [open]);
 
   // Clear a transient notice so it cannot linger and mislead.
@@ -334,6 +345,7 @@ function SettingsPanel({ open, onClose, language = "en" }) {
 
   return (
     <div
+      ref={scrimRef}
       className="fixed inset-0 z-50 flex items-center justify-center"
       style={{ padding: "var(--space-5)", background: "var(--scrim)", backdropFilter: "blur(6px)" }}
       role="dialog"
@@ -341,6 +353,7 @@ function SettingsPanel({ open, onClose, language = "en" }) {
       aria-label={ar ? "الإعدادات" : "Settings"}
     >
       <div
+        ref={panelRef}
         className="w-full max-w-lg max-h-[85vh] overflow-y-auto font-mono"
         style={{
           background: "var(--surface-2)",
@@ -700,17 +713,15 @@ function SettingsPanel({ open, onClose, language = "en" }) {
                 disabled={saving}
                 spellCheck={false}
                 placeholder="D:/Projects"
-                className="flex-1 min-w-0 outline-none transition-all"
-                style={{
-                  padding: "var(--space-2) var(--space-3)",
-                  fontSize: "var(--font-sm)",
-                  fontFamily: "var(--font-mono)",
-                  background: "color-mix(in srgb, var(--hud-cyan) 4%, transparent)",
-                  border: `var(--border-w) solid ${dirty ? "color-mix(in srgb, var(--hud-amber) 30%, transparent)" : "color-mix(in srgb, var(--hud-cyan) 12%, transparent)"}`,
-                  borderRadius: "var(--radius-sm)",
-                  color: "var(--text-primary)",
-                  caretColor: "var(--hud-cyan)",
-                }}
+                /* Everything except the unsaved-change signal comes from the
+                   shared class; the amber border is this field's own state
+                   and is the only thing left inline. */
+                className="flex-1 min-w-0 hud-input"
+                style={
+                  dirty
+                    ? { borderColor: "color-mix(in srgb, var(--hud-amber) 30%, transparent)" }
+                    : undefined
+                }
               />
               <button
                 onClick={save}
@@ -847,17 +858,10 @@ function Field({ id, label, value, onChange, hint, type = "text", placeholder, d
         disabled={disabled}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full outline-none transition-all"
-        style={{
-          padding: "var(--space-2) var(--space-3)",
-          fontSize: "var(--font-sm)",
-          fontFamily: "var(--font-mono)",
-          background: "color-mix(in srgb, var(--hud-cyan) 4%, transparent)",
-          border: "var(--border-w) solid color-mix(in srgb, var(--hud-cyan) 12%, transparent)",
-          borderRadius: "var(--radius-sm)",
-          color: "var(--text-primary)",
-          caretColor: "var(--hud-cyan)",
-        }}
+        /* One class instead of nine inline declarations re-stating it. The
+           inline version also filled the field with a *translucent* cyan wash,
+           so whatever sat behind it decided the contrast; --input-bg is opaque. */
+        className="w-full hud-input"
       />
       {hint && (
         <p

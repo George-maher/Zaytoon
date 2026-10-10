@@ -4,13 +4,16 @@ import * as api from "../../lib/api";
 /**
  * Source control for the open project.
  *
- * **It hides itself when there is no repository.** `404` from `/git/status`
- * means "not a repository here", which is not an error — it is the answer to
- * "should this panel exist". Showing a red failure on a folder that simply is
- * not under version control trains people to ignore red.
+ * **It hides itself when there is no repository, and only then.** `404` from
+ * `/git/status` means "not a repository here", which is not an error — it is
+ * the answer to "should this panel exist". Showing a red failure on a folder
+ * that simply is not under version control trains people to ignore red.
  *
- * The other statuses are handled distinctly, because they mean different things
- * to different people:
+ * The converse matters just as much and was the actual bug: the status load
+ * used to fold *every* failure into `404`, so the three cases below never
+ * reached the screen and the panel simply left, asserting that the folder was
+ * not a repository. They are handled distinctly now, because they mean
+ * different things to different people:
  *
  * - **403** — the path is outside the workspace. A containment decision. No
  *   retry offered; there is nothing the user can do from here.
@@ -54,8 +57,25 @@ function GitPanel({ path = ".", language = "en", onError }) {
   // an error banner — and both happen on the *same* state change.
   const [commitMessage, setCommitMessage] = useState("");
   const [error, setError] = useState("");
-  const [log, setLog] = useState([]);
+  /**
+   * The visible history: `{ commits, error, loading }`.
+   *
+   * Three states, three answers. A bare `[]` used to mean "no commits yet",
+   * "still loading" and "the request failed" at once — so a repository with a
+   * long history whose log request failed rendered as an empty list, which
+   * reads as a brand-new repository. The distinction costs one field and
+   * removes a claim the panel cannot back.
+   */
+  const [logView, setLogView] = useState({ commits: [], error: "", loading: true });
   const [branches, setBranches] = useState([]);
+  /**
+   * Why the status could not be read: `{ message, status }`, or `null`.
+   *
+   * Kept apart from `error` (which reports a *write* the user just asked for)
+   * because they need different responses — one gets a RETRY, the other gets
+   * git's own words on screen.
+   */
+  const [loadError, setLoadError] = useState(null);
   /** The entry whose discard is armed, or `""`. */
   const [armed, setArmed] = useState("");
   /** `{ path, text, empty, error, loading }` while the diff pane is open. */
@@ -67,11 +87,36 @@ function GitPanel({ path = ".", language = "en", onError }) {
   const [mergeTarget, setMergeTarget] = useState("");
 
   const refresh = useCallback(async () => {
-    const result = await api.getGitStatus(path);
-    if (result.error) {
-      // 404 is the "no repository" answer, not a failure to report.
-      setPresent(false);
+    setLoadError(null);
+    let result;
+    try {
+      result = await api.getGitStatus(path);
+    } catch (err) {
+      // A fetch that throws never returned a status code, so there is nothing
+      // to classify — report it plainly and leave the retry available rather
+      // than leaving the panel on "Reading…" forever.
+      setPresent(true);
       setStatus(null);
+      setLoadError({ message: String(err?.message || err), status: 0 });
+      return;
+    }
+    if (result.error) {
+      if (result.status === 404) {
+        // 404 *is* the "no repository" answer — a statement about the folder,
+        // not a failure.
+        setPresent(false);
+        setStatus(null);
+        return;
+      }
+      // Everything else is a different question with a different answer. The
+      // old code mapped all of them to `present = false`, so a 403
+      // containment refusal or a 409 from git itself hid the panel behind
+      // "This folder is not a git repository" — the confident falsehood the
+      // rest of this panel goes out of its way to avoid. Keep the panel, show
+      // the real reason, and refuse the retry only where a retry cannot help.
+      setPresent(true);
+      setStatus(null);
+      setLoadError({ message: result.error, status: result.status ?? 0 });
       return;
     }
     setPresent(true);
@@ -96,8 +141,16 @@ function GitPanel({ path = ".", language = "en", onError }) {
   useEffect(() => {
     if (!present) return;
     let live = true;
+    // A different path means the history on screen describes another
+    // repository — drop it rather than leave it up until the answer arrives.
+    setLogView({ commits: [], error: "", loading: true });
     api.getGitLog(path, 10).then((result) => {
-      if (live) setLog(result.commits || []);
+      if (!live) return;
+      setLogView({
+        commits: result.commits || [],
+        error: result.error || "",
+        loading: false,
+      });
     });
     if (live) loadBranches();
     return () => {
@@ -124,7 +177,13 @@ function GitPanel({ path = ".", language = "en", onError }) {
       // never do.
       if (result.status) setStatus(result.status);
       else await refresh();
-      api.getGitLog(path, 10).then((r) => setLog(r.commits || []));
+      api.getGitLog(path, 10).then((r) =>
+        setLogView({
+          commits: r.commits || [],
+          error: r.error || "",
+          loading: false,
+        }),
+      );
       loadBranches();
       return result;
     },
@@ -185,9 +244,45 @@ function GitPanel({ path = ".", language = "en", onError }) {
 
   if (!status) {
     return (
-      <p className="hud-micro" style={{ padding: "var(--space-3)", color: "var(--hud-text-mute)" }}>
-        {ar ? "جارٍ القراءة…" : "Reading…"}
-      </p>
+      <div
+        style={{
+          padding: "var(--space-3)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "var(--space-2)",
+          alignItems: "flex-start",
+        }}
+      >
+        <p
+          role={loadError ? "alert" : "status"}
+          className="hud-micro"
+          style={{
+            color: loadError ? "var(--hud-red)" : "var(--hud-text-mute)",
+          }}
+        >
+          {loadError ? loadError.message : ar ? "جارٍ القراءة…" : "Reading…"}
+        </p>
+        {/* 403 is a containment decision: re-asking for the same path cannot
+            change the boundary, so offering RETRY would only invite the user
+            to press a button that promises nothing. Every other failure can
+            pass — git may be busy, the backend may have been restarting — and
+            there was no way at all to try again before this. */}
+        {loadError && loadError.status !== 403 && (
+          <button
+            type="button"
+            className="hud-micro"
+            onClick={() => refresh()}
+            style={{
+              background: "transparent",
+              border: "var(--border-w) solid var(--hud-edge-faint)",
+              color: "var(--hud-cyan)",
+              padding: "0 var(--space-2)",
+            }}
+          >
+            {ar ? "أعد المحاولة" : "RETRY"}
+          </button>
+        )}
+      </div>
     );
   }
 
@@ -573,17 +668,11 @@ function GitPanel({ path = ".", language = "en", onError }) {
 
       <div className="flex-none flex items-center gap-2" style={{ padding: "var(--space-2)" }}>
         <input
-          className="hud-micro flex-1"
+          className="hud-input flex-1"
           value={commitMessage}
           onChange={(e) => setCommitMessage(e.target.value)}
           placeholder={ar ? "رسالة الالتزام" : "commit message"}
           aria-label={ar ? "رسالة الالتزام" : "Commit message"}
-          style={{
-            background: "var(--hud-surface, transparent)",
-            border: "var(--border-w) solid var(--hud-edge-faint)",
-            color: "var(--hud-text)",
-            padding: "var(--space-1) var(--space-2)",
-          }}
         />
         <button
           type="button"
@@ -605,13 +694,34 @@ function GitPanel({ path = ".", language = "en", onError }) {
       <ol
         className="flex-1 flex flex-col min-h-0 overflow-y-auto"
         style={{ padding: "var(--space-2)", listStyle: "none" }}
+        aria-label={ar ? "السجل" : "History"}
       >
-        {log.map((commit) => (
-          <li key={commit.sha} className="hud-micro" style={{ padding: "var(--space-1) 0" }}>
-            <span style={{ color: "var(--hud-text-mute)", direction: "ltr" }}>{commit.short}</span>{" "}
-            {commit.subject}
+        {/* Three states, three answers — see `logView`. Collapsing them into an
+            empty list made a failed request indistinguishable from an empty
+            repository, which is a claim the panel was in no position to make. */}
+        {logView.loading ? (
+          <li className="hud-micro" style={{ padding: "var(--space-1) 0", color: "var(--hud-text-mute)" }}>
+            {ar ? "جارٍ تحميل السجل…" : "Loading history…"}
           </li>
-        ))}
+        ) : logView.error ? (
+          <li
+            className="hud-micro"
+            style={{ padding: "var(--space-1) 0", color: "var(--hud-red)" }}
+          >
+            {logView.error}
+          </li>
+        ) : logView.commits.length === 0 ? (
+          <li className="hud-micro" style={{ padding: "var(--space-1) 0", color: "var(--hud-text-mute)" }}>
+            {ar ? "لا التزامات بعد في هذا الفرع" : "No commits yet on this branch"}
+          </li>
+        ) : (
+          logView.commits.map((commit) => (
+            <li key={commit.sha} className="hud-micro" style={{ padding: "var(--space-1) 0" }}>
+              <span style={{ color: "var(--hud-text-mute)", direction: "ltr" }}>{commit.short}</span>{" "}
+              {commit.subject}
+            </li>
+          ))
+        )}
       </ol>
     </section>
   );

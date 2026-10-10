@@ -17,6 +17,17 @@ import ConfirmationDialog from "./components/ConfirmationDialog";
 import ReminderPanel from "./components/ReminderPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import WorkspaceShell from "./components/workspace/WorkspaceShell";
+import HomeScreen from "./components/HomeScreen";
+import ComputerView from "./components/ComputerView";
+import TaskFlowView from "./components/TaskFlowView";
+import AIFloatingBar from "./components/AIFloatingBar";
+import CommandPalette from "./components/CommandPalette";
+import ViewTransition from "./components/ViewTransition";
+import Sidebar from "./components/Sidebar";
+import ChatView from "./components/ChatView";
+import SkillsView from "./components/SkillsView";
+import ModelsView from "./components/ModelsView";
+import { VIEWS, resolveScreen } from "./lib/viewState";
 
 /**
  * Zaytoon: a workspace with a conversation in it, not a chat with panels
@@ -64,6 +75,51 @@ function useWide() {
   return wide;
 }
 
+/** Below this, the header's four destinations stop fitting next to the logo. */
+const NARROW_QUERY = "(max-width: 767px)";
+
+/**
+ * Narrow enough that the header has to shed weight.
+ *
+ * The same mechanism as `useWide()`, deliberately: both are *structural*
+ * decisions — what is rendered and in what shape — and a media query read in
+ * JS is the one thing that can change markup on a resize without mounting two
+ * copies of the app and asking assistive technology to tell them apart.
+ *
+ * Presentation that needs no structural change (a panel stacking, a grid
+ * collapsing) belongs in CSS; this exists for the three places below where the
+ * DOM itself differs:
+ *
+ * 1. the tagline, which is the widest element in the header's left block —
+ *    "TACTICAL COMMAND INTERFACE" is ~200px, more than three times the logo
+ *    and the wordmark beside it — so it is what a phone actually runs out of;
+ * 2. the nav labels, which collapse to their glyphs with the label kept as
+ *    `sr-only` text rather than dropped: the button's accessible name is
+ *    identical at every width, so a screen-reader user on a phone and a
+ *    sighted user on a phone can reach the same four destinations;
+ * 3. the status word, which hands off to `StatusIndicator`'s own `compact`
+ *    mode — glyph visible, word announced — rather than inventing a second
+ *    way to do what that prop already does.
+ *
+ * Defaults to *not* narrow when `matchMedia` is unavailable, so an
+ * unrecognised host gets the complete header instead of a stripped one.
+ */
+function useNarrow() {
+  const [narrow, setNarrow] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(NARROW_QUERY).matches
+      : false,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return undefined;
+    const mq = window.matchMedia(NARROW_QUERY);
+    const onChange = (e) => setNarrow(e.matches);
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, []);
+  return narrow;
+}
+
 export default memo(function App() {
   const {
     messages, isConnected, everConnected, isTyping, status, language, setLanguage,
@@ -82,6 +138,17 @@ export default memo(function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const containerRef = useRef(null);
   const wide = useWide();
+  const narrow = useNarrow();
+
+  // View state. `setView` is deliberately private: every navigation goes
+  // through `navigate()`, which resolves the request against the vocabulary
+  // in lib/viewState, so an unknown or not-yet-built destination lands on
+  // Home rather than mounting a shell that has nothing to show.
+  const [view, setView] = useState(VIEWS.HOME);
+  const navigate = useCallback((next) => setView(resolveScreen(next)), []);
+  const screen = resolveScreen(view);
+  // Command palette (Ctrl+K)
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   // The reminder list lives in hook state and is populated only by a
   // `reminder_list` frame, so ask for one as soon as the socket is up.
@@ -127,6 +194,93 @@ export default memo(function App() {
   // drawer tab when not. Centre jumps have no persistent panel and so never
   // claim one; a left-rail id (files, …) matches no strip button.
   const dockPanel = wide ? shellInspectorTab : shellTab;
+
+  // -- Open Folder / Open File workflows -----------------------------------
+
+  const handleOpenFolder = useCallback(
+    async (path) => {
+      // Set as workspace root and open the project
+      const result = await workspace.openProject(path);
+      if (result?.error) {
+        workspace.report(result.error);
+        return;
+      }
+      navigate(VIEWS.WORKSPACE);
+    },
+    [workspace, navigate],
+  );
+
+  const handleOpenFile = useCallback(
+    async (path) => {
+      // Open the file in the editor
+      const result = await workspace.open(path);
+      if (result?.error) {
+        workspace.report(result.error);
+        return;
+      }
+      // Also try to detect the project context from the file's directory
+      const lastSlash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+      if (lastSlash > 0) {
+        const dir = path.substring(0, lastSlash);
+        await workspace.openProject(dir);
+      }
+      navigate(VIEWS.WORKSPACE);
+    },
+    [workspace, navigate],
+  );
+
+  const handleOpenProject = useCallback(
+    async (path) => {
+      await handleOpenFolder(path);
+    },
+    [handleOpenFolder],
+  );
+
+  // -- Command palette: pickers and the composer ---------------------------
+
+  /**
+   * Focus a field by id, on the frame *after* the palette closes.
+   *
+   * Doing it synchronously would focus a control behind a modal that is about
+   * to unmount, and the browser would hand focus to `<body>` instead.
+   */
+  const focusById = useCallback((id) => {
+    requestAnimationFrame(() => document.getElementById(id)?.focus());
+  }, []);
+
+  /**
+   * Palette → Open Folder / Open File.
+   *
+   * These must never be called with no path: `handleOpenFolder(undefined)`
+   * sends a request that cannot succeed and reports the resulting "path is
+   * required" back as though something had gone wrong. So the command either
+   * uses a native picker, or hands off to the one field built for typing a
+   * path — Home's input, which is the documented browser fallback. In an
+   * environment with neither, CommandPalette drops the command entirely
+   * rather than offering a row that does nothing.
+   */
+  const paletteOpenFolder = useCallback(async () => {
+    if (desktop.available) {
+      const path = await desktop.openFolderDialog();
+      if (path) await handleOpenFolder(path);
+      return;
+    }
+    navigate(VIEWS.HOME);
+    focusById("home-path");
+  }, [handleOpenFolder, navigate, focusById]);
+
+  const paletteOpenFile = useCallback(async () => {
+    if (desktop.available) {
+      const path = await desktop.openFileDialog();
+      if (path) await handleOpenFile(path);
+      return;
+    }
+    navigate(VIEWS.HOME);
+    focusById("home-path");
+  }, [handleOpenFile, navigate, focusById]);
+
+  /** Palette → Ask Zaytoon: put the caret in the composer, wherever it is. */
+  const paletteAsk = useCallback(() => focusById("zaytoon-composer"), [focusById]);
 
   const state = useMemo(
     () => resolveState({ isConnected, pendingConfirmation, awaitingCommand, isListening, isTyping, isSpeaking, status }),
@@ -210,6 +364,26 @@ export default memo(function App() {
     }
   }, [reminders]);
 
+  // Ctrl+K and Ctrl+Space both open the command palette — the two chords a
+  // command surface is expected to answer to, and the ones the product
+  // documents. Guarded on no text input having focus for Ctrl+Space, because
+  // that chord is insert-a-space in some editors and stealing it from an
+  // in-progress message would be a bug, not a shortcut.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "k" || e.key === " ") {
+        if (e.key === " " && e.target instanceof HTMLElement && e.target.closest("input, textarea, [contenteditable=true]")) {
+          return;
+        }
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const ar = language === "ar";
 
   /**
@@ -239,14 +413,27 @@ export default memo(function App() {
   return (
     <div
       ref={containerRef}
-      className="h-screen w-screen flex flex-col overflow-hidden hud-void"
+      className="h-screen w-screen flex overflow-hidden hud-void"
     >
       {/* Environment layers. Static, cheap, and behind everything. */}
       <div className="hud-grid" aria-hidden="true" />
       <div className="hud-traces" aria-hidden="true" />
+      {/* The reference frames its artwork with a ruler of short ticks; here
+          it marks the top of the deck, masked so it fades rather than ends. */}
+      <div className="hud-ticks" aria-hidden="true" />
       <div className="hud-scan" aria-hidden="true" />
 
+      {/* Sidebar — the product's only navigation. */}
+      <Sidebar
+        view={screen}
+        language={language}
+        onNavigate={navigate}
+        onOpenProject={handleOpenProject}
+        isConnected={isConnected}
+      />
+
       {/* ---------------------------------------------------------------- */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
       <header
         className="flex-none flex items-center justify-between"
         style={{
@@ -270,9 +457,11 @@ export default memo(function App() {
           </span>
           <div className="min-w-0">
             <h1 className="hud-identity">ZAYTOON</h1>
-            <p className="hud-micro truncate" style={{ fontSize: "var(--font-xs)" }}>
-              {ar ? "واجهة الأوامر" : "TACTICAL COMMAND INTERFACE"}
-            </p>
+            {!narrow && (
+              <p className="hud-micro truncate" style={{ fontSize: "var(--font-xs)" }}>
+                {ar ? "واجهة الأوامر" : "TACTICAL COMMAND INTERFACE"}
+              </p>
+            )}
           </div>
         </div>
 
@@ -284,17 +473,20 @@ export default memo(function App() {
             onDone={(id) => sendReminderCmd("done", id)}
             language={language}
           />
-          <StatusIndicator state={state} language={language} />
+          <StatusIndicator state={state} language={language} compact={narrow} />
         </div>
       </header>
 
       {/* ---------------------------------------------------------------- */}
+      <ViewTransition viewKey={screen} className="flex-1 flex flex-col min-h-0">
+      {screen === VIEWS.WORKSPACE ? (
       <WorkspaceShell
         workspace={workspace}
         socket={{ tasks, activeTask, cancelTask, terminalLines, watchTerminal, fileChanges }}
         extras={extras}
         language={language}
         wide={wide}
+        narrow={narrow}
         tab={shellTab}
         onTabChange={setShellTab}
         inspectorTab={shellInspectorTab}
@@ -399,6 +591,76 @@ export default memo(function App() {
           />
         </div>
       </WorkspaceShell>
+      ) : screen === VIEWS.CHAT ? (
+        <ChatView
+          language={language}
+          messages={messages}
+          isTyping={isTyping}
+          isConnected={isConnected}
+          statusText={statusText}
+          statusTone={statusTone}
+          subtitle={subtitle}
+          plan={plan}
+          activeTool={activeTool}
+          activity={activity}
+          onSend={sendMessage}
+          onVoiceStart={startVoiceMode}
+          onVoiceStop={stopVoiceMode}
+          voiceMode={voiceMode}
+          onStop={requestStop}
+          isSpeaking={isSpeaking}
+          pendingConfirmation={pendingConfirmation}
+        />
+      ) : screen === VIEWS.COMPUTER ? (
+        <ComputerView language={language} onOpenFile={handleOpenFile} />
+      ) : screen === VIEWS.TASKS ? (
+        <TaskFlowView
+          language={language}
+          plan={plan}
+          activeTool={activeTool}
+          activity={activity}
+          tasks={tasks}
+          activeTask={activeTask}
+          onCancel={cancelTask}
+        />
+      ) : screen === VIEWS.SKILLS ? (
+        <SkillsView language={language} />
+      ) : screen === VIEWS.MODELS ? (
+        <ModelsView language={language} />
+      ) : (
+        <HomeScreen
+          language={language}
+          isConnected={isConnected}
+          onOpenFolder={handleOpenFolder}
+          onOpenFile={handleOpenFile}
+          onOpenProject={handleOpenProject}
+          onSendCommand={sendMessage}
+          onOpenCommands={() => setPaletteOpen(true)}
+          onVoiceStart={startVoiceMode}
+          onVoiceStop={stopVoiceMode}
+          voiceMode={voiceMode}
+          isBusy={isTyping || isSpeaking}
+        />
+      )}
+      </ViewTransition>
+
+      {/* Every screen can be talked to, and the guarantee is structural: App
+          mounts this rather than each screen doing so, so a destination added
+          later gets a composer by default instead of by remembering. Home has
+          its prompt and the workspace has the console — there the strip would
+          be a second field for the same job, which is why it is absent. */}
+      {screen !== VIEWS.HOME && screen !== VIEWS.WORKSPACE && (
+        <AIFloatingBar
+          language={language}
+          isConnected={isConnected}
+          statusText={statusText}
+          statusTone={statusTone}
+          onSend={sendMessage}
+          onVoiceStart={startVoiceMode}
+          onVoiceStop={stopVoiceMode}
+          voiceMode={voiceMode}
+        />
+      )}
 
       {/* High-risk tool approval gate. Unchanged: the security boundary does
           not move for a redesign. */}
@@ -413,6 +675,34 @@ export default memo(function App() {
         onClose={() => setSettingsOpen(false)}
         language={language}
       />
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        language={language}
+        onOpenFolder={paletteOpenFolder}
+        onOpenFile={paletteOpenFile}
+        onSearch={() => {
+          navigate(VIEWS.WORKSPACE);
+          setShellTab("files");
+        }}
+        onOpenTerminal={() => {
+          navigate(VIEWS.WORKSPACE);
+          setShellInspectorTab("terminal");
+        }}
+        onToggleExplorer={() => {
+          navigate(VIEWS.WORKSPACE);
+          setShellTab((t) => (t === "files" ? "projects" : "files"));
+        }}
+        onAsk={paletteAsk}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onNewTask={() => {
+          navigate(VIEWS.WORKSPACE);
+          setShellInspectorTab("tasks");
+        }}
+        onNavigate={navigate}
+      />
+      </div>
     </div>
   );
 });

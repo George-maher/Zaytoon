@@ -265,10 +265,10 @@ function ProjectsPanel({
         </label>
         <input
           id="project-path"
+          className="hud-input w-full"
           value={path}
           onChange={(e) => setPath(e.target.value)}
           placeholder={root || "."}
-          className="w-full"
           style={{ marginTop: "var(--space-2)" }}
         />
         <p className="hud-micro" style={{ marginTop: "var(--space-2)", color: "var(--hud-text-mute)" }}>
@@ -361,6 +361,7 @@ function ProjectsPanel({
               </label>
               <input
                 id={`cmd-${field}`}
+                className="hud-input w-full"
                 value={editing[field]}
                 onChange={(e) => setEditing({ ...editing, [field]: e.target.value })}
               />

@@ -1,4 +1,4 @@
-import { memo, useRef, useCallback, useEffect } from "react";
+import { memo, useRef, useCallback, useEffect, useState } from "react";
 
 /**
  * Command input.
@@ -11,6 +11,11 @@ import { memo, useRef, useCallback, useEffect } from "react";
  *
  * The microphone lives here and nowhere else in the product; see
  * components/hud/CommandConsole.jsx for why.
+ *
+ * When `multiline` is true the field becomes a `<textarea>` that grows with
+ * its content (up to a cap), so a long command or a multi-line prompt is
+ * writable without a horizontal scroll. Enter still sends; Shift+Enter still
+ * inserts a newline.
  */
 export default memo(function InputBar({
   onSend,
@@ -19,10 +24,13 @@ export default memo(function InputBar({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
+  onStop: _onStop,
+  multiline = false,
 }) {
   const inputRef = useRef(null);
   const formRef = useRef(null);
   const canRecord = !!onVoiceStart || !!onVoiceStop;
+  const [_composing, setComposing] = useState(false);
 
   const handleSubmit = useCallback(
     (e) => {
@@ -31,10 +39,14 @@ export default memo(function InputBar({
       if (text) {
         onSend(text);
         inputRef.current.value = "";
+        // Reset the textarea height after clearing.
+        if (multiline && inputRef.current) {
+          inputRef.current.style.height = "auto";
+        }
         inputRef.current.focus();
       }
     },
-    [onSend],
+    [onSend, multiline],
   );
 
   const handleKeyDown = useCallback(
@@ -46,6 +58,14 @@ export default memo(function InputBar({
     },
     [handleSubmit],
   );
+
+  // Auto-grow the textarea with its content, up to a cap.
+  const autoGrow = useCallback(() => {
+    const el = inputRef.current;
+    if (!el || !multiline) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [multiline]);
 
   // Keep focus on the composer so a reply can be followed by typing.
   // Guarded on `document.activeElement === document.body` so focus is never stolen
@@ -59,8 +79,37 @@ export default memo(function InputBar({
   const setFocused = (on) => {
     const form = formRef.current;
     if (!form) return;
-    form.style.borderColor = on ? "var(--hud-edge-strong)" : "var(--hud-edge)";
+    form.style.borderColor = on ? "var(--input-border-focus)" : "var(--hud-edge)";
     form.style.boxShadow = on ? "0 0 12px color-mix(in srgb, var(--hud-cyan) 8%, transparent)" : "inset 0 1px 0 color-mix(in srgb, var(--hud-cyan) 4%, transparent)";
+  };
+
+  const sharedProps = {
+    ref: inputRef,
+    id: "zaytoon-composer",
+    maxLength: 8000,
+    "aria-label": language === "ar" ? "رسالتك" : "Your message",
+    placeholder: language === "ar" ? "اكتب أمراً…" : "ENTER COMMAND…",
+    className: "w-full",
+    style: {
+      padding: "var(--space-3) var(--space-4)",
+      background: "transparent",
+      border: "none",
+      color: "var(--hud-cyan)",
+      caretColor: "var(--hud-cyan)",
+      fontFamily: "var(--font-mono)",
+      fontSize: "var(--font-lg)",
+      letterSpacing: "0.02em",
+      ...(multiline
+        ? { resize: "none", overflowY: "auto", minHeight: "44px", lineHeight: 1.5 }
+        : {}),
+    },
+    dir: language === "ar" ? "rtl" : "ltr",
+    onKeyDown: handleKeyDown,
+    onFocus: () => setFocused(true),
+    onBlur: () => setFocused(false),
+    onInput: multiline ? autoGrow : undefined,
+    onCompositionStart: () => setComposing(true),
+    onCompositionEnd: () => setComposing(false),
   };
 
   return (
@@ -76,28 +125,11 @@ export default memo(function InputBar({
       }}
     >
       <div className="flex-1 relative min-w-0 flex items-center">
-        <input
-          ref={inputRef}
-          type="text"
-          maxLength={8000}
-          aria-label={language === "ar" ? "رسالتك" : "Your message"}
-          placeholder={language === "ar" ? "اكتب أمراً…" : "ENTER COMMAND…"}
-          className="w-full outline-none"
-          style={{
-            padding: "var(--space-3) var(--space-4)",
-            background: "transparent",
-            border: "none",
-            color: "var(--hud-text)",
-            caretColor: "var(--hud-cyan)",
-            fontFamily: "var(--font-mono)",
-            fontSize: "var(--font-lg)",
-            letterSpacing: "0.02em",
-          }}
-          dir={language === "ar" ? "rtl" : "ltr"}
-          onKeyDown={handleKeyDown}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-        />
+        {multiline ? (
+          <textarea {...sharedProps} rows={1} />
+        ) : (
+          <input {...sharedProps} type="text" />
+        )}
         {canRecord && (
           <button
             type="button"

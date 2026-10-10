@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import { gsap } from 'gsap'
 import ConfirmationDialog from './ConfirmationDialog'
 
 const request = {
@@ -15,6 +16,10 @@ const request = {
 }
 
 describe('ConfirmationDialog', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('renders nothing without a request', () => {
     const { container } = render(
       <ConfirmationDialog request={null} onRespond={vi.fn()} />,
@@ -165,5 +170,33 @@ describe('ConfirmationDialog', () => {
       />,
     )
     expect(document.querySelector('pre')).toHaveAttribute('dir', 'ltr')
+  })
+
+  it('is on screen before any animation has run, and enters on transforms only', () => {
+    const fromTo = vi.spyOn(gsap, 'fromTo').mockReturnValue({ kill: () => {} })
+
+    render(<ConfirmationDialog request={request} onRespond={vi.fn()} />)
+
+    // Synchronously present. A prompt that waited for a tween to finish would
+    // be a prompt whose Enter and Escape the user could press into nothing —
+    // and this one binds both to `window` on the same commit.
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
+    expect(document.querySelector('pre').textContent).toContain('command: npm install')
+
+    expect(fromTo).toHaveBeenCalledTimes(2)
+    const [scrim, panel] = fromTo.mock.calls
+
+    // The scrim covers the viewport, so it fades and nothing else: a translate
+    // would open a gap at the edge and flash what is behind the overlay.
+    expect(scrim[1]).toMatchObject({ y: 0, scale: 1 })
+
+    // Only transform and opacity in both keyframe objects. Nothing here can
+    // move the exact command out from under the person approving it.
+    for (const [, from, to] of [scrim, panel]) {
+      const serialised = JSON.stringify([from, to])
+      for (const prop of ['width', 'height', 'top', 'left', 'margin', 'padding']) {
+        expect(serialised).not.toContain(`"${prop}"`)
+      }
+    }
   })
 })

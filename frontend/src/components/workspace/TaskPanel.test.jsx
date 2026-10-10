@@ -13,7 +13,7 @@
  *   pretending the list payload carries it.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within, act } from "@testing-library/react";
 import TaskPanel from "./TaskPanel";
 import * as api from "../../lib/api";
 
@@ -123,5 +123,77 @@ describe("TaskPanel", () => {
 
     expect(await screen.findByText("المهام")).toBeInTheDocument();
     expect(screen.getByText("لا مهام بعد")).toBeInTheDocument();
+  });
+
+  // -- the merge: socket for what is running, store for what happened -------
+
+  it("shows persisted tasks the socket was never there to see", async () => {
+    // The socket only knows about this session. Before the fetch result was
+    // actually kept, a second day's open panel said "No tasks yet" above a
+    // database full of them — the panel's only job, unperformed.
+    mockApi({
+      getTasks: async () => ({
+        tasks: [
+          { id: 1, title: "Yesterday's build", status: "completed", is_terminal: true, duration_ms: 42 },
+        ],
+        count: 1,
+        active: 0,
+      }),
+    });
+    render(<TaskPanel tasks={[]} language="en" />);
+
+    expect(await screen.findByText("Yesterday's build")).toBeInTheDocument();
+    expect(screen.queryByText(/no tasks yet/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps a task to one row, with the socket's copy winning", async () => {
+    // The same task arrives from both sources: the store's snapshot was taken
+    // before it started, the socket's while it ran. Two rows would read as two
+    // tasks, and the stale one would say "queued" about work that is running.
+    mockApi({
+      getTasks: async () => ({
+        tasks: [
+          { id: 8, title: "Run the tests", status: "queued", is_terminal: false },
+          { id: 1, title: "Old task", status: "completed", is_terminal: true },
+        ],
+        count: 2,
+        active: 0,
+      }),
+    });
+    render(<TaskPanel tasks={[RUNNING]} language="en" />);
+
+    expect(await screen.findByText("Run the tests")).toBeInTheDocument();
+    expect(screen.getAllByText("Run the tests")).toHaveLength(1);
+    expect(screen.getByText(/Running ·/)).toBeInTheDocument();
+    expect(screen.getByText("Old task")).toBeInTheDocument();
+  });
+
+  it("says it is loading rather than claiming there are no tasks", async () => {
+    let resolveFetch;
+    mockApi({
+      getTasks: () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    });
+    render(<TaskPanel tasks={[]} language="en" />);
+
+    expect(screen.getByText("Loading tasks…")).toBeInTheDocument();
+    expect(screen.queryByText(/no tasks yet/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveFetch({ tasks: [], count: 0, active: 0 });
+    });
+    expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+  });
+
+  it("does not claim an empty store when the load itself failed", async () => {
+    // The alert and the empty state would contradict each other, and only one
+    // of them is backed by the response.
+    mockApi({ getTasks: async () => ({ tasks: [], error: "permission denied" }) });
+    render(<TaskPanel tasks={[]} language="en" />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
+    expect(screen.queryByText(/no tasks yet/i)).not.toBeInTheDocument();
   });
 });

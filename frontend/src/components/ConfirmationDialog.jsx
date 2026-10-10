@@ -1,5 +1,6 @@
-import { memo, useEffect, useMemo } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { riskTone, riskColor, riskPillClass } from "../lib/risk";
+import { enterOverlay } from "../lib/motion";
 
 /**
  * ConfirmationDialog - Human-in-the-loop approval prompt.
@@ -31,6 +32,18 @@ function serialiseParam(value) {
 
 function ConfirmationDialog({ request, onRespond, language = "en" }) {
   const isArabic = language === "ar";
+  const scrimRef = useRef(null);
+  const panelRef = useRef(null);
+
+  // Enter motion. It is deliberately the *shortest* of the three overlays and
+  // sits in its own effect: a safety prompt that takes a beat to arrive is a
+  // safety prompt the user starts reading too early, and Enter/Escape are
+  // bound to `window` below — they answer on the first frame, animation or
+  // no animation.
+  useLayoutEffect(() => {
+    if (!request) return undefined;
+    return enterOverlay(scrimRef.current, panelRef.current, { duration: 0.16, y: 6 });
+  }, [request]);
 
   // Enter allows, Escape cancels. Keeps the hotkey workflow fast.
   useEffect(() => {
@@ -90,6 +103,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
 
   return (
     <div
+      ref={scrimRef}
       className="fixed inset-0 z-50 flex items-center justify-center"
       style={{
         padding: "var(--sp-4)",
@@ -101,6 +115,7 @@ function ConfirmationDialog({ request, onRespond, language = "en" }) {
       aria-label={title}
     >
       <div
+        ref={panelRef}
         className="w-full max-w-lg font-mono"
         style={{
           background: "var(--surface-2)",

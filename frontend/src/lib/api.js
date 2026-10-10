@@ -339,7 +339,16 @@ export async function deleteEntry(path, { recursive = false } = {}) {
 export async function getGitStatus(path = ".") {
   const res = await fetch(`${API_BASE}/git/status?path=${encodeURIComponent(path)}`);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
+  if (!res.ok) {
+    // `status` rides along on the failure and on nothing else: the panel
+    // cannot tell "there is no repository here" (404) from a containment
+    // refusal (403) or git's own answer (409) without it, and treating them
+    // alike means one of them gets rendered as a confident falsehood.
+    return {
+      error: data.detail || data.error || `HTTP ${res.status}`,
+      status: res.status,
+    };
+  }
   return data;
 }
 
@@ -765,6 +774,50 @@ export async function textToSpeech(text, lang = "en") {
   return res.blob();
 }
 
+/**
+ * The applications this build may launch, as display metadata.
+ *
+ * `GET /computer/apps` → `{ apps, categories, total, resolved, ... }`. The
+ * backend owns the list because it *is* the allow-list
+ * `POST /command/open-app` enforces; a copy kept here would drift the first
+ * time someone edited one of them, and a grid that offers a name the launcher
+ * refuses is a row of buttons that fail.
+ *
+ * `{ resolve: true }` additionally asks for `installed` / `via` per app —
+ * whether this machine has **positive evidence** of it. Two properties worth
+ * keeping, because both fail silently:
+ *
+ * - the flag is explicit rather than defaulted, so the filesystem walk behind
+ *   it is a cost someone has to ask for at every call site;
+ * - the backend tags its answer `resolved: true` only when it actually
+ *   computed one. `resolved: false` after a `resolve: true` request is "I did
+ *   not find out" (`resolveError` says why), never a quiet fallback to
+ *   silence — so this never has to guess whether the verdicts are present.
+ *
+ * `installed: false` is *not* a claim that an application is missing; see
+ * `resolve_app_detail`. A portable copy with no Start Menu entry stays
+ * invisible, and the UI says so rather than calling it absent.
+ *
+ * A 404 means the backend predates the route: report it rather than throw, so
+ * the Computer view can say so plainly instead of showing an empty grid.
+ */
+export async function getComputerApps({ resolve: resolveAvailability = false } = {}) {
+  const suffix = resolveAvailability ? "?resolve=true" : "";
+  const res = await fetch(`${API_BASE}/computer/apps${suffix}`);
+  if (res.status === 404) return { unavailable: true, apps: [], categories: [] };
+  if (!res.ok) throw new Error(`Apps fetch failed: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  return {
+    unavailable: false,
+    apps: Array.isArray(data.apps) ? data.apps : [],
+    categories: Array.isArray(data.categories) ? data.categories : [],
+    total: typeof data.total === "number" ? data.total : 0,
+    resolved: data.resolved === true,
+    found: typeof data.found === "number" ? data.found : 0,
+    resolveError: typeof data.resolve_error === "string" ? data.resolve_error : null,
+  };
+}
+
 export async function openApp(appName) {
   const res = await fetch(`${API_BASE}/command/open-app`, {
     method: "POST",
@@ -969,4 +1022,40 @@ export async function stopProcess(id) {
   if (!res.ok) throw new Error(`Process stop failed: ${res.status}`);
   const data = await res.json().catch(() => ({}));
   return { unavailable: false, stopped: Boolean(data.stopped) };
+}
+
+/**
+ * The last lines a tracked process printed.
+ *
+ * `GET /processes/{id}/logs?tail=N` → `{ id, status, lines }`. This is the
+ * one computer action with no UI at all until now: the endpoint existed, the
+ * processes were captured, and there was no way to read either — so "start a
+ * dev server and watch it" ended at "the process is running".
+ *
+ * Only processes Zaytoon started can be queried (same ownership rule as
+ * `stop`), and a 404 therefore means "unknown id" as often as "no such
+ * route": both are reported rather than thrown, because a missing tail of
+ * output must not break the panel showing the process itself.
+ */
+export async function getProcessLogs(id, tail = 40) {
+  const n = Number.isFinite(Number(tail)) && Number(tail) > 0 ? Number(tail) : 40;
+  const res = await fetch(
+    `${API_BASE}/processes/${encodeURIComponent(id)}/logs?tail=${Math.min(n, 500)}`,
+  );
+  if (res.status === 404) return { unavailable: true, lines: [] };
+  if (!res.ok) throw new Error(`Process logs failed: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  // The route answers `200 {"error": ...}` for an id it does not know — a
+  // refusal, not a successful read of an empty log. Reading `lines` alone
+  // would render "No output captured", which claims a quiet process rather
+  // than an unknown one.
+  if (typeof data.error === "string" && data.error) {
+    return { unavailable: true, lines: [], error: data.error };
+  }
+  return {
+    unavailable: false,
+    id: data.id ?? id,
+    status: typeof data.status === "string" ? data.status : "",
+    lines: Array.isArray(data.lines) ? data.lines : [],
+  };
 }

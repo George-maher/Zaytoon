@@ -129,6 +129,18 @@ function AICore({ state = "idle", size = 300, language = "en", speakingVoice = n
   // fills faster. It is an activity indicator, not a progress bar, and it is
   // labelled as such.
   const active = state === "idle" || state === "offline" ? 0 : Math.round(SEGMENTS * 0.4);
+  // One animated element per screen. `AICore` and `AIPresence` are the same
+  // idea at two scales, so only one of them may be moving at a time — and
+  // since the core is the larger, more prominent of the two it is the one
+  // that keeps the motion. When the turn is over it drops to a single slow
+  // ring: a permanently spinning dial spends the product's only animation
+  // budget on a state that is not happening.
+  const working = active > 0;
+  const reduced =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const spin = working && !reduced;
 
   return (
     <div
@@ -137,28 +149,40 @@ function AICore({ state = "idle", size = 300, language = "en", speakingVoice = n
       role="img"
       aria-label={`AI core: ${language === "ar" ? s.ar : s.en}`}
     >
-      {/* Ambient bloom. One element, the only resting glow in the layout. */}
-      <div
-        className="absolute rounded-full"
-        style={{
-          width: size * 0.62,
-          height: size * 0.62,
-          background: "radial-gradient(circle, var(--state-glow), transparent 68%)",
-          filter: "blur(18px)",
-        }}
-        aria-hidden="true"
-      />
+      {/* Bloom. Present only while working — the brief reserves glow for active
+          and streaming states, and a resting bloom is ambient decoration. */}
+      {spin && (
+        <div
+          className="absolute rounded-full"
+          style={{
+            width: size * 0.62,
+            height: size * 0.62,
+            background: "radial-gradient(circle, var(--state-glow), transparent 68%)",
+            filter: "blur(18px)",
+          }}
+          aria-hidden="true"
+        />
+      )}
 
-      <div className="hud-core-spin-slow absolute inset-0" style={{ "--ring-dur": `${s.rate * 3}s` }}>
+      <div
+        className={spin ? "hud-core-spin-slow absolute inset-0" : "absolute inset-0"}
+        style={spin ? { "--ring-dur": `${s.rate * 3}s` } : undefined}
+      >
         <SegmentedRing size={size} active={active} />
       </div>
 
-      <div className="absolute inset-0 flex items-center justify-center">
-        <Ring size={size} stroke={1} opacity={0.5} duration={s.rate * 2} />
+      {/* The two inner counter-rotating rings exist only while working. Kept
+          mounted but frozen when idle would still paint three concentric
+          moving lines — the exact "everything glows, nothing is focal"
+          failure the brief rules out. */}
+      {spin && (
         <div className="absolute inset-0 flex items-center justify-center">
-          <Ring size={size - 26} stroke={1} opacity={0.34} duration={s.rate * 2.6} reverse />
+          <Ring size={size} stroke={1} opacity={0.5} duration={s.rate * 2} />
+          <div className="absolute inset-0 flex items-center justify-center">
+            <Ring size={size - 26} stroke={1} opacity={0.34} duration={s.rate * 2.6} reverse />
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Identity disc. Flat fill plus a lit edge — no blur. */}
       <div
@@ -191,20 +215,22 @@ function AICore({ state = "idle", size = 300, language = "en", speakingVoice = n
         </span>
       </div>
 
-      {/* Hairline sweep. Transform-only. */}
-      <div
-        className="absolute rounded-full hud-core-spin-rev"
-        style={{
-          width: size - 12,
-          height: size - 12,
-          border: "1px solid transparent",
-          borderTopColor: "var(--state-color)",
-          borderRightColor: "var(--state-color)",
-          opacity: 0.45,
-          "--ring-dur": `${s.rate}s`,
-        }}
-        aria-hidden="true"
-      />
+      {/* Hairline sweep. Transform-only, and only while working. */}
+      {spin && (
+        <div
+          className="absolute rounded-full hud-core-spin-rev"
+          style={{
+            width: size - 12,
+            height: size - 12,
+            border: "1px solid transparent",
+            borderTopColor: "var(--state-color)",
+            borderRightColor: "var(--state-color)",
+            opacity: 0.45,
+            "--ring-dur": `${s.rate}s`,
+          }}
+          aria-hidden="true"
+        />
+      )}
 
       {showWave && (
         <div className="absolute" style={{ bottom: size * 0.08 }}>

@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop
 from tools.sandbox import (
@@ -77,8 +77,8 @@ _DETECT_EXT = re.compile(r"\.\w+$")
 _IS_WINDOWS = os.name == "nt"
 
 
-def _find_start_menu_shortcut(app: str) -> Optional[str]:
-    app_lower = app.strip().lower()
+def _start_menu_roots() -> List[str]:
+    """The Start Menu roots that exist on this machine, in priority order."""
     search_dirs = [
         os.path.join(
             os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"
@@ -88,57 +88,156 @@ def _find_start_menu_shortcut(app: str) -> Optional[str]:
             "Microsoft", "Windows", "Start Menu", "Programs",
         ),
     ]
-    for base in search_dirs:
-        if not base or not os.path.isdir(base):
-            continue
+    return [d for d in search_dirs if d and os.path.isdir(d)]
+
+
+def build_shortcut_index() -> List[Tuple[str, str]]:
+    """One walk of the Start Menu: ``(shortcut stem, path)``, in walk order.
+
+    The shortcut lookup used to walk both roots on *every call*, so probing
+    twenty applications for availability would have cost twenty walks of the
+    same tree — enough to block the event loop for the length of a filesystem
+    scan. A batch caller builds this once and passes it down.
+
+    The order is exactly the order the per-call walk produced (per root, then
+    ``os.walk``'s order within it), so the first match here is the match that
+    would have been returned before. Scanning a whole tree to find a match
+    that may sit in the first directory costs a little more than an early exit
+    on a single lookup; that is a bounded, one-off cost on a path that already
+    launches a process.
+    """
+    index: List[Tuple[str, str]] = []
+    for base in _start_menu_roots():
         for root, _, files in os.walk(base):
             for name in files:
                 if not name.lower().endswith(".lnk"):
                     continue
                 stem = os.path.splitext(name)[0].lower()
-                if stem == app_lower or app_lower in stem:
-                    return os.path.join(root, name)
+                index.append((stem, os.path.join(root, name)))
+    return index
+
+
+def _find_start_menu_shortcut(
+    app: str, *, index: Optional[Sequence[Tuple[str, str]]] = None
+) -> Optional[str]:
+    """First Start Menu shortcut whose stem matches, or ``None``.
+
+    ``index`` lets a caller that resolves many names share one walk; leaving it
+    out builds the index here, so a single lookup still works and there is only
+    one implementation of what "matches" means.
+    """
+    app_lower = app.strip().lower()
+    if index is None:
+        index = build_shortcut_index()
+    for stem, path in index:
+        if stem == app_lower or app_lower in stem:
+            return path
     return None
+
+
+def _locate(
+    name: str, *, shortcut_index: Optional[Sequence[Tuple[str, str]]] = None
+) -> Optional[Tuple[str, str]]:
+    """Positive evidence that ``name`` is present: ``(target, from_where)``.
+
+    One implementation of "have I actually seen this application?", shared by
+    every branch of the resolver so two of them cannot disagree about what
+    counts as a hit. It looks for a real artifact — an executable on ``PATH``
+    or a Start Menu shortcut — and never treats a *table* of how to launch
+    something as proof that it exists.
+    """
+    alias = APP_PATHS.get(name, [name])[0]
+    on_path = shutil.which(alias) or shutil.which(alias + ".exe")
+    if on_path:
+        return on_path, "path"
+    lnk = _find_start_menu_shortcut(name, index=shortcut_index)
+    if lnk:
+        return lnk, "shortcut"
+    return None
+
+
+def resolve_app_detail(
+    app: str, *, shortcut_index: Optional[Sequence[Tuple[str, str]]] = None
+) -> Dict[str, Any]:
+    """Resolve an application name to a launch target, and say whether the
+    application is actually *present*.
+
+    The distinction is the whole point. The old resolver returned a bare alias
+    (``"winword"``) when it had looked everywhere and found nothing, and a real
+    target when it had found one — both truthy, so a caller could not tell
+    "installed" from "will be attempted and may well fail". The Computer view
+    needs that answer before it puts an application forward as available, and a
+    panel that guesses is worse than one that says nothing.
+
+    Returns a dict with:
+
+    - ``target`` — what a launcher should be handed, or ``None`` if the name
+      was rejected outright. It may be a bare alias *without* the application
+      being found; that is a deliberate best-effort, because ``OpenApp`` still
+      tries it and its failure at exec time is more informative than a silent
+      no-op.
+    - ``found`` — **positive evidence** that the application is on this
+      machine: an executable on ``PATH``, an existing path, or a Start Menu
+      shortcut. ``False`` means "I found nothing", never "not installed": an
+      install this machine does not advertise (a portable copy, a custom
+      location, a portable app with no Start Menu entry) stays invisible, and
+      the UI says so rather than calling it absent.
+    - ``via`` — where ``target`` came from, so a caller can explain itself.
+
+    ``resolve_windows_app`` is this function with the verdict stripped off;
+    there is one decision tree, not two.
+    """
+    try:
+        name = sanitize_app_name(app).lower()
+    except SecurityError:
+        logger.warning("Blocked app resolution for unsafe name: %r", app)
+        return {"target": None, "found": False, "via": "rejected"}
+
+    if name in WINDOWS_APP_LAUNCH:
+        # The builtin table says *how* to launch, never *that* anything is
+        # installed — `spotify:` is a URI scheme that resolves only when
+        # Spotify is present. So the target stays the builtin form (it is what
+        # `OpenApp` wants) while `found` is earned from real evidence, checked
+        # exactly as it would be for any other name.
+        return {
+            "target": WINDOWS_APP_LAUNCH[name][0],
+            "found": _locate(name, shortcut_index=shortcut_index) is not None,
+            "via": "builtin",
+        }
+
+    if name in APP_PATHS:
+        hit = _locate(name, shortcut_index=shortcut_index)
+        if hit:
+            return {"target": hit[0], "found": True, "via": hit[1]}
+        # Best effort: `OpenApp` attempts the alias and reports honestly.
+        return {"target": APP_PATHS[name][0], "found": False, "via": "alias"}
+
+    if _DETECT_EXT.search(name) or os.path.sep in name:
+        # A caller-supplied path is honoured only when it exists and is not a
+        # script type.
+        try:
+            validate_app_target(name)
+        except SecurityError:
+            return {"target": None, "found": False, "via": "rejected"}
+        if os.path.exists(name):
+            return {"target": name, "found": True, "via": "path"}
+        return {"target": None, "found": False, "via": "missing"}
+
+    hit = _locate(name, shortcut_index=shortcut_index)
+    if hit:
+        return {"target": hit[0], "found": True, "via": hit[1]}
+    return {"target": None, "found": False, "via": "none"}
 
 
 def resolve_windows_app(app: str) -> Optional[str]:
     """Resolve an application name to a launch target, or ``None``.
 
-    Kept at module level (and re-exported from ``tools.executor``) because the
-    security-sandbox suite tests it directly.
+    A thin view over :func:`resolve_app_detail` — kept at module level (and
+    re-exported from ``tools.executor``) because the security-sandbox suite
+    tests it directly, and every one of its return values must stay exactly
+    what they were before the verdict existed.
     """
-    try:
-        app = sanitize_app_name(app).lower()
-    except SecurityError:
-        logger.warning("Blocked app resolution for unsafe name: %r", app)
-        return None
-
-    if app in WINDOWS_APP_LAUNCH:
-        return WINDOWS_APP_LAUNCH[app][0]
-
-    if app in APP_PATHS:
-        alias = APP_PATHS[app][0]
-        found = shutil.which(alias) or shutil.which(alias + ".exe")
-        if found:
-            return found
-        lnk = _find_start_menu_shortcut(app)
-        if lnk:
-            return lnk
-        return alias
-
-    if _DETECT_EXT.search(app) or os.path.sep in app:
-        # A caller-supplied path is honoured only when it exists and is not a
-        # script type.
-        try:
-            validate_app_target(app)
-        except SecurityError:
-            return None
-        return app if os.path.exists(app) else None
-
-    found = shutil.which(app) or shutil.which(app + ".exe")
-    if found:
-        return found
-    return _find_start_menu_shortcut(app)
+    return resolve_app_detail(app)["target"]
 
 
 def _normalise(params: Dict[str, Any]) -> str:

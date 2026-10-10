@@ -24,19 +24,23 @@ from app import theme  # noqa: E402
 
 #: Every colour token the redesign specifies, with its required value.
 REQUIRED_COLORS = {
-    "BG0": "#05080d",
-    "BG1": "#0a1119",
-    "BG2": "#0e1926",
-    "HAIRLINE": "#1b2a3a",
-    "BORDER_STRONG": "#24405a",
-    "TEXT_BASE": "#d7e3f4",
-    "TEXT_MUTE": "#7f93ad",
-    "TEXT_FAINT": "#4c5f78",
-    "CYAN": "#00e5ff",
-    "GREEN": "#00ff9c",
-    "AMBER": "#ffb020",
-    "RED": "#ff3b5c",
-    "VIOLET": "#7c5cff",
+    "BG0": "#05070a",
+    "BG1": "#080b11",
+    "BG2": "#0d1219",
+    "HAIRLINE": "#182230",
+    "BORDER_STRONG": "#24344a",
+    "TEXT_BASE": "#e8f6ff",
+    "TEXT_MUTE": "#6d8296",
+    "TEXT_FAINT": "#55697d",
+    # The accent is the reference's own cyan: 96% of the source image's
+    # saturated pixels sit in the blue/cyan family, measured brightest
+    # #8bffff. Kept in step with frontend/src/styles/theme.css, which
+    # test_design_parity pins token-for-token against this module.
+    "CYAN": "#22d3ee",
+    "GREEN": "#35d399",
+    "AMBER": "#f2b84b",
+    "RED": "#ff6b6b",
+    "VIOLET": "#8bffff",
 }
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")

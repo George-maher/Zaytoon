@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional
 from tools.applications import (  # noqa: F401 - re-exported for the test suite
     APP_PATHS,
     WINDOWS_APP_LAUNCH,
+    build_shortcut_index,
+    resolve_app_detail,
     resolve_windows_app,
 )
 from tools.base import OSToolkit  # noqa: F401 - re-exported
@@ -175,7 +177,9 @@ __all__ = [
     "RiskAssessor",
     "RiskLevel",
     "build_default_registry",
+    "build_shortcut_index",
     "is_safe_path",
+    "resolve_app_detail",
     "resolve_workspace",
     "resolve_windows_app",
     "sanitize_app_name",
