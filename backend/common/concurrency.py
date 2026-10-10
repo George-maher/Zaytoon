@@ -16,8 +16,16 @@ class ReentrantAsyncLock:
     A plain lock is correct until one guarded helper calls another guarded
     helper — then it self-deadlocks, and because ``asyncio`` has no timeout on
     ``acquire()`` the whole turn hangs with no error to point at the cause.
-    That is exactly the shape of ``MemoryAgent.get_due_reminders``, which marks
-    a reminder complete and re-schedules it by calling two other writers.
+
+    The case that motivated it is gone: ``MemoryAgent.get_due_reminders`` used to
+    mark a reminder complete and re-schedule it from inside the read, calling two
+    other guarded writers while holding the lock. Reads no longer mutate (see
+    ``tests/test_reminder_lifecycle.py``), so nothing in the store nests today —
+    and that is worth knowing, because a re-entrant lock also permits a nesting
+    that is really a bug. This class stays because the storage layer is written
+    by many hands: a future helper that calls another one must not hang the
+    process, and refusing the pattern is the job of review and the tests, not of
+    the primitive.
 
     Re-entrancy is per **task**, not per object: a second task still blocks,
     which is the property the lock exists for. Ownership is recorded on

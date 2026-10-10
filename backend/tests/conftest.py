@@ -61,3 +61,28 @@ def _isolated_core_db(monkeypatch, tmp_path):
     core suite keeps its own explicit database.
     """
     monkeypatch.setenv("CORE_DB_PATH", str(tmp_path / "core.db"))
+
+
+@pytest.fixture(autouse=True)
+async def _close_import_time_memory_agent():
+    """Close the agent `api.main` built at import time, before its loop dies.
+
+    ``api.main`` constructs ``MemoryAgent()`` at module scope, so one aiosqlite
+    connection and its worker thread outlive whichever test happened to use it.
+    When that thread finishes a statement after the owning event loop is closed,
+    aiosqlite reports ``RuntimeError: Event loop is closed`` *inside the worker
+    thread* — attributed to whatever test the garbage collector happened to run
+    in, and immune to every fix made in the code that actually leaked. The app's
+    own lifespan now closes this agent too; this fixture keeps the test suite's
+    loops from being the thing that trips over it.
+
+    Skipped when `api.main` was never imported, so unit tests do not pay for a
+    FastAPI import they deliberately avoid.
+    """
+    yield
+    import sys
+
+    module = sys.modules.get("api.main")
+    agent = getattr(module, "memory_agent", None) if module else None
+    if agent is not None and getattr(agent, "_db", None) is not None:
+        await agent.close()

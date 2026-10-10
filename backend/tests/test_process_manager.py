@@ -183,6 +183,14 @@ class TestOwnership:
         a = await process_registry.start([PYTHON, "-V"], cwd=str(workspace))
         b = await process_registry.start([PYTHON, "-V"], cwd=str(workspace))
         assert a.id != b.id
+        # Drain the readers of both children through the production path instead
+        # of leaving them for the fixture's bare `kill()`: an un-drained pipe
+        # transport is only closed in its destructor, which after the test's event
+        # loop is gone printed `RuntimeError: Event loop is closed` and made every
+        # run of this file look broken. Note `close_all` reports 0 here on
+        # purpose - `python -V` has already exited, and it stops what is *running*.
+        for entry in (a, b):
+            await process_registry.stop(entry.id)
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +380,156 @@ class TestTools:
         result = await registry.execute("process_list", {})
         assert result["success"] is True
         assert "requires_confirmation" not in result
+
+# ---------------------------------------------------------------------------
+# Shutdown: what happens to tracked children when the backend goes away
+# ---------------------------------------------------------------------------
+class TestCloseAll:
+    """The registry is in memory, so an unreaped child is orphaned forever.
+
+    Before `close_all` existed, `process_start` + a backend restart left a dev
+    server holding its port with no id to stop it by: the new session's registry
+    was empty, so `process_stop` refused the pid it did not own. The terminal
+    manager had already made the opposite choice for shells, which is the
+    precedent this follows.
+    """
+
+    async def test_a_tracked_child_is_stopped(self, workspace):
+        table = ProcessRegistry()
+        entry = await table.start(
+            [PYTHON, str(_sleeper(workspace, "orphan.py", 30))],
+            cwd=str(workspace),
+            name="server",
+        )
+        assert await _await_status(entry) == "running", entry.status
+
+        stopped = await table.close_all("backend shutting down")
+
+        assert stopped == 1
+        await _await_exit(entry)
+        assert entry.proc.returncode is not None, "the child is still alive"
+        assert entry.status in ("stopped", "exited"), entry.status
+
+    async def test_the_child_is_reaped_not_merely_signalled(self, workspace):
+        """`terminate` then `wait`: a zombie is not 'stopped' either."""
+        table = ProcessRegistry()
+        entry = await table.start(
+            [PYTHON, str(_sleeper(workspace, "reap.py", 30))], cwd=str(workspace)
+        )
+        await table.close_all("shutdown")
+        # The pumps are cancelled on stop; the exit watcher must have run.
+        assert all(task.cancelled() or task.done() for task in entry.pumps)
+
+    async def test_only_processes_this_registry_started_are_touched(self, workspace):
+        """The ownership invariant, asserted at the one place that could break it.
+
+        A `close_all` that searched for matching command lines would be a way to
+        kill anything on the machine from a backend restart. It is not: it walks
+        its own table, so a foreign process with an identical command line keeps
+        running.
+        """
+        foreign = await asyncio.create_subprocess_exec(
+            PYTHON,
+            str(_sleeper(workspace, "foreign.py", 30)),
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        table = ProcessRegistry()
+        try:
+            assert await table.close_all("shutdown") == 0
+            await asyncio.sleep(0.3)
+            assert foreign.returncode is None, "a process we did not spawn was killed"
+        finally:
+            foreign.kill()
+            await foreign.wait()
+            # DEVNULL means there is no pipe to drain; a subprocess with PIPE and
+            # no reader leaves the transport open until its destructor runs,
+            # which after the loop is closed is the `Event loop is closed` noise.
+            assert foreign.stdout is None
+
+    async def test_finished_entries_are_not_counted(self, workspace):
+        table = ProcessRegistry()
+        entry = await table.start(
+            [PYTHON, str(_sleeper(workspace, "brief.py", 0))], cwd=str(workspace)
+        )
+        await _await_exit(entry)
+        assert await table.close_all("shutdown") == 0
+
+    async def test_it_is_safe_to_call_twice(self, workspace):
+        table = ProcessRegistry()
+        await table.start(
+            [PYTHON, str(_sleeper(workspace, "twice.py", 30))], cwd=str(workspace)
+        )
+        assert await table.close_all("shutdown") == 1
+        assert await table.close_all("shutdown") == 0
+
+    async def test_an_empty_registry_is_not_an_error(self):
+        assert await ProcessRegistry().close_all("shutdown") == 0
+
+
+async def _await_status(entry, want="running", timeout=4.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while entry.status != want and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    return entry.status
+
+
+class TestStoppedProcessesReleaseTheirPipes:
+    """`stop()` is not finished until the *transport* is gone, not just the pid."""
+
+    async def test_the_subprocess_transport_is_closed(self, workspace):
+        table = ProcessRegistry()
+        entry = await table.start(
+            [PYTHON, str(_sleeper(workspace, "short.py", 0))], cwd=str(workspace)
+        )
+        await _await_exit(entry)
+        await table.stop(entry.id)
+        # The observable that matters: the readers ran to EOF instead of being
+        # cancelled, which is what lets the transport close its own pipes.
+        # Asserted on the tasks because Python 3.11 offers no public way to ask
+        # whether a subprocess transport is closed.
+        assert entry.pumps and all(t.done() for t in entry.pumps)
+        assert not any(t.cancelled() for t in entry.pumps), (
+            "a cancelled reader leaves the pipe transport open until __del__"
+        )
+
+    async def test_a_child_that_outlived_its_readers_is_still_stopped(self, workspace):
+        """A wedged grandchild must not be able to hang `stop()`.
+
+        The drain is bounded by `PUMP_DRAIN_S`, so a pipe held open by someone
+        else's process falls back to cancelling the reader instead of blocking
+        shutdown forever.
+        """
+        from tools import processes as mod
+        holder = await asyncio.create_subprocess_exec(
+            PYTHON,
+            "-c",
+            "import sys, time; sys.stdout.write('x' * 10); sys.stdout.flush(); time.sleep(30)",
+            stdout=asyncio.subprocess.PIPE,
+        )
+        try:
+            table = ProcessRegistry()
+            entry = await table.start(
+                [PYTHON, str(_sleeper(workspace, "holder.py", 30))], cwd=str(workspace)
+            )
+            started = asyncio.get_running_loop().time()
+            await table.stop(entry.id)
+            assert asyncio.get_running_loop().time() - started < 3.0, (
+                "`stop()` blocked on a pipe it could not drain; the wait must be "
+                f"bounded by PUMP_DRAIN_S ({mod.PUMP_DRAIN_S}s)"
+            )
+        finally:
+            holder.kill()
+            await holder.wait()
+            await asyncio.wait_for(holder.stdout.read(), timeout=2)
+
+    async def test_closing_twice_is_harmless(self, workspace):
+        table = ProcessRegistry()
+        entry = await table.start(
+            [PYTHON, str(_sleeper(workspace, "twice2.py", 0))], cwd=str(workspace)
+        )
+        await _await_exit(entry)
+        assert await table.stop(entry.id) is not None
+        assert await table.stop(entry.id) is not None, "stop must stay idempotent"

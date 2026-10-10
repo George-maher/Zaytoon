@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -10,6 +11,12 @@ from common.concurrency import ReentrantAsyncLock
 from common.reporting import safe_error
 
 logger = logging.getLogger("Zaytoon.MemoryAgent")
+
+
+#: Rows claimed per tick. Unbounded claiming is how a machine that slept for a
+#: week delivers 400 notifications at once: the app becomes the thing the user
+#: notices instead of the reminders they asked for.
+MAX_REMINDERS_PER_TICK = 20
 
 
 class MemoryAgent:
@@ -114,6 +121,35 @@ class MemoryAgent:
                 await db.execute("ALTER TABLE context_summary ADD COLUMN session_id TEXT DEFAULT 'default'")
             except Exception:
                 pass
+
+        # Delivered-or-not has to be countable *in the row*: `notify_attempts` on
+        # the data class was recomputed from zero on every tick and never
+        # persisted, so nothing could tell a first attempt from a third.
+        # The `duplicate column name` guard is this file's existing idiom for an
+        # idempotent ALTER, so a re-run is a no-op rather than an error.
+        for column, ddl in (
+            (
+                "attempts",
+                "ALTER TABLE reminders ADD COLUMN attempts INTEGER DEFAULT 0",
+            ),
+            # The claim token: *which* batch took a row. `status = 'firing'` on
+            # its own only says somebody is working on it, so the next read would
+            # hand the same reminder out again while the first delivery was still
+            # in flight — a slow notification is enough. See `get_due_reminders`.
+            (
+                "claimed_at",
+                "ALTER TABLE reminders ADD COLUMN claimed_at TEXT",
+            ),
+        ):
+            try:
+                await db.execute(ddl)
+            except Exception as exc:  # noqa: BLE001 - re-run of a done migration
+                if "duplicate column" not in str(exc).lower():
+                    safe_error(
+                        exc,
+                        operation=f"migrate.reminders.{column}",
+                        component="MemoryAgent",
+                    )
 
     async def store_message(
         self, role: str, content: str, language: str = "en", session_id: str = "default"
@@ -412,36 +448,108 @@ class MemoryAgent:
         return cursor.rowcount > 0
 
     async def get_due_reminders(self) -> List[Dict[str, Any]]:
+        """**Claim** every pending reminder whose time has come; deliver none.
+
+        This used to *complete* each row it read and *insert the next
+        occurrence* of a recurring one. Both were wrong, and in opposite
+        directions:
+
+        * a notification that then failed left the row completed, so the
+          reminder was consumed without being delivered — nothing would read it
+          again, and `mark_failed` only changed the status of a dead row;
+        * the scheduler *also* reschedules after a verified delivery
+          (`ReminderService.handle_recurring`), so a daily reminder got **two**
+          next occurrences per fire, doubling every day. The extra copy was
+          also inserted through `add_reminder` without `session_id` or
+          `timezone_offset`, so it appeared in the wrong session at the wrong
+          hour.
+
+        A read must not mutate. The only thing owed at claim time is that nobody
+        else takes the same row, which one UPDATE does atomically — the
+        `status = 'pending'` predicate is evaluated by the statement itself, so
+        two overlapping ticks cannot both claim it. Completion and rescheduling
+        now have exactly one owner: ``SchedulerManager._fire_reminder``, after a
+        verified delivery.
+        """
         await self._ensure_initialized()
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        db = await self._get_db()
-        async with db.execute(
-            "SELECT id, title, description, remind_time, recurring FROM reminders "
-            "WHERE status = 'pending' AND remind_time <= ?",
-            (now_utc,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            result = [dict(row) for row in rows]
-            for r in result:
-                await self.complete_reminder(r["id"])
-                if r.get("recurring") and r["recurring"] != "none":
-                    intervals = {
-                        "daily": timedelta(days=1),
-                        "weekly": timedelta(weeks=1),
-                        "monthly": timedelta(days=30),
-                    }
-                    delta = intervals.get(r["recurring"], timedelta(days=1))
-                    old_time = datetime.strptime(
-                        r["remind_time"][:19], "%Y-%m-%d %H:%M:%S"
-                    )
-                    new_time = old_time + delta
-                    await self.add_reminder(
-                        title=r["title"],
-                        remind_time=new_time.strftime("%Y-%m-%d %H:%M:%S"),
-                        description=r.get("description", ""),
-                        recurring=r["recurring"],
-                    )
-            return result
+        async with self._write_lock:
+            db = await self._get_db()
+            token = uuid.uuid4().hex
+            await db.execute(
+                "UPDATE reminders SET status = 'firing', attempts = attempts + 1, "
+                "claimed_at = ? "
+                "WHERE id IN ("
+                "  SELECT id FROM reminders"
+                "  WHERE status = 'pending' AND remind_time <= ?"
+                "  ORDER BY remind_time"
+                "  LIMIT ?"
+                ")",
+                (token, now_utc, MAX_REMINDERS_PER_TICK),
+            )
+            await db.commit()
+            async with db.execute(
+                # Only *this* batch. `status = 'firing' AND remind_time <= now`
+                # would also match rows another caller claimed and has not
+                # delivered yet, which is precisely the duplicate being prevented;
+                # `claimed_at` is the token written by the UPDATE above.
+                "SELECT id, title, description, remind_time, recurring, session_id, "
+                "       status, attempts, created_at "
+                "FROM reminders WHERE claimed_at = ? AND status = 'firing' "
+                "ORDER BY remind_time",
+                (token,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def release_reminder(self, reminder_id: int, max_attempts: int = 3) -> str:
+        """Give a failed delivery back, or stop trying. Returns the new status.
+
+        ``pending`` lets the next tick retry; ``failed`` is reached only once the
+        persisted ``attempts`` count says we have tried ``max_attempts`` times —
+        which, being in the row, stays true across a restart too.
+        """
+        await self._ensure_initialized()
+        async with self._write_lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                "UPDATE reminders SET status = CASE WHEN attempts >= ? "
+                "THEN 'failed' ELSE 'pending' END, claimed_at = NULL "
+                "WHERE id = ? AND status = 'firing'",
+                (max_attempts, reminder_id),
+            )
+            await db.commit()
+            async with db.execute(
+                "SELECT status FROM reminders WHERE id = ?", (reminder_id,)
+            ) as check:
+                row = await check.fetchone()
+        # The status is read back rather than computed from `rowcount`, because
+        # `rowcount == 0` means "this row was not in `firing`" — already
+        # released, deleted, or never claimed. Reporting `pending` in that case
+        # would promise a retry that the next tick will not perform.
+        return row["status"] if row else "gone"
+
+    async def requeue_stale_claims(self) -> int:
+        """Return rows left ``firing`` by a previous process.
+
+        A claim must eventually be released or the reminder is neither delivered
+        nor visible: the panel lists `pending`, so a row stranded in `firing` by
+        a crash or a `kill` between claim and delivery simply vanishes. Nothing
+        can be legitimately firing at startup, so every such row is due again.
+        Re-notifying after a crash is the lesser harm beside losing it.
+        """
+        await self._ensure_initialized()
+        async with self._write_lock:
+            db = await self._get_db()
+            cursor = await db.execute(
+                "UPDATE reminders SET status = 'pending', claimed_at = NULL "
+                "WHERE status = 'firing'"
+            )
+            await db.commit()
+        count = cursor.rowcount
+        if count:
+            logger.info("Requeued %d reminder(s) claimed by a previous run", count)
+        return count
 
     async def mark_reminder_done(self, reminder_id: int) -> None:
         await self.complete_reminder(reminder_id)

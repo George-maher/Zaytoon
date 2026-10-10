@@ -327,16 +327,37 @@ class Config:
         """True when we have what we need to call OpenRouter at all."""
         return bool(self.OPENROUTER_API_KEY)
 
+    #: How stale the cached provider probe in ``services/provider_health`` may
+    #: be before ``/health`` re-probes. The UI and the desktop supervisor poll this
+    #: endpoint, so a short TTL bounds staleness while keeping the daemon off the
+    #: critical path; 0 forces a probe per call.
+    HEALTH_PROBE_TTL_S: float = _env_float("HEALTH_PROBE_TTL_S", 5.0)
+    #: The probe's own timeout, deliberately nothing like ``OLLAMA_TIMEOUT`` (a
+    #: generation may run for minutes; a version handshake must not).
+    HEALTH_PROBE_TIMEOUT_S: float = _env_float("HEALTH_PROBE_TIMEOUT_S", 2.0)
+    #: Stop tracked background processes (`process_start`) when the backend
+    #: shuts down. The registry is in-memory, so leaving them running orphans
+    #: them: a dev server still holding its port, invisible to the next session.
+    #: Off, and `process_stop` becomes a tool the user must remember to drive.
+    PROCESS_STOP_ON_SHUTDOWN: bool = _env_bool("PROCESS_STOP_ON_SHUTDOWN", True)
+
+    #: Also ask ``/api/tags`` and report which tier models are absent. One extra
+    #: local GET, and it is what turns "provider unreachable" into the specific
+    #: "`ollama pull qwen3.5:9b`" the user can act on.
+    HEALTH_PROBE_MODELS: bool = _env_bool("HEALTH_PROBE_MODELS", True)
+
     @property
     def provider_ready(self) -> bool:
-        """True when the *active* provider can serve requests.
+        """True when the *active* provider is configured well enough to try.
 
-        Ollama needs no credentials — only a reachable endpoint — so this is
-        what ``/health`` should report, while ``llm_configured`` keeps its
-        OpenRouter-specific meaning for the free-model policy checks.
+        This is a **configuration** predicate, not a reachability one, and the two
+        must not be confused: ``/health`` used to treat this as the second, so an
+        Ollama install with a stopped daemon read ``status: "ok"`` while the same
+        process logged ``AI provider not connected`` two seconds earlier. Reach
+        is ``services/provider_health``, which actually asks.
         """
         if self.PROVIDER == PROVIDER_OLLAMA:
-            return True
+            return bool(self.OLLAMA_BASE_URL)
         return bool(self.OPENROUTER_API_KEY)
 
     def model_for_tier(self, tier: str) -> str:

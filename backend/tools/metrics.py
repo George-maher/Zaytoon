@@ -17,6 +17,7 @@ engine records into this object.
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+from common.reporting import safe_error
 
 #: Terminal states a call can end in. Plain strings so the payload stays
 #: JSON-serialisable without the client importing an enum.
@@ -140,8 +141,8 @@ def record_tool_call(
         return
     try:
         metrics.end(name, status=status, duration_ms=duration_ms)
-    except Exception:  # pragma: no cover - defensive
-        pass
+    except Exception as e:  # noqa: BLE001 - instrumentation, never fatal
+        safe_error(e, operation="metrics.end", component="ToolMetrics", detail=name)
 
 
 __all__ = [

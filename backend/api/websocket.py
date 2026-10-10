@@ -1161,8 +1161,10 @@ async def _run_turn(
     if state and state.tts_task and not state.tts_task.done():
         try:
             await state.tts_task
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - speech is an accessory to the reply
+            # A failed synthesis must not eat the answer that was already sent,
+            # but it should say why the speaker stayed quiet.
+            safe_error(e, operation="ws.tts_join", component="WebSocket")
 
     tts_task = None
     if not tts_triggered:

@@ -557,8 +557,8 @@ class Orchestrator:
                 task, "Paused: the turn stopped here before dispatching.",
                 level="warning",
             )
-        except Exception:  # noqa: BLE001 - the log explains, it does not decide
-            pass
+        except Exception as e:  # noqa: BLE001 - the log explains, it does not decide
+            safe_error(e, operation="orchestrator.pause_log", component="Orchestrator")
         return True
 
     async def _default_project_id(self) -> Optional[str]:

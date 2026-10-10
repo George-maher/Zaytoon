@@ -1319,8 +1319,12 @@ class AgentEngine:
                     # Instrumentation must never fail the call it measures.
                     try:
                         self.metrics.begin(call.name)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
+                    except Exception as e:  # noqa: BLE001 - instrumentation
+                        # Still never fatal — but "instrumentation is broken"
+                        # used to be indistinguishable from "nothing happened",
+                        # which is how a metrics bug survived for months.
+                        safe_error(e, operation="engine.metrics_begin",
+                                   component="AgentEngine", detail=call.name)
                 beat = asyncio.create_task(
                     _heartbeat(call.name, bus, language), name=f"beat:{call.name}"
                 )
@@ -1378,15 +1382,24 @@ class AgentEngine:
                     )
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a display must not break a turn
-                pass
+            except Exception as e:  # noqa: BLE001 - a display must not break a turn
+                # The turn survives; the reason the panel stayed blank does not
+                # have to be invisible.
+                safe_error(e, operation="engine.tool_event", component="AgentEngine")
             finally:
                 if beat is not None:
                     beat.cancel()
                     try:
                         await beat
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    except asyncio.CancelledError:
+                        # The routine path: we asked for this cancellation.
                         pass
+                    except Exception as e:  # noqa: BLE001 - reported, not fatal
+                        # Anything *else* the heartbeat raised is a bug in the
+                        # heartbeat, and this used to be the one place that could
+                        # swallow it while the turn carried on looking normal.
+                        safe_error(e, operation="engine.heartbeat",
+                                   component="AgentEngine", detail=call.name)
                 elapsed_ms = (time.perf_counter() - started_at) * 1000.0
                 record_tool_call(
                     self.metrics, call.name, status, elapsed_ms,

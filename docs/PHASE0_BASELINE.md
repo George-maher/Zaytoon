@@ -426,3 +426,165 @@ warnings the suite emits — an `asyncio` subprocess transport and an `aiosqlite
 worker thread, both outliving their loop — are real cleanup bugs, not pytest
 noise; (3) the 17 `except Exception: pass/continue` sites; (4) a bounded
 provider probe so `/health` does not hang on a hung daemon.
+
+## 8. P3 result — health truth, error visibility, cancellation and cleanup (2026-10-10)
+
+Scope agreed at the end of §7: the four leads listed there. Investigation during
+the phase turned up a fifth item, a live reminder-loss bug, which was promoted
+into this phase because every minute it stays unfixed doubles a user's duplicate
+notifications and deletes the ones that fail.
+
+### Gate
+
+| Check | Before | After |
+|---|---|---|
+| `pytest backend/tests -q` | 2333 passed, 3 skipped, **2 warnings** | **2389 passed, 3 skipped, 0 failed, 1 warning** (the surviving warning is `StarletteDeprecationWarning` from a dependency) |
+| `/health` with Ollama stopped | `status: "ok"`, `status_reason` absent | `status: "degraded"`, `status_reason: "ConnectError: All connection attempts failed"` |
+| `/health` `uptime` | `1791651058` (a Unix epoch, ≈56 years) | `9.496` seconds + `started_at` |
+| `/health` worst-case latency, hung daemon | inherits `OLLAMA_TIMEOUT` = 120 s | `HEALTH_PROBE_TIMEOUT_S` + 0.5 s outer guard (2.5 s by default). A test whose transport sleeps 30 s under a 0.4 s budget returns in under 1.9 s |
+| `/health` under 10 concurrent pollers | 10 live probes | 1 probe (asserted: 2 HTTP requests, `cached: true` on 9) |
+| Recurring reminder rows after *n* fires | 2ⁿ (daily: 1 → 2 → 4 → 8) | *n* + 1 (one fired row + one future row) |
+| Reminder whose notification fails | consumed: completed, never delivered again | released to `pending`, retried, `failed` only after `MAX_RETRIES` |
+| `process_start` child after a backend restart | orphaned, holds its port, unstop-able (registry is memory-only) | stopped during shutdown (`PROCESS_STOP_ON_SHUTDOWN`, default on) |
+| `MemoryAgent` connection | never closed; its aiosqlite worker thread outlived the loop | closed last in `lifespan` shutdown, and per-test in `conftest` |
+| Silent `except Exception: pass` in the 11 touched modules | 16 broad swallows | 0 broad swallows, enforced by an AST guard test |
+| Broad swallow of a *security* cleanup | `SessionState.cancel()` hid a failed `cancel_all()` | logged at ERROR, cancellation still completes |
+| Backend shutdown | (unverified) | `Scheduler manager stopped` → `Zaytoon AI backend shut down`, **0 tracebacks** |
+
+Suite time is unchanged within noise (93.33 s → 91.75 s) while running 56 more
+tests; `test_reminder_lifecycle.py` alone would have taken ~60 s of real
+`RETRY_DELAYS` sleeping had it not zeroed them.
+
+### New defect found and fixed (R10 — reminder consumption and double reschedule)
+
+**Severity: High. User-visible data loss in both directions.**
+
+`MemoryAgent.get_due_reminders()` completed every row it *read* and inserted the
+next occurrence of a recurring one. `SchedulerManager._fire_reminder()` *also*
+rescheduled, after a verified delivery. Consequences, each reproduced in a test
+before being fixed:
+
+1. **A recurring reminder doubled its future rows** every time it fired
+   (1 → 2 → 4 → 8 …). The row inserted by the read path went through
+   `add_reminder()` without `session_id` or `timezone_offset`, so it also landed
+   in the default session at an hour computed without the user's offset.
+2. **A reminder whose notification failed was consumed anyway** — completed at
+   read time, and `mark_failed` afterwards only renamed a row nothing selects
+   again. Set a reminder, the desktop is asleep, it is gone rather than late.
+3. `notify_attempts` existed on `ReminderData`, was shown to callers, and was
+   **never persisted** — it reset to 0 on every tick, so "attempt 3 of 3" was
+   only ever true inside one function's memory.
+
+The fix follows one rule: **a read must not mutate, and a row has one owner.**
+The store now claims (`UPDATE … SET status='firing', attempts=attempts+1,
+claimed_at=<token>` as one statement, so overlapping ticks cannot both take a
+row); `_fire_reminder` settles it (complete + reschedule on delivery, release on
+failure). `claimed_at` is the batch token: without it, "firing" only says
+*somebody* is working on the row, so the next reader hands out the same reminder
+again while the first send is still in flight — which is exactly what the first
+version of this fix did, caught by `test_a_second_read_within_the_tick_sees_nothing_new`.
+
+Also, because a claim is only safe if it is eventually released:
+`requeue_stale_claims()` runs in `SchedulerManager.start()`, so a process killed
+between claim and delivery re-queues instead of swallowing the reminder.
+Re-notifying after a crash is the lesser harm beside losing it.
+
+Due reminders are now delivered concurrently within a tick
+(`MAX_CONCURRENT_DELIVERIES = 4`), because `_fire_reminder`'s backoff was awaited
+serially: one unreachable notification backend delayed every reminder behind it
+by up to 21 s. `deliver_due()` was extracted from `_check_loop` so a tick is
+drivable from a test instead of by waiting 15 s.
+
+### Changes
+
+| File | What | Why |
+|---|---|---|
+| `services/provider_health.py` *(new)* | Cached, timeout-bounded, single-flight provider probe; `reachable` / `unreachable` / `unconfigured` / `never_probed` | `/health.llm.configured` was an assertion. Ollama is probed for real (version + `/api/tags`); OpenRouter reports **observations** (circuit-breaker state, counters) because a metered API must not be pinged from a health check |
+| `config.py` | `provider_ready` no longer returns `True` unconditionally for Ollama; `HEALTH_PROBE_{TTL_S,TIMEOUT_S,MODELS}`; `PROCESS_STOP_ON_SHUTDOWN` | the predicate is now labelled for what it measures — configuration, not reach — and the reachability question has an owner |
+| `api/main.py` | `/health` status from the probe, `status_reason`, monotonic `uptime` + `started_at`, one `APP_VERSION` constant, `provider_health.invalidate()` on `POST /settings/ai`, `memory_agent.close()` and `close_all()` in shutdown | a repointed provider must not be judged by the previous endpoint's cached verdict; the version literal existed twice |
+| `agents/memory_agent.py` | claim-based `get_due_reminders`, `release_reminder`, `requeue_stale_claims`, `attempts`/`claimed_at` migration, `MAX_REMINDERS_PER_TICK = 20` | see R10. The batch is capped so a machine that slept for a week does not deliver 400 notifications at once |
+| `reminder/service.py` | `release()`, `requeue_stale_claims()`, `get_due()` reflects the stored status, `notify_attempts` mapped from the persisted count | the data class must not contradict the row |
+| `scheduler/manager.py` | `deliver_due()`, concurrent bounded delivery, release-instead-of-consume, stale-claim recovery at `start()` | one owner for the row's fate |
+| `tools/processes.py` | `ProcessRegistry.close_all()`, and `stop()` now drains the output pumps instead of cancelling them | `asyncio` closes a subprocess transport only once its pipes reach EOF; cancelling the readers left the fd open until the destructor — a leaked descriptor per stopped process in a long-running backend, and `RuntimeError: Event loop is closed` in the test report |
+| 11 modules (engine, websocket, completion_validator, tasks/manager, secrets, metrics, domain/models, orchestrator, stt, api/main, scheduler) | broad `except …: pass` → `safe_error(…)` / an explicit log | see below |
+| `tests/conftest.py` | autouse teardown closing the import-time `MemoryAgent` | the leaking connection is bound to whichever loop last ran the app, so the warning was attributed to an unrelated test and looked immune to every fix |
+| `.env.example` | 4 new knobs, each with its reasoning | every key in the template is checked to exist in `config.py` |
+
+**Two of the swallows were not harmless**, which is why the pass was not simply
+kept with a comment: `SessionState.cancel()` swallowed a failure of
+`confirmation_manager.cancel_all()` — the call that prevents a dead session's
+pending approvals from being honoured later, now logged at ERROR because a
+security-boundary failure at debug level is still a hidden failure; and
+`contract_from_registry()` swallowed an error while building the tool map, so
+the completion validator reported "no violations" about a contract with **no
+tools in it**. The others are genuine best-effort paths (metrics must not fail
+the call it measures, a temp-file cleanup must not change a transcription
+result) — they keep that property and gain a log line.
+
+`tests/test_error_visibility.py` enforces the invariant structurally rather than
+by wording: a `pass` in one of the 11 modules is allowed if it catches only
+routine exceptions (`CancelledError`) or a narrow domain error
+(`FileNotFoundError`, `IllegalTransition`), and is a failure if it can catch
+`Exception`. Verified as a real guard: reintroducing one swallow made exactly
+that parameterised case red.
+
+### Tests added (56)
+
+`test_provider_health.py` 16 · `test_reminder_lifecycle.py` 15 ·
+`test_error_visibility.py` 16 · `test_process_manager.py` +9
+(`TestCloseAll` 6, `TestStoppedProcessesReleaseTheirPipes` 3).
+
+Both new behaviour suites were **mutation-checked**, because a test that passes
+before and after a fix proves nothing:
+
+* re-applying the old read-path completion + reschedule turned **9 of 15**
+  `test_reminder_lifecycle.py` tests red — the double-row growth, the swallowed
+  reminder, the lost `session_id` and the crash recovery all have teeth;
+* reintroducing `except Exception: pass` in `core/tasks/manager.py` reddened the
+  guard for that file only.
+
+Deliberate non-assertion recorded: the registry-escape style assertion in
+`test_security_sandbox.py` (see §7) still outnumbers my own containment test's
+contributions; the reminder tests assert on **rows in the database**, not on log
+lines, so they survive refactors of the code that writes them.
+
+### Explicitly *not* done, and why
+
+* **No synthetic OpenRouter request in `/health`.** A key-validity ping would
+  add a metered network call to the endpoint that reports on network failure, and
+  would make "is the cloud up?" a question answered by spending money. The
+  cloud path therefore reports observations and says so (`source:
+  "observations"`), and `never_probed` is an accepted answer rather than a guess
+  at `ok`.
+* **`ReentrantAsyncLock` kept.** Removing the side effects from
+  `get_due_reminders` retired its original justification — its docstring named
+  that method as the pattern it existed for — so the docstring now says the case
+  is gone and why the class stays: the storage layer has many writers, and a
+  future helper that calls another must not hang the process. Refusing the *nesting*
+  is a review-and-test job (`test_reminder_lifecycle.py`), not a reason to swap in
+  a stricter primitive mid-phase.
+* **The 37-`pass`-sites census was not "fixed".** 40 broad/narrow swallows exist
+  in the package; 11 modules are now guarded. The rest are in `config.py`
+  (before logging exists — a `safe_error` there would recurse through the module
+  that reads config), `scripts/` (operator tools, where a traceback is the
+  correct output), and narrow handlers where silence is the specified behaviour.
+  Each of those three groups was read, not assumed.
+* **No `updated_at` column / TTL-based claim expiry.** A claim older than the
+  interval could be re-queued from *inside* the loop, but with one scheduler task
+  in this process the startup requeue covers the real failure mode (crash,
+  `kill`, restart) and a timer-based reclaim would risk re-delivering a
+  notification that is merely slow. Revisit if a second scheduler ever exists.
+* **Frontend not shown the probe yet.** `SettingsPanel` keys its AI-core badge on
+  `llm.configured`, which is now accurate but incomplete: the richer
+  `llm.probe` (`unreachable`, `missing_models`) is in the payload and unused.
+  Kept out of this phase so the backend contract could land first; it is a
+  display change, listed for P4.
+* **No change to confirmation policy, tiers, sandbox or audit** (decision 5).
+  `test_process_manager.py`'s ownership test now *asserts* that a foreign pid is
+  untouched by `close_all`, which pins the boundary tighter rather than looser.
+
+### Next (P4)
+
+Concurrency bound (R7) with measured before/after, plus the deterministic fast
+path — and, now that `/health` carries a truthful probe, surfacing it in the HUD
+instead of `llm.configured`.

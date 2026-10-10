@@ -144,8 +144,18 @@ class SessionState:
         if self.confirmation_manager is not None:
             try:
                 self.confirmation_manager.cancel_all("session cancelled")
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - cancel must always complete
+                # Not merely a log line: if this fails, pending confirmations
+                # outlive the session that asked for them, and an approval
+                # granted afterwards could still be honoured for a session that
+                # is gone. A security-relevant swallow, so it is reported as one.
+                import logging
+
+                logging.getLogger("Zaytoon.Domain").error(
+                    "pending confirmations were NOT cancelled on session "
+                    "disconnect (%s: %s) - approvals may still be honoured for "
+                    "a dead session", type(e).__name__, e,
+                )
         self.cancel_event.set()
         if self.tts_task and not self.tts_task.done():
             self.tts_task.cancel()

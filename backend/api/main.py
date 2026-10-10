@@ -4,7 +4,7 @@ import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, UploadFile, File
@@ -41,6 +41,7 @@ from api.websocket import (
 from domain.models import TokenBucketRateLimiter
 from services.agent_service import AgentService
 from services import workspace_settings
+from services.provider_health import provider_health
 
 # The Zaytoon core runtime: task system, projects, files, skills, providers,
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
@@ -273,6 +274,17 @@ async def lifespan(app):
         await get_terminal_manager().close_all("backend shutting down")
     except Exception as e:
         safe_error(e, operation="shutdown.terminals", component="api.shutdown")
+    # Same reasoning, different table: interactive shells and `process_start`
+    # children are separate registries, and each had to be closed on its own.
+    if config.PROCESS_STOP_ON_SHUTDOWN:
+        try:
+            from tools.processes import registry as process_registry
+
+            stopped = await process_registry.close_all("backend shutting down")
+            if stopped:
+                logger.info("Stopped %d tracked process(es)", stopped)
+        except Exception as e:
+            safe_error(e, operation="shutdown.processes", component="api.shutdown")
     await scheduler.stop()
     await close_shared_client()
     await get_llm_client().aclose()
@@ -284,10 +296,32 @@ async def lifespan(app):
     # leaves that connection open until the process exits.
     from services.ollama_client import close_ollama_client
     await close_ollama_client()
+    # Last, because everything above may still log through it: the memory agent
+    # owns the only aiosqlite connection, and closing it after the loop is gone
+    # is what produced `RuntimeError: Event loop is closed` at the end of every
+    # test run — a warning that trained everyone to ignore the output.
+    try:
+        await memory_agent.close()
+    except Exception as e:
+        safe_error(e, operation="shutdown.memory", component="api.shutdown")
     logger.info("Zaytoon AI backend shut down")
 
 
-app = FastAPI(title="Zaytoon AI Assistant", version="3.0.0", lifespan=lifespan)
+#: The one version string: it appeared twice (here and in `/health`), and a
+#: bump that missed one left the two disagreeing for whoever compared them.
+APP_VERSION = "3.0.0"
+
+#: Process start, for `/health`. Monotonic for the duration, wall-clock for the
+#: "when did this process come up" the log and the UI can compare against.
+_STARTED_MONOTONIC = time.monotonic()
+_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _uptime_seconds() -> float:
+    return round(time.monotonic() - _STARTED_MONOTONIC, 3)
+
+
+app = FastAPI(title="Zaytoon AI Assistant", version=APP_VERSION, lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -501,9 +535,37 @@ async def health():
         except Exception as e:  # pragma: no cover - defensive
             routing["tools"] = {"models": [], "error": redact(str(e))}
 
+    # The verdict has to combine two different questions that were previously
+    # conflated. `provider_ready` is "is it configured?"; the probe is "did a
+    # real handshake just succeed?". Reporting only the first made a stopped
+    # daemon look healthy to the desktop supervisor and to the HUD.
+    probe = await provider_health.status()
+    usable = (
+        config.provider_ready
+        and probe["state"] in ("reachable",)
+        and not probe.get("missing_models")
+    )
+    if not config.provider_ready:
+        status = "degraded"
+    elif usable:
+        status = "ok"
+    elif probe["state"] == "never_probed":
+        # Nothing has been tried yet on a metered provider, so there is no
+        # evidence either way. `ok` would be a guess; `degraded` would be an
+        # alarm. Say what is actually known.
+        status = "unverified"
+    else:
+        status = "degraded"
+
     return {
-        "status": "ok" if config.provider_ready else "degraded",
-        "version": "3.0.0",
+        "status": status,
+        "status_reason": (
+            "" if status == "ok"
+            else "provider not configured" if not config.provider_ready
+            else "no request has been made yet" if status == "unverified"
+            else probe.get("error") or "provider unreachable"
+        ),
+        "version": APP_VERSION,
         "llm": {
             **config.describe_llm(),
             "chain": chain,
@@ -512,6 +574,10 @@ async def health():
             "max_attempts": client.max_attempts,
             "model_health": client.health_snapshot(),
             "metrics": client.metrics.to_dict(),
+            # The probe's own report card, next to the counters it complements:
+            # `configured` answers "is there an endpoint and a key", `probe`
+            # answers "can it answer right now".
+            "probe": probe,
         },
         "agents": ["router", "planner", "fast", "code", "tool", "memory", "scheduler"],
         # Tool-layer health, alongside (not inside) `llm.metrics`: one answers
@@ -531,7 +597,14 @@ async def health():
         # is `core`. Reporting only the first made the whole workspace look
         # absent when it was merely on a different code path.
         "core": await _core_health(),
-        "uptime": time.time(),
+        # `uptime` was `time.time()` — a Unix epoch in a field named for a
+        # duration, which read as ~56 years of uptime. `GET /system` already
+        # answers this correctly (`uptime_seconds` from psutil/boot time); this
+        # is the process's own clock, monotonic so a system-clock change cannot
+        # make the app appear to have started in the future.
+        "uptime": _uptime_seconds(),
+        "uptime_seconds": _uptime_seconds(),
+        "started_at": _STARTED_AT.isoformat(timespec="seconds"),
     }
 
 
@@ -865,6 +938,10 @@ async def set_ai_settings(data: dict):
     # Invalidate provider singleton so new settings take effect
     from services.ai_provider import close_provider
     await close_provider()
+    # ...and drop the cached health verdict, which describes the *old* endpoint.
+    # A user who just repointed the provider must not watch /health report the
+    # previous daemon for another TTL window.
+    provider_health.invalidate()
     
     # Verify new configuration
     from services.ai_provider import get_provider
@@ -957,8 +1034,8 @@ async def _run_pull(provider, model: str) -> None:
             # The next `GET /settings/ai` must see the model just installed.
             try:
                 provider.invalidate_cache()
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - best-effort cache refresh
+                safe_error(e, operation="settings.invalidate", component="api.startup")
 
 
 @app.post("/settings/ai/pull")
