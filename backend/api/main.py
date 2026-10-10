@@ -27,7 +27,7 @@ from config import config, PROVIDER_OLLAMA, TIER_FAST, TIER_REASONING
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
 from services.auth import get_device_auth, PermissionScope
-from services.llm_client import get_llm_client
+from services.llm_client import get_llm_client, llm_gate
 from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
 from tools.metrics import get_tool_metrics
@@ -574,6 +574,10 @@ async def health():
             "max_attempts": client.max_attempts,
             "model_health": client.health_snapshot(),
             "metrics": client.metrics.to_dict(),
+            # "Why is it slow?" deserves a number. With a cap in place, the
+            # difference between "the model is slow" and "eight of my own
+            # requests are queued behind each other" is only visible here.
+            "slots": llm_gate().stats(),
             # The probe's own report card, next to the counters it complements:
             # `configured` answers "is there an endpoint and a key", `probe`
             # answers "can it answer right now".

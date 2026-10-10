@@ -858,6 +858,10 @@ Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Age
 `ToolAgent` delegates to **`agents/engine.AgentEngine`**, a bounded ReAct loop.
 
 ```
+fast_path.match(message)      (agents/fast_path.py) — anchored, safe-tier only
+  ├─ matched ────────► run the one tool call through the SAME gate/audit/metrics,
+  │                    answer from its output, 0 model calls, turn over
+  └─ no match / not safe / would need approval ──► the loop below
 ask the model (catalogue + observations so far)
   ├─ no tool call ────────────────────► final answer, streamed as prose
   └─ tool call
@@ -866,6 +870,31 @@ ask the model (catalogue + observations so far)
        └─ loop                         (≤ DEFAULT_MAX_ITERATIONS = 8)
 budget exhausted ──► one forced summary call, so the user still gets an answer
 ```
+
+**Why the short circuit exists and what it may not do.** "what time is it" costs
+a small local model two generations (the call, then the narration of a result it
+already has) and can come back as an invented time. `agents/fast_path.py` matches a
+closed list of phrasings, anchored at both ends, to exactly one tool. It is not a
+permission shortcut: the registry's tier and `RiskAssessor`/`TOOL_ALWAYS_CONFIRM`
+are re-checked per call, so a tool that would prompt the model also bypasses the
+fast path, and re-tiering one closes the shortcut (`ALLOWED_TOOLS` is asserted
+against the live registry in `tests/test_fast_path.py`). There is no fall-through
+*after* execution — an already-run tool is answered from its own outcome, error
+included, because the model re-calling it would launch the app twice.
+`FAST_PATH_ENABLED=false` restores the old behaviour exactly (the engine test module
+disables it so it keeps testing the loop).
+
+**Model calls are bounded process-wide.** `services/llm_client.py` wraps `complete()`
+and `stream()` in `common.concurrency.BoundedGate` — `LLM_MAX_CONCURRENCY` (default
+2) simultaneous generations, strict FIFO queueing, `LLM_QUEUE_TIMEOUT_S` (default
+45) before a waiter is refused with `kind="llm_queue_timeout"` and a sentence that
+says the model is busy rather than broken. It is re-entrant per task because
+`stream()` falls back to a blocking `complete()` inside its own slot; a plain
+semaphore would deadlock there. Occupancy is published at `GET /health` →
+`llm.slots`. This is not a throughput dial: on one GPU, more concurrent
+generations means worse answers and a real chance of an OOM-killed daemon.
+`scripts/measure_fast_path.py` prints both measurements (fast path: 64 model calls
+→ 0, p50 1813 ms → 8 ms against a simulated 900 ms provider).
 
 Three properties are load-bearing, and each has a test in
 `tests/test_agent_engine.py`:

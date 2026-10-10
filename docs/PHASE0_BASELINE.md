@@ -588,3 +588,123 @@ lines, so they survive refactors of the code that writes them.
 Concurrency bound (R7) with measured before/after, plus the deterministic fast
 path — and, now that `/health` carries a truthful probe, surfacing it in the HUD
 instead of `llm.configured`.
+
+## 9. P4 result — bounded model calls and a deterministic fast path (2026-10-10)
+
+R7 (open since Phase 0) plus the short circuit the roadmap paired it with. Both
+are measured rather than asserted, because the claim "this is faster/safer under
+load" is the kind that is easy to write and hard to notice when false.
+
+### Gate
+
+| Check | Before | After |
+|---|---|---|
+| Simultaneous `LLMClient.complete()`/`stream()` calls | unbounded (only per-turn tool parallelism was capped, at 4, and per turn) | `LLM_MAX_CONCURRENCY` = 2, strict FIFO queue, refused with an explanation after `LLM_QUEUE_TIMEOUT_S` = 45 s |
+| Peak in-flight under 12 simultaneous requests | 12 | 2 (asserted for limits 1/2/4 × 1/4/12 arrivals) |
+| `GET /health` | said nothing about queueing | `llm.slots: {limit, in_flight, queued}` |
+| A `get_time`-class turn (`what time is it`, `take a screenshot`, `system info`, `open spotify`) | 2 model generations + tool | 0 model generations + tool |
+| Same, latency (simulated 900 ms provider, 32 turns) | p50 **1813 ms**, 64 model calls | p50 **8 ms**, 0 model calls — 230×, measured by `scripts/measure_fast_path.py` |
+| `POST /chat` "what time is it" with **Ollama stopped** | "The local model provider is not running… Start it with `ollama serve`" | `It's 2026-10-10 18:18:07 (Saturday)` — a real answer, no provider needed |
+| Same request in Arabic, provider stopped | provider-down message | `الساعة دلوقتي 2026-10-10 18:18:07 (Saturday)` |
+| A prompt the matcher does not know, provider stopped | provider-down message | unchanged (verified live: the fall-through still names `ollama serve`) |
+| Backend suite | 2389 passed / 3 skipped / 0 failed | **2446 passed / 3 skipped / 0 failed** in 89.5–95.0 s (57 new tests, same wall clock) |
+
+### Changes
+
+| File | What | Why |
+|---|---|---|
+| `common/concurrency.py` | `BoundedGate` + `QueueTimeout`: bounded, strictly FIFO, re-entrant **per task**, with a bounded wait | Re-entrancy is not a convenience: `stream()`'s documented recovery is a blocking `complete()` *inside its own slot*, so a plain semaphore deadlocks on a normal failure path. Per-task (not per-object) is what keeps a sibling task honest |
+| `services/llm_client.py` | `complete()`/`stream()` wrapped by `_gated()`; `_llm_gate()` published; `llm_queue_timeout` added to `_USER_NOTICES` (en + ar) | The cap has to sit on the entry points the agents actually call, and a full gate must produce "the model is busy", never the generic "all models are unavailable" |
+| `agents/fast_path.py` *(new)* | Anchored intent table (6 phrasing families, EN + transliterated Egyptian + AR), conjunction guard, 120-char ceiling, `ALLOWED_TOOLS` allow-list, templated bilingual rendering | Everything about the matching is deliberately boring. Fuzzy matching, embeddings or "closest tool" would answer half a request as if it were the whole thing — which is the failure mode this is meant to remove, not add |
+| `agents/engine.py` | `_fast_path()` before the prompt is assembled; reuses `_run_one()`; falls through to the model on any pre-execution doubt | Reuse is the point: the same heartbeat, start/finish frames, metrics **and audit record** a model-initiated call produces. A second execution path that audits differently is a hole, not an optimisation |
+| `config.py` | `LLM_MAX_CONCURRENCY`, `LLM_QUEUE_TIMEOUT_S`, `FAST_PATH_ENABLED` | the knob and the escape hatch, documented in `.env.example` with the reasoning rather than just the default |
+| `api/main.py` | `/health` publishes `llm.slots` | "why is it slow" needs a number |
+| `scripts/measure_fast_path.py` *(new)* | Runnable before/after for both features | a claim that lives only in a commit message cannot be re-checked |
+| `tests/test_agent_engine.py` | autouse fixture disabling the fast path **in that module** | see below — this is the one place a test was changed |
+
+### The one test-file change, and why it was not a weakening
+
+Thirteen `test_agent_engine.py` cases went red when the shortcut landed. They were
+not wrong and were not adjusted to match new behaviour: they stub `_ask()` and
+post `"what time is it"`, so an optimisation that answers *before* `_ask` makes
+them assert nothing about the loop they claim to cover. The module now disables
+`FAST_PATH_ENABLED` explicitly. The shortcut is tested in the other direction, in
+`tests/test_fast_path.py`, which enables it and asserts the model is **not**
+consulted (`_never_ask` raises if it is).
+
+### Security review of the new path
+
+`fast_path` cannot reach anything the model could not reach without prompting:
+the tool must be in `ALLOWED_TOOLS`; the registry's declared tier must be
+`safe`; and `RiskAssessor`/`TOOL_ALWAYS_CONFIRM` are consulted via
+`_needs_approval()` — if the call would prompt, the turn returns to the model
+which prompts. Three tests change those policies to prove it, rather than reading
+the code: re-tiering a stub (`open_app`), adding `get_time` to
+`TOOL_ALWAYS_CONFIRM` (the engine is deliberately constructed *inside* the
+mutation, since `RiskAssessor` snapshots policy at construction), and removing
+the tool from the registry. A fourth test asserts every name in `ALLOWED_TOOLS`
+is still tier-`safe` in the **live** registry, so re-tiering `open_app` tomorrow
+fails the suite instead of silently creating a confirmation bypass.
+
+Decision 5 is intact: no tier, gate, sandbox or audit behaviour changed — the
+gate is a *throughput* bound and the fast path is *fewer* calls, not looser
+policy.
+
+### Two bugs found in my own new code (both by tests, before commit)
+
+1. **`wait_for` cancels what it awaits.** My first timeout check was
+   `if not ticket.done()`, but a cancelled future is `done`, so a timed-out
+   waiter fell into the "I was granted a slot" branch and **ran anyway** —
+   two bodies inside a gate of one, with `in_flight` lying. Now: granted means
+   `done() and not cancelled()`. Pinned by
+   `test_a_timed_out_waiter_does_not_run_as_if_it_held_the_slot`, which is the
+   test I most expect someone to delete as "over-specified".
+2. **A stub that answers once measures nothing.** The first version of
+   `measure_fast_path.py` returned a tool call only on the very first
+   `_ask`, so 31 of 32 turns degraded into single-generation prose and the
+   "before" number was half the real cost (901 ms instead of 1813 ms). The
+   simulation now alternates, and the comment says why.
+
+### Explicitly *not* done, and why
+
+* **No real-model numbers.** This machine has no `ollama` binary and no model, so
+  every latency figure above is explicitly against a *simulated* 900 ms provider.
+  The ratios travel; the milliseconds do not. `scripts/measure_fast_path.py` is
+  the artifact to re-run on real hardware.
+* **`max 100 sessions` was not lowered or connected to the gate.** The gate
+  bounds work in progress; the session cap bounds state. Merging them would make
+  an idle session cost a slot.
+* **No priority classes.** A confirmation reply does not jump the queue behind a
+  new prompt. Add it when someone is actually starved, not before.
+* **The fast path was not widened** to `calculator`, `file_read`, `git_status` or
+  anything with required arguments: each needs a *parser*, and a parser that
+  guesses a path is how an answer becomes an action on the wrong file.
+* **No `asyncio.timeout()` wrapper added around model calls** to make nesting
+  "safer": wrapping a nested acquisition in `wait_for` moves it to a new task and
+  *breaks* re-entrancy — my own test did that by accident, and the fix belongs in
+  the caller's discipline, not in another layer.
+
+### Warning-count correction, and a fixture that cost 85 seconds
+
+§8 recorded "1 warning", measured on one run. It is not stable: across the runs of
+this phase it was 1 or 2, the extra one being a `PytestUnhandledThreadExceptionWarning`
+from an aiosqlite worker *thread* that finished after its event loop was closed.
+Reporting a number from a single run as if it were a property was the wrong habit,
+and the same flakiness is why the count is given as a range above rather than as a
+figure.
+
+What that investigation also produced is worth recording, because it is the more
+general lesson: the first version of the suite-wide fix enumerated
+`gc.get_objects()` in an autouse teardown to find every live `MemoryAgent`. It
+worked — 0 spurious warnings — and it took the suite from 92 s to 174 s, because
+the scan ran once per test across 2 400 tests. A hygiene fixture that doubles the
+build is worse than the warning it removes. The final version keeps a
+`weakref.WeakSet` populated by a `MemoryAgent.__init__` wrapper installed in
+`tests/conftest.py`: O(1) per test, no production code changed to serve the tests,
+and 89 s.
+
+### Next (P5)
+
+Agent-contract hardening: planning bounds, result verification, duplicate
+side-effect prevention — the reminder work in §8 fixed the scheduler's version of
+that; the engine's turn-level version is next.

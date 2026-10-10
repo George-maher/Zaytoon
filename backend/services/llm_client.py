@@ -49,7 +49,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence
 
 import httpx
 
@@ -73,6 +73,9 @@ from services.completion_validator import (
     validate_completion,
 )
 from services.model_registry import Selection, select_models
+from contextlib import asynccontextmanager
+
+from common.concurrency import BoundedGate, QueueTimeout
 
 logger = logging.getLogger("Zaytoon.LLMClient")
 
@@ -1397,6 +1400,31 @@ class LLMClient:
     ) -> str:
         """Non-streaming completion, validated against ``contract``.
 
+        Holds one slot of the process-wide gate while it runs — see
+        :func:`llm_gate` for why the bound lives here rather than in the
+        transport, and why a full gate *queues* before it ever refuses.
+        """
+        async with _gated():
+            return await self._complete(
+                messages, tier=tier, max_tokens=max_tokens,
+                temperature=temperature, tools=tools, retries=retries,
+                contract=contract, extract=extract, request_id=request_id,
+            )
+
+    async def _complete(
+        self,
+        messages: List[Dict[str, Any]],
+        tier: str = TIER_FAST,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        retries: Optional[int] = None,
+        contract: CompletionContract = CHAT_CONTRACT,
+        extract: Optional[Callable[[str], Any]] = None,
+        request_id: str = "",
+    ) -> str:
+        """Non-streaming completion, validated against ``contract``.
+
         Walks the capability-filtered chain under a single global attempt
         budget, and moves on for **contract** failures as well as transport
         failures. A completion is returned only if it satisfies the contract; a
@@ -1652,6 +1680,32 @@ class LLMClient:
         return content if isinstance(content, str) else None
 
     async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
+        tier: str = TIER_FAST,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        retries: Optional[int] = None,
+        contract: CompletionContract = STREAM_CONTRACT,
+        extract: Optional[Callable[[str], Any]] = None,
+        request_id: str = "",
+    ) -> str:
+        """Stream SSE deltas through ``on_delta``, returning the full text.
+
+        The gate is held for the whole stream, which is the point: a generation
+        is the expensive resource, not the first byte. The blocking recovery
+        below re-enters the same slot rather than asking for a second one.
+        """
+        async with _gated():
+            return await self._stream(
+                messages, on_delta=on_delta, tier=tier, max_tokens=max_tokens,
+                temperature=temperature, tools=tools, retries=retries,
+                contract=contract, extract=extract, request_id=request_id,
+            )
+
+    async def _stream(
         self,
         messages: List[Dict[str, Any]],
         on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -1936,6 +1990,10 @@ _USER_NOTICES: Dict[str, Dict[str, str]] = {
         "en": "No AI provider is configured.",
         "ar": "مفيش مزوّد ذكاء اصطناعي متفعّل.",
     },
+    "llm_queue_timeout": {
+        "en": "The model is still working on other requests and freed up too late.",
+        "ar": "الموديل لسه بيشتغل على طلبات تانية ومفيش غير متأخر.",
+    },
 }
 
 
@@ -1960,6 +2018,43 @@ def user_notice(exc: Optional[BaseException], language: str = "en") -> Optional[
         # in it, and `redact` has already run on the way to the log.
         text = f"{text} {detail}"
     return text
+
+
+#: How many model calls may run at once, process-wide.
+#:
+#: A local runtime is the reason this exists. Ollama on one GPU serves one or two
+#: generations well and six badly: the requests do not queue politely, they
+#: contend for the same memory, and the usual outcome is that *every* session
+#: gets a slow or failed answer — or the daemon is OOM-killed and the assistant
+#: goes dark entirely. Nothing else in the stack bounded this: the only other
+#: semaphore is the per-turn tool parallelism cap, which is scoped to one turn
+#: and says nothing about how many turns the process is running at once.
+#:
+#: Queued, not failed: a second question in the same second is normal use, and
+#: answering it with "the model is busy" would be a self-inflicted outage. Only a
+#: request that waits longer than ``LLM_QUEUE_TIMEOUT_S`` gives up, and it gives up
+#: with a sentence the user can act on.
+_llm_gate = BoundedGate(
+    limit=lambda: config.LLM_MAX_CONCURRENCY,
+    queue_timeout=lambda: config.LLM_QUEUE_TIMEOUT_S,
+)
+
+
+def llm_gate() -> BoundedGate:
+    """The process-wide gate. Exposed for ``/health`` and for tests."""
+    return _llm_gate
+
+
+@asynccontextmanager
+async def _gated() -> "AsyncIterator[None]":
+    """Hold one gate slot, translating a full queue into an honest failure."""
+    try:
+        async with _llm_gate:
+            yield
+    except QueueTimeout as exc:
+        raise AllModelsUnavailableError(
+            f"every model slot was busy: {exc}", kind="llm_queue_timeout"
+        ) from exc
 
 
 # Module-level singleton used by the agents.

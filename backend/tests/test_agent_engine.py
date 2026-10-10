@@ -32,6 +32,22 @@ from agents.events import AgentEvent, AgentEventType, EventBus, NullBus  # noqa:
 from tools.base import BaseTool, ToolResult  # noqa: E402
 from tools.registry import ToolRegistry  # noqa: E402
 from tools import sandbox  # noqa: E402
+from config import config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _model_path_only(monkeypatch):
+    """Keep the deterministic fast path out of the loop's tests.
+
+    `agents/fast_path.py` answers "what time is it" *before the engine runs*, which
+    is exactly its purpose — and it also means a test here that stubs `_ask` and
+    posts that prompt would silently be asserting nothing about the loop. Thirteen
+    cases did precisely that when the shortcut landed, which is the real reason
+    this fixture exists: not to make them pass, but to make them test what they
+    say they test. The shortcut has its own suite (`tests/test_fast_path.py`) that
+    enables it and asserts the opposite direction.
+    """
+    monkeypatch.setattr(config, "FAST_PATH_ENABLED", False)
 
 
 # ---------------------------------------------------------------------------

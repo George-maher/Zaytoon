@@ -50,9 +50,12 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from agents import fast_path
 from agents.events import EventBus, NullBus
+from config import config
 from common.audit import record as audit_record
 from common.reporting import safe_error
+from tools.safety import PERMISSION_SAFE
 from tools.metrics import (
     STATUS_DECLINED,
     STATUS_FAILED,
@@ -787,6 +790,22 @@ def tool_label(name: str, language: str = "en") -> str:
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
+#: The fast path's own sentences: short, bilingual, and never a claim that
+#: something worked when the tool said it did not.
+_FAST_PATH_DECLINED = {
+    "en": "That needs your approval, and it was not approved, so nothing was done.",
+    "ar": "الطلب ده كان محتاج موافقتك، ومفيش موافقة اتعملت، فمفيش حاجة اتنفذت.",
+}
+_FAST_PATH_FAILED = {
+    "en": "I ran that directly and it did not work",
+    "ar": "نفذته على طول ومبقاش شغال",
+}
+_FAST_PATH_EMPTY = {
+    "en": "It ran, and there was nothing to report back.",
+    "ar": "اتنفذ، ومفيش حاجة ترجعها.",
+}
+
+
 @dataclass
 class LoopResult:
     """Outcome of one agent turn."""
@@ -891,6 +910,15 @@ class AgentEngine:
         guessed value is never delivered.
         """
         bus = bus or NullBus()
+
+        # Deterministic short circuit (see `agents/fast_path.py`). Placed before
+        # the prompt is assembled — not after a first model call — because the
+        # thing saved *is* the model call.
+        fast = await self._fast_path(user_message, language, bus, approval,
+                                     response_id)
+        if fast is not None:
+            return fast
+
         catalogue = self._catalogue(language)
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": build_system_prompt(catalogue, language)}
@@ -1276,6 +1304,81 @@ class AgentEngine:
                 )
             index = end
         return outcomes
+
+    async def _fast_path(
+        self,
+        user_message: str,
+        language: str,
+        bus: EventBus,
+        approval: Optional[Callable[..., Any]],
+        response_id: str,
+    ) -> Optional[LoopResult]:
+        """One safe tool call, no model, when the message *is* that call.
+
+        ``None`` means "ask the model" — the ordinary outcome, and it preserves
+        today's behaviour for everything this does not recognise exactly.
+
+        There is no fall-through **after** execution. A tool that already ran must
+        be answered from its own result, because otherwise the model may call it
+        again and `open_app` launches twice: a duplicate side effect is worse than
+        a terse reply. So once the call is dispatched, its outcome — including an
+        error — is the answer.
+        """
+        if not config.FAST_PATH_ENABLED:
+            return None
+        matched = fast_path.match(user_message)
+        if matched is None:
+            return None
+        name, params = matched
+
+        # The registry decides, not this module. An unknown name, or a tool whose
+        # tier is no longer `safe`, is not answerable from here and goes back to
+        # the ordinary path before anything runs.
+        if not self.registry.has(name):
+            return None
+        tool = self.registry.get(name)
+        if getattr(tool, "permission", None) != PERMISSION_SAFE:
+            return None
+        if self._needs_approval(ToolCall(name=name, params=params)):
+            # The confirmation policy for this exact call is not "safe" — e.g. the
+            # user listed it in TOOL_ALWAYS_CONFIRM. Prompting from here would
+            # duplicate machinery the loop owns, and skipping it would answer
+            # without asking, so the turn goes back to the model.
+            return None
+
+        call = ToolCall(name=name, params=params, raw="<fast_path>")
+        outcome = await self._run_one(
+            call, approval, bus, language,
+            audit={"trace_id": response_id, "user_request": user_message},
+        )
+
+        if isinstance(outcome, str):
+            # The caller's gate declined. Nothing happened, and that is what gets
+            # said — in the user's language, because this reaches a screen.
+            text = _FAST_PATH_DECLINED.get(language) or _FAST_PATH_DECLINED["en"]
+        elif isinstance(outcome, dict) and outcome.get("success"):
+            text = fast_path.render(fast_path.intent_for(name), outcome, language)
+            if not text:
+                # Success with nothing to show is still success. Inventing a
+                # result is the bug this codebase is organised against.
+                text = _FAST_PATH_EMPTY.get(language) or _FAST_PATH_EMPTY["en"]
+        else:
+            error = ""
+            if isinstance(outcome, dict):
+                error = str(outcome.get("error") or outcome.get("output") or "").strip()
+            prefix = _FAST_PATH_FAILED.get(language) or _FAST_PATH_FAILED["en"]
+            text = f"{prefix}{(': ' + error) if error else ''}"
+
+        await bus.response_chunk(text, response_id=response_id)
+        await bus.completed(reason="fast_path", iterations=0)
+        ok = isinstance(outcome, dict) and bool(outcome.get("success"))
+        return LoopResult(
+            text=text,
+            iterations=0,
+            tool_calls=[name],
+            failed_calls=[] if ok else [name],
+            stopped_reason="fast_path",
+        )
 
     async def _run_one(
         self,

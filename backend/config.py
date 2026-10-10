@@ -327,6 +327,24 @@ class Config:
         """True when we have what we need to call OpenRouter at all."""
         return bool(self.OPENROUTER_API_KEY)
 
+    #: Model calls allowed to run at the same time, process-wide. This is not a
+    #: throughput knob: a local runtime getting *more* concurrent generations
+    #: gives every one of them a worse answer, or takes the daemon down. Raise it
+    #: only on a machine that provably has the memory for another context.
+    LLM_MAX_CONCURRENCY: int = _env_int("LLM_MAX_CONCURRENCY", 2)
+    #: How long a request waits for a slot before it is refused with an
+    #: explanation. Queueing is the normal case (two questions in one second is
+    #: ordinary use); refusing is the exception, and the ceiling exists so a wedged
+    #: generation cannot hold the whole assistant behind it forever.
+    LLM_QUEUE_TIMEOUT_S: float = _env_float("LLM_QUEUE_TIMEOUT_S", 45.0)
+
+    #: Answer a closed set of one-tool requests ("what time is it", "open spotify")
+    #: without a model call. Off, every such turn goes through the LLM exactly as
+    #: it always did — the path only removes a round trip, so the flag is a
+    #: behaviour switch for debugging, not a safety switch: the registry tier and
+    #: the confirmation gate are re-checked before anything runs.
+    FAST_PATH_ENABLED: bool = _env_bool("FAST_PATH_ENABLED", True)
+
     #: How stale the cached provider probe in ``services/provider_health`` may
     #: be before ``/health`` re-probes. The UI and the desktop supervisor poll this
     #: endpoint, so a short TTL bounds staleness while keeping the daemon off the

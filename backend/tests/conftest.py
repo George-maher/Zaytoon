@@ -63,26 +63,55 @@ def _isolated_core_db(monkeypatch, tmp_path):
     monkeypatch.setenv("CORE_DB_PATH", str(tmp_path / "core.db"))
 
 
+#: Every `MemoryAgent` built during a test run, weakly. Populated by the
+#: `__init__` wrapper below rather than by scanning `gc.get_objects()` per test —
+#: that version worked, and also nearly doubled the suite (92 s → 174 s), which is
+#: how a hygiene fixture becomes the slowest thing in the build.
+import weakref  # noqa: E402
+
+_LIVE_AGENTS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _track_memory_agents() -> None:
+    """Record agents as they are constructed, without touching production code.
+
+    Only `__init__` is wrapped: the class is created at import time by
+    ``api.main`` and by some tests directly, and every one of them owns an
+    aiosqlite connection plus its worker thread.
+    """
+    from agents.memory_agent import MemoryAgent
+
+    if getattr(MemoryAgent.__init__, "_zaytoon_tracked", False):
+        return
+    original = MemoryAgent.__init__
+
+    def __init__(self, *args, **kwargs):  # noqa: ANN001, N805
+        original(self, *args, **kwargs)
+        _LIVE_AGENTS.add(self)
+
+    __init__._zaytoon_tracked = True  # noqa: SLF001
+    MemoryAgent.__init__ = __init__
+
+
+_track_memory_agents()
+
+
 @pytest.fixture(autouse=True)
 async def _close_import_time_memory_agent():
-    """Close the agent `api.main` built at import time, before its loop dies.
+    """Close every live `MemoryAgent` before its event loop dies.
 
-    ``api.main`` constructs ``MemoryAgent()`` at module scope, so one aiosqlite
-    connection and its worker thread outlive whichever test happened to use it.
-    When that thread finishes a statement after the owning event loop is closed,
-    aiosqlite reports ``RuntimeError: Event loop is closed`` *inside the worker
-    thread* — attributed to whatever test the garbage collector happened to run
-    in, and immune to every fix made in the code that actually leaked. The app's
-    own lifespan now closes this agent too; this fixture keeps the test suite's
-    loops from being the thing that trips over it.
+    ``api.main`` constructs one at module scope, so an aiosqlite connection and
+    its worker thread outlive whichever test happened to use it. When that thread
+    finishes a statement after the owning loop is closed, aiosqlite reports
+    ``RuntimeError: Event loop is closed`` *inside the worker thread* — attributed
+    to whatever test the collector happened to run in, and immune to any fix made
+    in the code that actually leaked. The app's own lifespan closes this agent
+    too; this fixture keeps the *suite's* loops from tripping over it.
 
-    Skipped when `api.main` was never imported, so unit tests do not pay for a
-    FastAPI import they deliberately avoid.
+    Safe to run unconditionally: `_get_db()` reconnects on demand, so closing
+    here can never break a later test.
     """
     yield
-    import sys
-
-    module = sys.modules.get("api.main")
-    agent = getattr(module, "memory_agent", None) if module else None
-    if agent is not None and getattr(agent, "_db", None) is not None:
-        await agent.close()
+    for agent in list(_LIVE_AGENTS):
+        if getattr(agent, "_db", None) is not None:
+            await agent.close()
