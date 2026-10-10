@@ -11,9 +11,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import AICore from "./components/hud/AICore";
-import StatusIndicator from "./components/hud/StatusIndicator";
-import { STATES, resolveState } from "./components/hud/hudState";
+import AICore from "./components/HUD/AICore";
+import StatusIndicator from "./components/HUD/StatusIndicator";
+import { STATES, resolveState } from "./components/HUD/hudState";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, "styles/theme.css"), "utf8");

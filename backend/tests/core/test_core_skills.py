@@ -10,6 +10,7 @@ from core.skills import (
     ManifestError,
     SkillExists,
     SkillLimitExceeded,
+    SkillOutsideRoot,
     build_skill_context,
     create,
     discover,
@@ -351,9 +352,17 @@ class TestRemove:
         os.makedirs(outside)
         open(os.path.join(outside, "precious.txt"), "w").close()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(SkillOutsideRoot):
             remove("../outside", root=temp_skills_dir)
         assert os.path.isfile(os.path.join(outside, "precious.txt"))
+
+    def test_a_refusal_is_not_the_same_answer_as_a_missing_skill(self, temp_skills_dir):
+        # 403 and 404 are different UI states: one says "stop", the other says
+        # "nothing there". Returning False for both, or raising for both, would
+        # let the panel offer a retry where there is nothing to retry.
+        assert remove("absent", root=temp_skills_dir) is False
+        with pytest.raises(SkillOutsideRoot):
+            remove("../absent", root=temp_skills_dir)
 
     def test_remove_handles_a_symlink_without_following_it(self, temp_skills_dir, tmp_path):
         outside = os.path.join(str(tmp_path), "outside")
@@ -365,7 +374,29 @@ class TestRemove:
             pytest.skip("symlinks unavailable on this platform")
 
         assert remove("linked", root=temp_skills_dir) is True
-        assert os.path.isdir(outside), "rmtree followed the symlink"
+        assert os.path.isdir(outside), "the link target must survive its removal"
+        assert not os.path.lexists(link), "the link itself must go"
+
+    def test_a_symlink_inside_the_root_is_still_deletable(self, temp_skills_dir):
+        """Containment is a lexical decision, so an alias never locks a skill.
+
+        Resolving with realpath *before* the containment check was the bug: a
+        skill directory reached through a link resolved outside the root, the
+        check refused it, and the user could no longer delete it — a security
+        control that locked its own owner out. The link is removed as a link;
+        whatever it points at is left alone.
+        """
+        inside = os.path.join(temp_skills_dir, "real")
+        os.makedirs(inside)
+        open(os.path.join(inside, "skill.json"), "w").close()
+        link = os.path.join(temp_skills_dir, "aliased")
+        try:
+            os.symlink(inside, link, target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - no symlinks
+            pytest.skip("symlinks unavailable on this platform")
+
+        assert remove("aliased", root=temp_skills_dir) is True
+        assert os.path.isdir(inside), "removing an alias deleted the skill"
 
 
 class TestSkillContext:

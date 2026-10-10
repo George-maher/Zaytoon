@@ -66,6 +66,7 @@ from services.completion_validator import (
     contract_from_registry,
 )
 from tools.registry import ToolRegistry
+from services.llm_client import user_notice
 
 logger = logging.getLogger("Zaytoon.AgentEngine")
 
@@ -811,6 +812,11 @@ class AgentEngine:
     tools until the request is satisfied, and returns.
     """
 
+    #: The provider exception behind the most recent failed `_ask`, if any.
+    #: A class default so the attribute always exists, even in a subclass that
+    #: does not call `__init__`; the instance value is set per turn.
+    last_llm_error: Optional[BaseException] = None
+
     def __init__(
         self,
         llm: Any,
@@ -818,6 +824,9 @@ class AgentEngine:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         metrics: Optional[Any] = None,
     ) -> None:
+        #: The exception behind the most recent failed `_ask`, if any. Per-turn
+        #: state on a per-turn object; see the comment in `_ask`.
+        self.last_llm_error = None
         self.llm = llm
         self.registry = registry
         self.max_iterations = max(1, int(max_iterations))
@@ -923,13 +932,20 @@ class AgentEngine:
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
             if raw is None:
-                # Every compatible free model was rate-limited or produced a
-                # completion that failed validation. Report that, and nothing
-                # else -- never the last invalid text.
-                message = _ALL_MODELS_FAILED.get(
+                # No model could answer. Report that, and nothing else -- never
+                # the last invalid text.
+                #
+                # "Free models" is only the truth for the OpenRouter path, and a
+                # user whose `ollama serve` is stopped does not need to "try
+                # again in a moment": they need the command that fixes it. The
+                # client already knows which of those it is, so ask it, and fall
+                # back to the generic notice when it has nothing better to say.
+                message = user_notice(self.last_llm_error, language) or _ALL_MODELS_FAILED.get(
                     language, _ALL_MODELS_FAILED["en"]
                 )
-                errors.append("every compatible free model failed")
+                errors.append(
+                    str(getattr(self.last_llm_error, "kind", "pool_exhausted"))
+                )
                 await bus.error(message)
                 await bus.response_chunk(message, response_id=response_id)
                 await bus.completed(reason="llm_unavailable", iterations=iteration)
@@ -1173,6 +1189,7 @@ class AgentEngine:
         the budget is exhausted we get ``None`` and the loop reports that
         honestly rather than passing along the last invalid text.
         """
+        self.last_llm_error = None
         try:
             return await self.llm.complete(
                 messages,
@@ -1188,7 +1205,12 @@ class AgentEngine:
             # One structured line, no traceback in the return value: `None`
             # already means "no model could answer", and the loop reports that
             # honestly rather than echoing an exception at the user.
+            #
+            # The exception itself is kept on the instance (never returned) so
+            # the caller can name the *reason*. `AgentEngine` is built per turn
+            # (see `agents/tool_agent.py`), so this cannot leak between users.
             safe_error(e, operation="llm.complete", component="agents.engine")
+            self.last_llm_error = e
             return None
 
     async def _run_batch(

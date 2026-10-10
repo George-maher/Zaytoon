@@ -132,7 +132,16 @@ def is_allowed_model(model: str) -> bool:
     return is_allowlisted(model)
 
 
-# The single supported provider. Local model execution has been removed.
+#: The supported providers. **Ollama is the default** (local, no key); OpenRouter
+#: is the optional cloud path. Which one runs is decided once, here, and no path
+#: ever falls back into the other implicitly — a local-only install must not
+#: start making cloud calls because a daemon is down, and a cloud install must
+#: not start running weights on the user's machine because a request was rate
+#: limited. (This comment used to claim local execution "has been removed", with
+#: `AI_PROVIDER` defaulting to `ollama` four lines below it. The README and a CI
+#: guard repeated the claim. Whichever way the product moves, the code, the docs
+#: and the guard have to say the same thing — that is what the guard below is
+#: for now.)
 PROVIDER_OPENROUTER = "openrouter"
 PROVIDER_OLLAMA = "ollama"
 VALID_PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_OLLAMA)

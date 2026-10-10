@@ -1,8 +1,17 @@
-"""OpenRouter client: FREE-only, capability-routed, contract-validated.
+"""The one LLM entry point: FREE-only for the cloud path, contract-validated.
 
-Every request goes to OpenRouter's OpenAI-compatible endpoint
-``https://openrouter.ai/api/v1/chat/completions``. There is no local fallback
-and there never was one — the free tier is the whole cost model.
+Every agent goes through :class:`LLMClient`. Which transport answers is decided
+once by ``AI_PROVIDER``: **Ollama by default** (local, no key), OpenRouter as
+the optional cloud path. Both share the same attempt budget, the same
+``AttemptRecord`` log line and the same completion contract, so a model that
+behaves differently per transport is visible rather than structural.
+
+The OpenRouter path is what the free-only policy governs: its requests go to
+``https://openrouter.ai/api/v1/chat/completions`` and the free tier is the whole
+cost model there. **There is no fallback between providers** — a local install
+with a stopped daemon must never start making cloud calls, and a rate-limited
+cloud call must never start running weights on the user's machine. Degradation is
+a reported failure, not a silent switch.
 
 Four guarantees are enforced here, in this order:
 
@@ -99,10 +108,26 @@ class LLMResponseError(LLMError):
 
 
 class AllModelsUnavailableError(LLMError):
-    """Every compatible free model failed. The user gets a controlled message.
+    """Every compatible model failed. The user gets a controlled message.
 
     Never a fabricated answer and never the last invalid completion.
+
+    `kind` exists so a caller can *react* to the reason instead of pattern-
+    matching the sentence. The engine used to replace whatever this exception
+    said with one generic "all available free AI models are temporarily
+    unavailable" notice — which told a user with a stopped `ollama serve` to
+    wait a moment for a cloud rate limit that had not happened. The actionable
+    text was already here; it was being thrown away one layer up.
     """
+
+    def __init__(
+        self, message: str, attempts: Optional[List["AttemptRecord"]] = None,
+        kind: str = "pool_exhausted",
+    ) -> None:
+        super().__init__(message, attempts)
+        #: provider_unreachable | model_missing | provider_unconfigured |
+        #: local_model_failed | pool_exhausted
+        self.kind = kind
 
 
 @dataclass
@@ -496,10 +521,11 @@ class LLMClient:
         """
         if not config.llm_configured:
             raise LLMError(
-                "OPENROUTER_API_KEY is not set. Zaytoon calls OpenRouter only "
-                "(local model execution has been removed); set the key in "
-                "backend/.env."
-            )
+                "AI_PROVIDER=openrouter requires OPENROUTER_API_KEY; set it in "
+                "backend/.env, or switch back to the local runtime with "
+                "AI_PROVIDER=ollama. Zaytoon will not fall between providers on "
+                "its own."
+            ) from None
 
         tier = tier if tier in (TIER_FAST, TIER_REASONING, TIER_FALLBACK) else TIER_FAST
         pool = config.model_pool(tier)
@@ -1081,6 +1107,7 @@ class LLMClient:
                         f"`ollama pull {model}` and try again "
                         "(Zaytoon never downloads models on its own).",
                         attempts,
+                        kind="model_missing",
                     ) from e
                 record = AttemptRecord(
                     label, "ollama", model, self._classify_status(status),
@@ -1175,11 +1202,14 @@ class LLMClient:
             return content
 
         if not reachable and attempts and attempts[0].outcome == "connect_error":
-            raise AllModelsUnavailableError(attempts[0].detail, attempts)
+            raise AllModelsUnavailableError(
+                attempts[0].detail, attempts, kind="provider_unreachable"
+            )
         raise AllModelsUnavailableError(
             f"Local model {model!r} failed "
             f"({len(attempts)} attempts): {self._summarise(attempts)}",
             attempts,
+            kind="local_model_failed",
         )
 
     async def _stream_ollama(
@@ -1343,11 +1373,14 @@ class LLMClient:
             return full
 
         if not reachable and attempts and attempts[0].outcome == "connect_error":
-            raise AllModelsUnavailableError(attempts[0].detail, attempts)
+            raise AllModelsUnavailableError(
+                attempts[0].detail, attempts, kind="provider_unreachable"
+            )
         raise AllModelsUnavailableError(
             f"Local model {model!r} failed while streaming "
             f"({len(attempts)} attempts): {self._summarise(attempts)}",
             attempts,
+            kind="local_model_failed",
         )
 
     async def complete(
@@ -1582,6 +1615,7 @@ class LLMClient:
         raise AllModelsUnavailableError(
             f"All compatible free models failed ({len(attempts)} attempts): {verdict}",
             attempts,
+            kind="pool_exhausted",
         )
 
     @staticmethod
@@ -1878,7 +1912,54 @@ class LLMClient:
             f"All compatible free models failed while streaming "
             f"({len(attempts)} attempts): {self._summarise(attempts)}",
             attempts,
+            kind="pool_exhausted",
         )
+
+
+#: What to tell the user, per failure kind. The provider's own detail is
+#: appended when it exists — it already names the command to run, and a
+#: paraphrase would be worse than the quotation.
+_USER_NOTICES: Dict[str, Dict[str, str]] = {
+    "provider_unreachable": {
+        "en": "The local model provider is not running.",
+        "ar": "الموديل المحلي مش شغال.",
+    },
+    "model_missing": {
+        "en": "The model this request needs is not installed locally.",
+        "ar": "الموديل المطلوب مش متسطب على الجهاز.",
+    },
+    "local_model_failed": {
+        "en": "The local model could not complete this request.",
+        "ar": "الموديل المحلي مقدرش يكمّل الطلب ده.",
+    },
+    "provider_unconfigured": {
+        "en": "No AI provider is configured.",
+        "ar": "مفيش مزوّد ذكاء اصطناعي متفعّل.",
+    },
+}
+
+
+def user_notice(exc: Optional[BaseException], language: str = "en") -> Optional[str]:
+    """A bilingual, actionable sentence for a provider failure — or ``None``.
+
+    ``None`` means "nothing better to say than the caller's own generic notice",
+    which keeps the pool-exhausted path (every free model rate-limited or
+    answering invalid) exactly as it was worded. The point of this function is
+    narrower: a stopped daemon, a missing model and a missing key are each
+    fixable by the user in one command, and telling them to "try again in a
+    moment" for those is not a diagnosis, it is a deferral.
+    """
+    kind = getattr(exc, "kind", None)
+    if kind not in _USER_NOTICES or kind == "pool_exhausted":
+        return None
+    text = _USER_NOTICES[kind].get(language) or _USER_NOTICES[kind]["en"]
+    detail = str(exc or "").strip()
+    if detail:
+        # The provider detail is ours, not upstream's body: every raise site
+        # composes it from config plus the exception type. No credential can be
+        # in it, and `redact` has already run on the way to the log.
+        text = f"{text} {detail}"
+    return text
 
 
 # Module-level singleton used by the agents.

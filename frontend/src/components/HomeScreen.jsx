@@ -2,9 +2,9 @@ import { memo, useCallback, useEffect, useState } from "react";
 import { desktop } from "../lib/desktop";
 import * as api from "../lib/api";
 import InputBar from "./InputBar";
-import StatusIndicator from "./hud/StatusIndicator";
-import AIPresence from "./hud/AIPresence";
-import { resolveState } from "./hud/hudState";
+import StatusIndicator from "./HUD/StatusIndicator";
+import AIPresence from "./HUD/AIPresence";
+import { resolveState } from "./HUD/hudState";
 
 /**
  * HomeScreen — the first screen.

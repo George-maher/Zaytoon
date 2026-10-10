@@ -7,6 +7,7 @@ nothing exercised the route.
 """
 
 import os
+import shutil
 import sys
 
 import pytest
@@ -120,6 +121,24 @@ class TestToolsEndpoint:
 
 
 class TestWorkspaceEndpoint:
+    """The root is the containment boundary of every file tool.
+
+    Two properties are worth pinning: a path that cannot be used is *refused*
+    (the UI must never show a workspace the tools are not using), and a path
+    that *is* accepted comes back after a restart — which is the half that was
+    missing, and the reason these assertions live next to the endpoint rather
+    than only in a unit test of the service.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_the_root(self):
+        """These tests move a process-global; put it back afterwards."""
+        from config import config
+
+        before = config.WORKSPACE_ROOT
+        yield
+        config.WORKSPACE_ROOT = before
+
     def test_get_reports_the_current_root(self, client):
         body = client.get("/settings/workspace").json()
         assert body["root"]
@@ -129,10 +148,92 @@ class TestWorkspaceEndpoint:
         response = client.post("/settings/workspace", json={"root": ""})
         assert response.status_code == 400
 
-    def test_post_rejects_an_unusable_path(self, client):
+    def test_post_rejects_a_relative_path(self, client):
+        # `X:/no/such/drive` is a missing drive in cmd.exe and an ordinary
+        # *relative* path on POSIX, where the old handler mkdir'd it inside the
+        # source tree and answered 200. "Absolute or refused" is the same rule
+        # on every OS, which is the only reason this case is testable here.
         response = client.post("/settings/workspace", json={"root": "X:/no/such/drive"})
         assert response.status_code == 400
-        assert "error" in response.json()
+        assert "absolute" in response.json()["error"].lower()
+
+    def test_post_rejects_a_path_that_cannot_be_a_directory(self, client, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("occupied", encoding="utf-8")
+        response = client.post(
+            "/settings/workspace", json={"root": str(blocker / "sub")}
+        )
+        assert response.status_code == 400
+
+    def test_post_accepts_an_existing_directory(self, client, tmp_path):
+        from config import config
+
+        chosen = tmp_path / "project"
+        chosen.mkdir()
+        response = client.post("/settings/workspace", json={"root": str(chosen)})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["root"] == str(chosen.resolve())
+        # Nothing was created, so there is nothing to mention.
+        assert body["note"] == ""
+        assert body["persisted"] is True
+        assert config.WORKSPACE_ROOT == str(chosen.resolve())
+
+    def test_post_creates_a_missing_directory_and_says_so(self, client, tmp_path):
+        response = client.post(
+            "/settings/workspace", json={"root": str(tmp_path / "new" / "deeper")}
+        )
+        assert response.status_code == 200
+        assert response.json()["note"] == "created"
+
+    @pytest.mark.parametrize("key", ["root", "path"])
+    def test_both_request_keys_are_accepted(self, client, tmp_path, key):
+        chosen = tmp_path / f"via-{key}"
+        chosen.mkdir()
+        response = client.post("/settings/workspace", json={key: str(chosen)})
+        assert response.status_code == 200
+
+    async def test_a_saved_root_survives_a_restart(self, client, tmp_path):
+        """The regression: the endpoint persisted the choice and nothing read it.
+
+        ``config.WORKSPACE_ROOT`` came from the environment only, so after a
+        restart every file tool was confined to the *default* directory while
+        the user believed they had pointed Zaytoon at their project.
+        """
+        from config import config
+        from services import workspace_settings
+
+        chosen = tmp_path / "my-project"
+        chosen.mkdir()
+        assert client.post(
+            "/settings/workspace", json={"root": str(chosen)}
+        ).status_code == 200
+
+        # Simulate a fresh process: the environment's answer is back.
+        config.WORKSPACE_ROOT = str(tmp_path / "default")
+        assert await workspace_settings.restore(main_module.user_prefs)
+        assert config.WORKSPACE_ROOT == str(chosen.resolve())
+
+    async def test_a_saved_root_that_vanished_warns_instead_of_failing(
+        self, client, tmp_path
+    ):
+        """A missing drive must not stop the backend from booting."""
+        from config import config
+        from services import workspace_settings
+
+        gone = tmp_path / "usb" / "project"
+        gone.mkdir(parents=True)
+        assert client.post(
+            "/settings/workspace", json={"root": str(gone)}
+        ).status_code == 200
+        shutil.rmtree(tmp_path / "usb")
+
+        config.WORKSPACE_ROOT = str(tmp_path / "default")
+        note = await workspace_settings.restore(main_module.user_prefs)
+        assert note and note.startswith("ignored")
+        # The configured default survives, so /health and the settings screen
+        # stay reachable and the user can pick a new folder.
+        assert config.WORKSPACE_ROOT == str(tmp_path / "default")
 
 
 class TestReminderRoutes:

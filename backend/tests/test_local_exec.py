@@ -212,12 +212,16 @@ class TestStructuredResult:
             )
         )
         assert result["success"] is False
-        assert "exit=1" in result["error"]
+        # The contract is "the exit code the process actually returned is echoed
+        # into the error text", not "that code is 1": `dir nope…` exits 1 in
+        # cmd.exe while GNU `ls` exits 2. Pinning the number tested the OS.
+        code = result["data"]["exit_code"]
+        assert code != 0
+        assert f"exit={code} in" in result["error"]
         # The model only sees `error` on failure, so the diagnostic has to live
         # there — a failing test whose output stayed in `output` would be
         # invisible to the agent.
         assert result["error"] == result["output"]
-        assert result["data"]["exit_code"] == 1
 
     def test_timeout_is_reported_and_output_is_kept(self, registry, workspace):
         result = asyncio.run(

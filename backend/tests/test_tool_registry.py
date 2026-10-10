@@ -411,13 +411,33 @@ class TestFilesystemTools:
         assert result["data"]["count"] == 10
         assert result["data"]["truncated"] is True
 
-    def test_every_escape_attempt_is_blocked(self, registry):
+    def test_every_escape_attempt_is_blocked(self, registry, workspace):
+        """No escape attempt may end up reading something outside the workspace.
+
+        The assertion is about the outcome, not the mechanism.
+        ``C:/Windows/…`` is an absolute path in Windows and a perfectly ordinary
+        *relative* name on POSIX — a directory literally called ``C:`` — so on
+        Linux the honest question is not "was it refused?" but "did it stay
+        inside the root?". Asserting `blocked` everywhere tested the shape of
+        the string, and reported a containment bug on a machine where the
+        containment was correct.
+        """
         for path in (
             "../outside.txt", "../../etc/passwd", "a/../../b",
             "C:/Windows/System32/drivers/etc/hosts", "~/secret",
         ):
             result = asyncio.run(registry.execute("file_read", {"path": path}))
-            assert result.get("blocked") is True, path
+            if os.name == "nt":
+                # Every one of these is an escape on Windows, including the
+                # drive-absolute one, and `file_read` is tier `safe` so the only
+                # possible refusal is the sandbox's.
+                assert result.get("blocked") is True, path
+                continue
+            if result.get("blocked"):
+                continue
+            resolved = sandbox.resolve_workspace(path, str(workspace))
+            assert resolved, f"{path} was neither refused nor resolved"
+            assert os.path.commonpath([resolved, str(workspace)]) == str(workspace), path
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,7 @@ backend/
 ├── scripts/verify_tool_capability.py # Re-probe the supports_tools claim
 ├── domain/models.py        # Enums (Intent, Language, AgentType), dataclasses,
 │                           #   TokenBucketRateLimiter, SessionState, SpokenSentenceTracker
-├── common/exceptions.py    # ZaytoonError hierarchy
+├── common/reporting.py     # the failure vocabulary: redact / safe_error / client_error
 ├── common/reporting.py     # redact() / safe_error() / client_error()
 ├── common/audit.py         # execution_audit table + recent/count/clear
 ├── scheduler/              # TimeParser, SchedulerManager
@@ -84,7 +84,7 @@ backend/
 │   ├── providers/          # capabilities | store | client | router
 │   ├── workspace/          # files (service) | terminal | git (service)
 │   └── api/                # tasks | projects | files | git | registry routers
-├── tests/                  # 45 test files (16 of them tests/core/), pytest-asyncio
+├── tests/                  # 48 test files (19 of them tests/core/), pytest-asyncio
 ├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
 ├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
 ├── scripts/verify_execution.py    # Live probe: tools, audit, dedupe, processes
@@ -93,8 +93,8 @@ backend/
     data/core.db            # Core runtime (a THIRD file — see below)
 frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
-├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
-│                           #   StatusDot, SystemMonitor, ReminderPanel, ConfirmationDialog
+├── components/             # ChatMessage, MessageList, InputBar, SystemMonitor,
+│                           #   ReminderPanel, ConfirmationDialog, HUD/, workspace/
 │   ├── Chat/ActivityFeed.jsx  # Agent progress: plan + tool_started/finished log
 │   └── SettingsPanel.jsx   # workspace root, API key, model chain, LLM metrics
 └── styles/index.css        # Tailwind + CSS vars + animations
@@ -628,7 +628,7 @@ half-installed system.
 ## Tests
 
 ```bash
-# backend (2307 tests)
+# backend (2,300+ tests; ~95 s)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
@@ -637,7 +637,7 @@ cd backend
 cd desktop
 ..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# frontend (376 tests + lint + build)
+# frontend (607 tests + lint + build)
 cd frontend
 npm run verify          # lint && test && build
 ```
@@ -660,7 +660,8 @@ npm run verify          # lint && test && build
 > assertion passed only because the test double's `__repr__` contained its
 > name. Everything downstream was broken and nothing noticed. The replacement
 > asserts `"bound method" not in catalogue` and runs against the real
-> 30-tool registry, because a double that can make a broken thing look fine is
+> the real 36-tool registry, because a double that can make a broken thing
+> look fine is
 > worse than no double. Run the app.
 - `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
   and an exploding HTTP client proving no request is attempted for a billable model.
@@ -708,8 +709,9 @@ npm run verify          # lint && test && build
   - `test_core_db.py`, `test_core_secrets.py`, `test_core_events.py`,
     `test_core_tasks.py`, `test_task_graph.py`, `test_core_projects.py`,
     `test_core_skills.py`, `test_core_providers.py`, `test_core_workspace.py`,
-    `test_core_terminal.py`, `test_api_core.py`, `test_api_providers.py`,
-    `test_api_tasks.py`, `test_api_workspace.py`.
+    `test_core_terminal.py`, `test_api_core.py` (files, projects, terminal,
+    tasks, reminders, providers, models — one file because they share the app
+    fixture and the unified `{error}` shape assertions).
 - `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
   the seam both the browser app and the desktop shell depend on.
 - `python scripts/verify_final.py` — live smoke check of all three areas. It is
@@ -766,15 +768,21 @@ React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
   the exact parameters. The `<pre>` block is `dir="ltr"` so an RTL UI cannot
   reorder a command the user is approving.
 
-### Orphaned components (resolved in Increment 1.5)
+### Orphaned components (resolved; the list is now empty)
 
 Eight root-level components existed but were imported nowhere, which is why the
 app had **no text input at all** and no reminders UI. `InputBar`,
-`ReminderPanel` and `SystemMonitor` are now wired. Still orphaned, pending
-deletion or adoption: `ChatInterface.jsx` and `VoiceControls.jsx` (both 0
-bytes), `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
-`useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css`.
-These are the remaining ESLint warnings.
+`ReminderPanel` and `SystemMonitor` are wired. The rest — `ChatInterface.jsx`,
+`VoiceControls.jsx`, `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
+`useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css` —
+were deleted, so `npm run lint` reports zero warnings. That is what makes a new
+warning mean something.
+
+Import **casing** is a portability matter here, not a style one: the HUD
+components live in `components/HUD/`, and a `components/hud/...` specifier
+resolves on Windows and fails to build on Linux.
+`src/imports.case.test.js` asserts exact casing for every relative import,
+because the build that mattered was the one nobody ran.
 
 ## Workspace (file-tool containment)
 

@@ -34,6 +34,7 @@ from core.skills import (
     ManifestError,
     SkillExists,
     SkillLimitExceeded,
+    SkillOutsideRoot,
     create,
     install,
     list_skills,
@@ -133,7 +134,11 @@ async def skill_delete(name: str) -> Dict[str, Any]:
     """Remove an installed skill. The registry refuses paths outside the root."""
     try:
         removed = remove(name)
-    except ValueError as exc:
+    except SkillOutsideRoot as exc:
+        # A named exception, because "not yours to delete" and "the caller sent
+        # something malformed" are different answers. Catching every ValueError
+        # and calling it 403 turned a caller bug into a permission decision the
+        # user cannot retry.
         raise HTTPException(403, str(exc)) from exc
     if not removed:
         raise HTTPException(404, f"No such skill: {name}")

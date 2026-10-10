@@ -12,8 +12,8 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend tests (py${{ matrix.python-version }})
-    runs-on: windows-latest   # the OS tools are Windows-specific
+    name: Backend tests (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: backend
@@ -22,6 +22,12 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
+        # Windows is the primary target and the OS tools are Windows-specific,
+        # but the product ships `install.sh`, a Linux Docker image and a pywebview
+        # WebKit host, so POSIX is supported and must not regress silently. The
+        # platform-dependent assertions are scoped in the tests themselves
+        # (skipif), not by skipping a whole OS here.
+        os: [windows-latest, ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +46,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Guard: the free-only policy must never be relaxed
+      - name: "Guard: the free-only policy must never be relaxed"
         run: |
           python -c "
           from config import config, ALLOWED_FREE_MODELS
@@ -49,23 +55,39 @@ jobs:
           print('allow-list:', sorted(ALLOWED_FREE_MODELS))
           "
 
-      - name: Guard: local model execution must stay removed
+      # The product decision (2026-10-10): Ollama is the primary provider and
+      # OpenRouter is optional. The guard that stood here asserted the *opposite*
+      # ("local model execution must stay removed") and so failed on every push to
+      # main, because config.py has made ollama the default. What actually needs
+      # protecting is not the absence of local execution — it is that a turn can
+      # never drift from one provider into the other without being told to.
+      - name: "Guard: local-first providers and no implicit fallback"
         run: |
           python -c "
-          from config import config
-          banned = [a for a in ('OLLAMA_BASE_URL','OLLAMA_MODEL','OLLAMA_FALLBACK_MODEL','PRIMARY_PROVIDER') if hasattr(config, a)]
-          assert not banned, f'local-model config reintroduced: {banned}'
-          print('no local-model configuration present')
+          from config import config, PROVIDER_OLLAMA, PROVIDER_OPENROUTER, VALID_PROVIDERS
+          assert config.PROVIDER == PROVIDER_OLLAMA, f'default provider moved to {config.PROVIDER!r}; local-first is the product decision'
+          assert VALID_PROVIDERS == (PROVIDER_OPENROUTER, PROVIDER_OLLAMA)
+          for tier in ('general', 'reasoning', 'fast'):
+              assert config.ollama_model_for_tier(tier), f'ollama {tier} tier has no model'
+          # Nothing may be downloaded on the app's own initiative: the config
+          # module in particular must not be able to run anything.
+          import pathlib as _p
+          assert 'subprocess' not in _p.Path('config.py').read_text(), 'config.py must not shell out'
+          print('provider=ollama by default, three tiers configured, no auto-download')
           "
 
       # A malformed requirements.txt does not fail locally (the venv already
       # has everything installed) but breaks `docker compose build`. Validate it
       # against a clean resolver.
-      - name: Guard: requirements files are pip-parseable
+      - name: "Guard: requirements files are pip-parseable"
         run: |
           python -m pytest tests/test_packaging.py -q
 
       - name: Build the backend image
+        # Linux only: the image is built FROM python:3.11-slim, and a Windows
+        # runner has no Linux daemon — a step that cannot succeed on half the
+        # matrix turns a real regression into a red X nobody reads.
+        if: matrix.os == 'ubuntu-latest'
         working-directory: .
         run: docker compose build backend
 
@@ -77,6 +99,10 @@ jobs:
 
   frontend:
     name: Frontend lint / test / build
+    # Ubuntu, deliberately: a relative import whose casing disagrees with the
+    # directory (`components/hud` for a folder named `components/HUD`) builds on
+    # Windows and fails here. `src/imports.case.test.js` asserts exact casing so
+    # it cannot come back quietly.
     runs-on: ubuntu-latest
     defaults:
       run:

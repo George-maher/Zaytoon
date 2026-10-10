@@ -62,9 +62,23 @@ def run(args, cwd, **env):
 
 @pytest.fixture
 def repo(temp_workspace):
-    """A real repository with one commit and a known file."""
+    """A real repository with one commit and a known file.
+
+    The identity is written into the repository's own config, not only into the
+    test's environment. `run()` above can pass `GIT_AUTHOR_*`, but the *service*
+    builds its own `git commit` argv and inherits the process environment — so a
+    machine with no global `user.email` (a fresh container, CI, a second
+    developer) failed every commit here with "Author identity unknown", and the
+    suite reported that as a product bug. A real working tree always has an
+    identity; a hermetic fixture has to provide one too.
+
+    The product must not supply it: injecting `-c user.name=...` into a commit
+    would attribute the user's work to Zaytoon.
+    """
     root = as_path(temp_workspace)
     run(["git", "init", "-q"], root)
+    run(["git", "config", "user.name", "Test"], root)
+    run(["git", "config", "user.email", "test@example.com"], root)
     (root / "readme.md").write_text("hello\n", encoding="utf-8")
     run(["git", "add", "readme.md"], root)
     run(["git", "commit", "-q", "-m", "first commit"], root)

@@ -1,5 +1,19 @@
 """Shared test fixtures.
 
+**Nothing here touches a real Zaytoon install.** Three SQLite files sit under
+``backend/data`` and each one is live state, not scratch: ``zaytoon.db`` holds the
+memory and *preference* rows the app reads back, ``audit.db`` is the execution
+history the UI displays, and ``core.db`` is the task/project/skill/provider
+registry. Importing ``api.main`` constructs a module-level ``MemoryAgent`` that
+binds to ``./data/zaytoon.db``, so a test posting a preference wrote into the
+developer's running assistant — and a ``pytest`` run against a live backend
+lands in ``database is locked`` while the user is using it.
+
+The redirect happens at *import* time rather than in a fixture because that
+module-level agent is built when ``api.main`` is first imported, which is before
+any fixture runs. ``tests/core/test_core_paths.py`` deletes these variables for
+its own assertions, so the layout rules stay testable on their real defaults.
+
 The suite predates multi-provider support: the routing, free-model and
 contract tests all exercise the *OpenRouter* chain, so they pin the provider
 explicitly rather than depending on the ambient default (Ollama). Tests that
@@ -7,9 +21,23 @@ cover the local path opt in by setting ``config.PROVIDER = "ollama"``
 themselves (see ``test_ollama_provider.py``).
 """
 
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from config import PROVIDER_OPENROUTER, config
+
+#: Removed wholesale in `pytest_unconfigure`; a run leaves no state behind.
+_ISOLATED_HOME = Path(tempfile.mkdtemp(prefix="zaytoon-tests-"))
+os.environ["ZAYTOON_DATA_DIR"] = str(_ISOLATED_HOME)
+os.environ["DATABASE_URL"] = f"sqlite:///{_ISOLATED_HOME / 'zaytoon.db'}"
+
+
+def pytest_unconfigure(*_args):
+    shutil.rmtree(_ISOLATED_HOME, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)

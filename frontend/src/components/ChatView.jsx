@@ -3,8 +3,8 @@ import ChatMessage from "./ChatMessage";
 import InputBar from "./InputBar";
 import ActivityFeed from "./Chat/ActivityFeed";
 import StatusLine from "./StatusLine";
-import AIPresence from "./hud/AIPresence";
-import { resolveState } from "./hud/hudState";
+import AIPresence from "./HUD/AIPresence";
+import { resolveState } from "./HUD/hudState";
 
 /**
  * ChatView — the dedicated conversation screen.

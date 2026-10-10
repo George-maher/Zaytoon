@@ -20,8 +20,9 @@ fi
 if [ ! -f "backend/.env" ]; then
     echo "[SETUP] Creating .env from .env.example..."
     cp backend/.env.example backend/.env
-    echo "[WARN] Edit backend/.env and set OPENROUTER_API_KEY (https://openrouter.ai/keys)"
-    echo "[WARN] Zaytoon calls OpenRouter only, so the assistant cannot answer without a key."
+    echo "[WARN] backend/.env defaults to AI_PROVIDER=ollama: point it at a local"
+    echo "[WARN] Ollama (no key) or set AI_PROVIDER=openrouter + OPENROUTER_API_KEY."
+    echo "[WARN] Zaytoon will not fall back between the two on its own."
 fi
 
 # Check node_modules

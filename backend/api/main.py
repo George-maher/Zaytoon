@@ -5,7 +5,6 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from pathlib import Path
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, UploadFile, File
@@ -41,6 +40,7 @@ from api.websocket import (
 )
 from domain.models import TokenBucketRateLimiter
 from services.agent_service import AgentService
+from services import workspace_settings
 
 # The Zaytoon core runtime: task system, projects, files, skills, providers,
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
@@ -153,6 +153,15 @@ async def lifespan(app):
     except Exception as e:
         safe_error(e, operation="startup.ai_settings", component="api.startup")
 
+    # Before any tool can run: the workspace root is the containment boundary of
+    # every file tool, so a saved choice has to be in place when the first turn
+    # starts — and a saved path that no longer exists must warn and fall back
+    # rather than stop the backend from booting.
+    try:
+        await workspace_settings.restore(user_prefs)
+    except Exception as e:
+        safe_error(e, operation="startup.workspace", component="api.startup")
+
     # Log provider configuration
     if config.PROVIDER == "ollama":
         logger.info(
@@ -187,9 +196,10 @@ async def lifespan(app):
             logger.info("Free-model policy: OK (all configured models allow-listed)")
         if not config.llm_configured:
             logger.error(
-                "OPENROUTER_API_KEY is not set. Zaytoon calls OpenRouter only "
-                "(local model execution has been removed), so the assistant will "
-                "be unable to answer until a key is configured."
+                "OPENROUTER_API_KEY is not set, so the assistant cannot answer. "
+                "Set it in backend/.env, or run locally instead with "
+                "AI_PROVIDER=ollama (no key needed, `ollama serve` required). "
+                "There is no automatic switch between the two."
             )
     
     logger.info("Tool safety sandbox: %s (confirm timeout %.0fs)",
@@ -709,38 +719,29 @@ async def get_workspace():
 async def set_workspace(data: dict):
     """Point the assistant at a different working directory.
 
-    The change is in-memory for the running process (and persisted as a
-    preference so a restart can restore it). A path that cannot be created is
-    rejected rather than silently ignored, so the UI never shows a workspace
-    the tools are not actually using.
+    Validation lives in `services/workspace_settings` because the startup path
+    applies the same rule: an endpoint that is stricter (or looser) than the
+    restore is how a setting works once and then silently stops working. A path
+    that cannot be used is rejected with the reason, never silently ignored, so
+    the UI cannot show a workspace the tools are not actually using.
     """
-    raw = (data.get("root") or data.get("path") or "").strip()
-    if not raw:
-        raise HTTPException(400, "No workspace path provided")
-
-    candidate = Path(os.path.expandvars(raw)).expanduser()
+    raw = data.get("root") or data.get("path") or ""
     try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        resolved = candidate.resolve()
-    except OSError as e:
+        resolved, note = workspace_settings.resolve_root(str(raw))
+    except workspace_settings.WorkspaceRejected as e:
         logger.warning("Rejected workspace %r: %s", raw, e)
-        raise HTTPException(400, f"Cannot use that directory: {redact(str(e))}")
+        raise HTTPException(400, redact(str(e))) from e
 
-    if not resolved.is_dir():
-        raise HTTPException(400, "Not a directory")
-
-    config.WORKSPACE_ROOT = str(resolved)
-    # Persist so a restart keeps the user's choice.
-    try:
-        await user_prefs.set("workspace_root", str(resolved))
-    except Exception as e:  # preferences are best-effort
-        safe_error(
-            e, operation="prefs.workspace", component="api.settings",
-            detail="workspace not persisted",
-        )
+    workspace_settings.apply_root(resolved)
+    persisted = await workspace_settings.persist(resolved, user_prefs)
 
     logger.info("Workspace root set to %s", resolved)
-    return {"status": "saved", **config.describe_workspace()}
+    return {
+        "status": "saved",
+        "note": note,
+        "persisted": persisted,
+        **config.describe_workspace(),
+    }
 
 
 # ---------------------------------------------------------------------------

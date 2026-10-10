@@ -13,6 +13,7 @@ Covers the three defects found in the audit plus the standing sandbox policy:
 """
 
 import os
+import platform
 import sys
 from pathlib import Path
 
@@ -123,8 +124,19 @@ class TestWindowsCmdToolInjection:
         result = await tool.execute("dir > C:\\evil.txt")
         assert result.success is False
 
+    @pytest.mark.skipif(
+        platform.system() != "Windows",
+        reason="`cmd` dispatches its allow-listed builtins through `cmd /c`; with "
+        "no cmd.exe the success path is not the product's behaviour on this OS. "
+        "The refusals in this class are logic rather than executors, so they "
+        "keep running everywhere.",
+    )
     async def test_benign_commands_still_work(self, tool):
-        """The fix must not break legitimate use of the allow-list."""
+        """The fix must not break legitimate use of the allow-list.
+
+        Asserting this on POSIX measured the absence of `cmd.exe` and reported a
+        product bug on a healthy machine.
+        """
         result = await tool.execute("echo hello")
         assert result.success is True
         assert "hello" in result.output
@@ -179,8 +191,26 @@ class TestPathContainment:
     def test_empty_rejected(self, value):
         assert is_safe_path(value) is False
 
+    @pytest.mark.skipif(
+        platform.system() != "Windows",
+        reason="drive letters are Windows path syntax; on POSIX `Z:\\etc` is an "
+        "ordinary file name, so there is no second drive to reject here. The "
+        "sibling-prefix and traversal cases above are what carry the "
+        "containment contract on every platform.",
+    )
     def test_different_drive_rejected(self):
         assert is_safe_path("Z:\\etc\\passwd", "C:\\Users\\x") is False
+
+    def test_a_root_that_does_not_exist_yet_is_still_a_boundary(self, tmp_path):
+        """Containment does not depend on the root existing on disk.
+
+        Resolution is lexical before it is physical, so a not-yet-created
+        workspace cannot be escaped by racing the mkdir. This is the
+        platform-neutral version of the case above.
+        """
+        future = tmp_path / "not-created-yet"
+        assert is_safe_path(str(future / "a.txt"), str(future)) is True
+        assert is_safe_path(str(tmp_path / "elsewhere"), str(future)) is False
 
 
 class TestFileToolContainment:

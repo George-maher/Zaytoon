@@ -10,7 +10,7 @@ import { memo, useRef, useCallback, useEffect, useState } from "react";
  * so the whole console lights up rather than a rounded pill.
  *
  * The microphone lives here and nowhere else in the product; see
- * components/hud/CommandConsole.jsx for why.
+ * components/HUD/CommandConsole.jsx for why.
  *
  * When `multiline` is true the field becomes a `<textarea>` that grows with
  * its content (up to a cap), so a long command or a multi-line prompt is
