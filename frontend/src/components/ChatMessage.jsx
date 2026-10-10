@@ -66,15 +66,16 @@ export default memo(function ChatMessage({ msg, language }) {
           maxWidth: "85%",
           padding: "var(--space-3) var(--space-4)",
           background: isUser
-            ? "color-mix(in srgb, var(--hud-cyan) 6%, var(--surface-1))"
+            ? "color-mix(in srgb, var(--zt-accent) 8%, var(--surface-1))"
             : "var(--surface-1)",
-          border: "var(--border-w) solid var(--hud-edge-faint)",
+          border: "1px solid var(--zt-border-subtle)",
+          clipPath: "polygon(0 var(--cut, 10px), var(--cut, 10px) 0, 100% 0, 100% calc(100% - var(--cut, 10px)), calc(100% - var(--cut, 10px)) 100%, 0 100%)",
           // Spine on the anchored side; in RTL that flips with the document.
-          borderInlineStart: `2px solid ${isUser ? "var(--hud-cyan)" : "var(--hud-blue)"}`,
+          borderInlineStart: `2px solid ${isUser ? "var(--zt-accent)" : "var(--zt-accent-dim)"}`,
           borderInlineEnd: isUser ? "none" : undefined,
           borderInlineStartWidth: 2,
           boxShadow: msg.streaming
-            ? "0 0 18px color-mix(in srgb, var(--hud-cyan) 12%, transparent)"
+            ? "0 0 18px color-mix(in srgb, var(--zt-accent) 12%, transparent)"
             : "none",
         }}
         dir={isArabic(msg.content) ? "rtl" : "ltr"}
@@ -95,7 +96,7 @@ export default memo(function ChatMessage({ msg, language }) {
                 <span
                   key={i}
                   className="w-[3px] h-[3px] typing-dot"
-                  style={{ background: "var(--hud-cyan)" }}
+                  style={{ background: "var(--zt-accent)" }}
                 />
               ))}
             </span>
@@ -105,7 +106,7 @@ export default memo(function ChatMessage({ msg, language }) {
           <span
             className="font-mono"
             style={{
-              color: isUser ? "var(--hud-cyan)" : "var(--hud-blue)",
+              color: isUser ? "var(--zt-accent)" : "var(--zt-accent-dim)",
               fontSize: "var(--font-xs)",
               letterSpacing: "0.16em",
             }}
