@@ -9,6 +9,7 @@ the hook failure is survivable, and a second launch is refused politely.
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import hotkeys as hotkeys_mod  # noqa: E402
 from app.hotkeys import HotkeyManager  # noqa: E402
 from app.instance import SingleInstance, ALREADY_RUNNING_MESSAGE  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _a_keyboard_to_patch(monkeypatch):
+    """Stand in for the `keyboard` package where it cannot be imported.
+
+    `app.hotkeys` sets `keyboard = None` when the package is unusable — correct
+    production behaviour, since the library needs a low-level OS hook (root on
+    Linux) — but it left these four tests calling `setattr(None, "add_hotkey", …)`.
+    They therefore passed only on a host that had the package installed: Windows,
+    the one leg whose output nobody could read. With a stand-in, the guarantee
+    "a failed bind degrades and reports" is checked on every platform.
+    """
+    if hotkeys_mod.keyboard is None:
+        fake = types.SimpleNamespace(
+            add_hotkey=lambda *_a, **_k: True,
+            unhook_all_hotkeys=lambda: None,
+        )
+        monkeypatch.setattr(hotkeys_mod, "keyboard", fake)
 
 
 class TestHookFailureIsSurvivable:

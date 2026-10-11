@@ -1,0 +1,13 @@
+# Root convenience file. There is no separate runtime set at the repository
+# root: the backend owns the dependencies, and pip resolves this pointer
+# relative to this file.
+#
+#   pip install -r requirements.txt          # same as backend/requirements.txt
+#   pip install -r backend/requirements-dev.txt   # + pytest and the test extras
+#
+# It used to be an empty file, which made `pip install -r requirements.txt` at
+# the root succeed while installing nothing — the worst kind of failure to
+# debug, because the command reports no error. The install instructions that
+# work are in README.md (backend venv first); this pointer exists so a reader
+# who guesses the root gets the right answer anyway.
+-r backend/requirements.txt

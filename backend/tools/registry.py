@@ -56,17 +56,55 @@ class ToolRegistry:
     def __init__(self, assessor: Optional[RiskAssessor] = None) -> None:
         self._tools: Dict[str, BaseTool] = {}
         self._aliases: Dict[str, str] = {}
+        #: Canonical name -> a tier the tool may never run below, recorded by the
+        #: *registry* rather than stored on the tool. See :meth:`register`.
+        self._floors: Dict[str, str] = {}
         self.assessor = assessor or RiskAssessor()
 
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
-    def register(self, tool: BaseTool, replace: bool = False) -> BaseTool:
+    def register(
+        self,
+        tool: BaseTool,
+        replace: bool = False,
+        *,
+        floor: Optional[str] = None,
+    ) -> BaseTool:
+        """Register ``tool``, optionally remembering a tier it cannot go below.
+
+        ``floor`` exists because the alternative — raising ``tool.permission``
+        once at load, which is what the skill loader used to do — is a claim about
+        an object the object can undo. ``BaseTool.permission`` is a plain mutable
+        attribute, so a tool that assigns ``self.permission = "safe"`` inside
+        ``execute()`` (or clears it to ``""``) drops out of the gate on the *next*
+        call, after having been approved once. A skill is third-party code; the
+        prompt has to hold on facts the registry knows, not on the honesty of the
+        thing it is about to run.
+
+        Floors are **sticky and monotone**: they are only ever set or raised here,
+        and only :meth:`unregister` removes one. A later ``register(same_name,
+        replace=True)`` without a ``floor`` therefore keeps the floor it already
+        had, so "re-register it quietly" is not an escape hatch. The cost is that
+        a name can stay floored after the tool behind it changes — which is the
+        safe direction of being wrong, and what a trusted built-in re-registering
+        itself would have to live with (built-ins are never floored, so in
+        practice nothing does).
+        """
         name = tool.name()
         if not name:
             raise ValueError(f"{type(tool).__name__} has an empty name()")
         if name in self._tools and not replace:
             raise ValueError(f"Tool '{name}' is already registered")
+        if floor is not None:
+            if floor not in _TIER_ORDER:
+                raise ValueError(
+                    f"unknown floor {floor!r}; expected one of "
+                    f"{sorted(_TIER_ORDER)}"
+                )
+            current = self._floors.get(name)
+            if current is None or _tier_rank(floor) > _tier_rank(current):
+                self._floors[name] = floor
         self._tools[name] = tool
         for alias in tool.aliases():
             if alias == name:
@@ -88,6 +126,8 @@ class ToolRegistry:
         tool = self._tools.pop(name, None)
         if tool is None:
             return
+        # The only way a floor is removed: the tool is gone. See `register`.
+        self._floors.pop(tool.name(), None)
         for alias in [a for a, owner in self._aliases.items() if owner == name]:
             self._aliases.pop(alias, None)
 
@@ -133,7 +173,7 @@ class ToolRegistry:
                 "name": tool.name(),
                 "description": tool.description(),
                 "schema": tool.schema(),
-                "permission": tool.permission,
+                "permission": self.effective_tier(tool.name()),
                 "aliases": tool.aliases(),
             }
             for tool in self.tools()
@@ -163,8 +203,47 @@ class ToolRegistry:
         """Tool names grouped by permission tier, for the settings panel."""
         grouped: Dict[str, List[str]] = {}
         for tool in self.tools():
-            grouped.setdefault(tool.permission, []).append(tool.name())
+            # Not `tool.permission`: the panel is the user's only view of what a
+            # skill's tool can do, and it must show the tier that will actually
+            # gate it.
+            grouped.setdefault(
+                self.effective_tier(tool.name()) or tool.permission, []
+            ).append(tool.name())
         return {tier: sorted(names) for tier, names in sorted(grouped.items())}
+
+    def floor_for(self, name: str) -> Optional[str]:
+        """The recorded minimum tier for a name, if any. For callers and tests."""
+        canonical = self.canonical(name) or (name or "").strip().lower()
+        return self._floors.get(canonical)
+
+    def effective_tier(self, name: str) -> str:
+        """The tier a name will actually be gated at: declaration vs floor.
+
+        Everything that *tells* someone about a tier — the settings panel, the
+        model's tool list, the audit row — should read this instead of
+        ``tool.permission``, or a lying tool gets to advertise itself as harmless.
+        """
+        tool = self.get(name)
+        canonical = tool.name() if tool is not None else (name or "").strip().lower()
+        declared = str(getattr(tool, "permission", "") or "") if tool else ""
+        floor = self._floors.get(canonical, "")
+        if _tier_rank(floor) > _tier_rank(declared):
+            return floor
+        return declared or floor
+
+    def _apply_floor(
+        self, assessment: RiskAssessment, name: str, floor: Optional[str]
+    ) -> RiskAssessment:
+        """Raise an assessment to the registry's recorded floor for this name."""
+        if not floor or _tier_rank(floor) <= _tier_rank(assessment.permission):
+            return assessment
+        assessment.permission = floor
+        if assessment.level is not RiskLevel.HIGH:
+            assessment.level = RiskLevel.HIGH
+            assessment.reasons = list(assessment.reasons) + [
+                f"'{name}' may not run below {floor}-level"
+            ]
+        return assessment
 
     def assess(self, name: str, params: Optional[Dict[str, Any]] = None) -> RiskAssessment:
         """Risk assessment for a named tool, reconciled with its declared tier.
@@ -180,8 +259,16 @@ class ToolRegistry:
         Equally, the tables can escalate a tool that under-declares itself.
         """
         tool = self.get(name)
+        # The floor is looked up *before* the early return below, because clearing
+        # `permission` is exactly how an untrusted tool would try to leave the
+        # gate: an empty tier must not mean "no floor either".
+        floor = self._floors.get(tool.name()) if tool is not None else None
         if tool is None or not tool.permission:
-            return self.assessor.assess(name, params or {})
+            return self._apply_floor(
+                self.assessor.assess(name, params or {}),
+                tool.name() if tool is not None else (name or "").strip().lower(),
+                floor,
+            )
 
         assessment = self.assessor.assess(tool.name(), tool.risk_params(params or {}))
         declared = tool.permission
@@ -194,7 +281,7 @@ class ToolRegistry:
                 assessment.reasons = list(assessment.reasons) + [
                     f"'{tool.name()}' is declared {declared}-level"
                 ]
-        return assessment
+        return self._apply_floor(assessment, tool.name(), floor)
 
     # ------------------------------------------------------------------
     # Execution
@@ -390,6 +477,7 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
     from tools import (
         applications,
         coding,
+        fetch,
         filesystem,
         git,
         local_exec,
@@ -403,7 +491,7 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
     registry = ToolRegistry(assessor=assessor)
     for module in (
         filesystem, terminal, local_exec, processes, applications, system,
-        web, git, coding, media,
+        web, fetch, git, coding, media,
     ):
         registry.register_all(module.build_tools())
     logger.info("Tool registry ready with %d tools: %s", len(registry), registry.list())

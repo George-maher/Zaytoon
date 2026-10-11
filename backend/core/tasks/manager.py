@@ -117,8 +117,8 @@ class TaskManager:
             # client the pause had been lifted when only this copy forgot it.
             try:
                 task.paused = await store.is_paused(task.id)
-            except Exception:  # noqa: BLE001 - payload accuracy, not correctness
-                pass
+            except Exception as e:  # noqa: BLE001 - payload accuracy, not correctness
+                safe_error(e, operation="tasks.paused_refresh", component="TaskManager")
 
         await self._bus.emit(
             CoreEventType.TASK_UPDATED,

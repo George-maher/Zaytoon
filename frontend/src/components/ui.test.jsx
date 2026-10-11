@@ -693,3 +693,82 @@ describe('SettingsPanel — AI provider', () => {
     expect(input).toHaveValue('mistral:7b')
   })
 })
+
+// ---------------------------------------------------------------------------
+describe('SettingsPanel — the health probe', () => {
+  /** The panel reads `/health`; the probe is the measured half of that payload.
+   *
+   * What is being defended is one specific lie: `configured: true` means "an
+   * endpoint and a key exist", which stays true while Ollama is stopped, while a
+   * model has been deleted, and while the machine is offline. Showing "present /
+   * ok" in that state is the panel answering a question it was never asked — so
+   * the row must take its colour from `llm.probe`, and must render *nothing* as
+   * reassuring when the field is absent (an older backend) rather than defaulting
+   * to green.
+   */
+  const healthWith = (llm) => ({
+    llm: {
+      provider: 'ollama',
+      configured: true,
+      primary_model: 'qwen3:9b',
+      chain: [],
+      rejected_models: [],
+      metrics: {},
+      ...llm,
+    },
+    voice: { stt: true, tts: true },
+    safety: { enabled: true },
+  })
+
+  async function renderPanel(health) {
+    global.fetch = vi.fn(async () => ({ ok: true, json: async () => health }))
+    render(<SettingsPanel open onClose={() => {}} language="en" health={health} />)
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled())
+  }
+
+  it('reports a reachable provider with the latency it measured', async () => {
+    await renderPanel(
+      healthWith({ probe: { state: 'reachable', latency_ms: 37, cached: false, checked_at: '2026-10-11T07:00:00+00:00' } })
+    )
+    const value = screen.getByText(/YES · 37 ms/)
+    expect(value).toBeInTheDocument()
+    // Green *and* the latency: the row's colour is the claim, not decoration.
+    expect(value).toHaveStyle({ color: 'var(--hud-green)' })
+  })
+
+  it('says so when the answer is a cached verdict rather than a fresh probe', async () => {
+    await renderPanel(healthWith({ probe: { state: 'reachable', latency_ms: 12, cached: true } }))
+    expect(screen.getByText(/cached/)).toBeInTheDocument()
+  })
+
+  it('turns red and quotes the reason when the provider is down', async () => {
+    await renderPanel(
+      healthWith({ probe: { state: 'unreachable', error: 'Ollama is not reachable at http://localhost:11434' } })
+    )
+    const down = screen.getByText(/Ollama is not reachable/)
+    expect(down).toBeInTheDocument()
+    // The colour is the whole point of this row: text that says "not reachable"
+    // inside a green panel is the exact lie the audit was about.
+    expect(down).toHaveStyle({ color: 'var(--hud-red)' })
+  })
+
+  it('does not call an unmeasured provider "ok"', async () => {
+    await renderPanel(healthWith({ probe: { state: 'never_probed', error: null } }))
+    const unmeasured = screen.getByText('not measured yet')
+    expect(unmeasured).toBeInTheDocument()
+    // Neither green (claims health) nor red (claims failure): "we have not looked".
+    expect(unmeasured).not.toHaveStyle({ color: 'var(--hud-green)' })
+    expect(unmeasured).not.toHaveStyle({ color: 'var(--hud-red)' })
+  })
+
+  it('does not call an absent probe "ok" either', async () => {
+    // An older backend has no `probe` key at all. The honest answer is "unknown".
+    await renderPanel(healthWith({}))
+    expect(screen.getByText('unknown')).toBeInTheDocument()
+  })
+
+  it('lists the models an endpoint has but has not pulled', async () => {
+    await renderPanel(healthWith({ probe: { state: 'reachable', missing_models: ['qwen3:32b'] } }))
+    expect(screen.getByText('qwen3:32b')).toBeInTheDocument()
+  })
+})

@@ -327,6 +327,14 @@ class Orchestrator:
             # *next* turn's tools to this task.
             agent_bus = event_bus if event_bus is not None else _bus_with_bus()
             off_record = agent_bus.subscribe(self._tool_recorder(task))
+            # The turn's source list, captured off the same bus. This is the only
+            # way a REST client can get it: `agents.dispatch` returns the reply
+            # *string*, and widening that signature for every caller would be a
+            # breaking change for one field. Subscribing costs nothing when the
+            # turn took no web search, because the engine does not emit an empty
+            # SOURCES event.
+            sources_seen: List[Dict[str, Any]] = []
+            off_sources = agent_bus.subscribe(_source_recorder(sources_seen))
             try:
                 reply = await self.agents.dispatch(
                     intent,
@@ -349,6 +357,7 @@ class Orchestrator:
                 )
             finally:
                 off_record()
+                off_sources()
             reply = reply or ""
 
             if cancel_event.is_set():
@@ -366,6 +375,7 @@ class Orchestrator:
                     language=language,
                     task=task,
                     cancelled=True,
+                    sources=list(sources_seen),
                     duration_ms=int((time.perf_counter() - started) * 1000),
                 )
 
@@ -381,6 +391,7 @@ class Orchestrator:
                 intent=intent,
                 language=language,
                 task=task,
+                sources=list(sources_seen),
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
 
@@ -557,8 +568,8 @@ class Orchestrator:
                 task, "Paused: the turn stopped here before dispatching.",
                 level="warning",
             )
-        except Exception:  # noqa: BLE001 - the log explains, it does not decide
-            pass
+        except Exception as e:  # noqa: BLE001 - the log explains, it does not decide
+            safe_error(e, operation="orchestrator.pause_log", component="Orchestrator")
         return True
 
     async def _default_project_id(self) -> Optional[str]:
@@ -651,6 +662,27 @@ class Orchestrator:
         )
 
 
+def _source_recorder(sink: List[Dict[str, Any]]) -> Callable[[Any], None]:
+    """A bus subscriber that keeps this turn's `sources` event payload.
+
+    Deliberately dumb: it copies the list the engine emitted and nothing else.
+    It does not re-derive numbering, re-read the ledger, or judge whether the
+    answer cited any of it — the engine owns that, and a second opinion here
+    would be a second truth.
+    """
+
+    def _observe(event: Any) -> None:
+        from agents.events import AgentEventType
+
+        if event.type is not AgentEventType.SOURCES:
+            return
+        items = (event.data or {}).get("sources")
+        if isinstance(items, list):
+            sink.extend(items)
+
+    return _observe
+
+
 @dataclass
 class TurnResult:
     """What one turn produced."""
@@ -662,6 +694,12 @@ class TurnResult:
     error: Optional[str] = None
     cancelled: bool = False
     duration_ms: int = 0
+    #: What this turn read, numbered the way the answer cites it
+    #: (`agents/sources.py`), captured from the agent bus. Empty means "no web
+    #: search happened" — the honest empty, not a failure to look. The
+    #: WebSocket gets the same list as a `sources` frame; this field is what
+    #: makes `POST /chat` able to answer "where did that come from?" at all.
+    sources: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -676,6 +714,7 @@ class TurnResult:
             "cancelled": self.cancelled,
             "duration_ms": self.duration_ms,
             "task_id": self.task.id if self.task else None,
+            "sources": list(self.sources),
         }
 
 

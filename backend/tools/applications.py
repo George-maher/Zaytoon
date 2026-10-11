@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import re
 import shutil
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -75,6 +76,40 @@ WINDOWS_APP_LAUNCH: Dict[str, List[str]] = {
 _DETECT_EXT = re.compile(r"\.\w+$")
 
 _IS_WINDOWS = os.name == "nt"
+_IS_MACOS = sys.platform == "darwin"
+
+#: Where macOS keeps application bundles. A `.app` is the artifact, and it is
+#: never on `PATH` — which is why a POSIX resolver written for Linux finds
+#: nothing on a Mac: `shutil.which("spotify")` is empty there by design, and the
+#: app is sitting in `/Applications/Spotify.app`.
+_MAC_APP_DIRS: List[str] = ["/Applications", os.path.expanduser("~/Applications")]
+
+
+def _mac_bundle(app: str, roots: Optional[Sequence[str]] = None) -> Optional[str]:
+    """The `.app` bundle for a name, matched case- and space-insensitively.
+
+    `Spotify`, `spotify` and `Spotify.app` all land on the same bundle
+    because the human word for an app and its folder name rarely agree on
+    spacing. Depth one only: a recursive scan of /Applications would find helper
+    bundles inside other bundles and launch something nobody named.
+    """
+    want = "".join(app.strip().lower().split())
+    if not want:
+        return None
+    for base in roots or _MAC_APP_DIRS:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".app"):
+                continue
+            stem = "".join(entry[:-4].lower().split())
+            if stem == want or want in stem:
+                full = os.path.join(base, entry)
+                if os.path.isdir(full):
+                    return full
+    return None
 
 
 def _start_menu_roots() -> List[str]:
@@ -150,6 +185,12 @@ def _locate(
     on_path = shutil.which(alias) or shutil.which(alias + ".exe")
     if on_path:
         return on_path, "path"
+    if _IS_MACOS:
+        bundle = _mac_bundle(alias) or _mac_bundle(name)
+        if bundle:
+            # Positive evidence in the same sense as the two checks around it: a
+            # directory that exists, not a row in a table.
+            return bundle, "bundle"
     lnk = _find_start_menu_shortcut(name, index=shortcut_index)
     if lnk:
         return lnk, "shortcut"
@@ -262,7 +303,10 @@ class OpenApp(BaseTool):
     def description(self) -> str:
         return (
             "Open a desktop application by name, e.g. spotify, vscode, chrome, "
-            "notepad, calculator."
+            "notepad, calculator. The same name works on all three systems: "
+            "Windows searches the Start Menu shortcuts, macOS finds the .app "
+            "bundle in /Applications, Linux uses the PATH. If nothing was found "
+            "the tool says which places it looked, and never launches a guess."
         )
 
     def schema(self) -> Dict[str, Any]:
@@ -331,6 +375,18 @@ class OpenApp(BaseTool):
 
 
 def _resolve_posix(app: str) -> Optional[List[str]]:
+    """The argv that launches `app`, or None when nothing on disk says it exists.
+
+    On macOS the bundle is handed to `open`, not executed directly: launching
+    `Spotify.app/Contents/MacOS/Spotify` starts the binary outside its launchd
+    session, which is how apps end up without their environment, their single
+    -instance guard, or their dock icon.
+    """
+    if _IS_MACOS:
+        for candidate in (APP_PATHS.get(app, [app])[0], app):
+            bundle = _mac_bundle(candidate)
+            if bundle:
+                return ["open", bundle]
     if app in APP_PATHS:
         alias = APP_PATHS[app][0]
         found = shutil.which(alias)

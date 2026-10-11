@@ -150,8 +150,16 @@ def _machine_key() -> bytes:
     seed = f"{os.path.abspath(os.getcwd())}|{_ENTROPY.decode()}".encode("utf-8")
     try:
         seed += socket_hostname().encode("utf-8")
-    except Exception:  # pragma: no cover - defensive
-        pass
+    except Exception as e:  # noqa: BLE001 - the seed degrades, it must not stop
+        # Loud on purpose: a different seed here means every stored secret fails
+        # to decrypt, and "wrong passphrase" was previously indistinguishable
+        # from "you changed machines".
+        import logging
+
+        logging.getLogger("Zaytoon.Secrets").warning(
+            "hostname unavailable while deriving the key seed: %s: %s",
+            type(e).__name__, e,
+        )
     return hashlib.sha256(seed).digest()
 
 

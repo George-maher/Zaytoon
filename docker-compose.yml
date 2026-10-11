@@ -22,7 +22,14 @@ services:
     stop_grace_period: 30s
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        # The port a browser will actually reach. The image's redirect target is
+        # built from this, so it must be the published port below (3443), not the
+        # container's 8443 — a redirect to an unpublished port is a dead end that
+        # looks like a broken backend.
+        HTTPS_PORT: "3443"
     container_name: zaytoon-frontend
     restart: unless-stopped
     ports:

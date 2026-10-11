@@ -1,0 +1,9 @@
+# The directory is committed; the key material is not.
+#
+# `frontend/Dockerfile` does `COPY certs/ /etc/nginx/certs/`, which fails the
+# build outright when the folder does not exist in the checkout — so the folder
+# has to be tracked. `docker-compose.yml` bind-mounts this same directory
+# read-only, so `scripts/generate-certs.sh` (or your real certificate) drops the
+# pair here and nothing needs rebuilding.
+*
+!.gitignore

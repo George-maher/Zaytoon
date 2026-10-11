@@ -28,6 +28,11 @@ def portable(tmp_path, monkeypatch):
     home.mkdir()
     for name in paths.LAYOUT:
         (home / name).mkdir()
+    # The explicit overrides outrank the layout, and `tests/conftest.py` sets
+    # one of them for the whole session so a run cannot write into a developer's
+    # real data directory. Clearing it is what makes "pretend to be portable"
+    # mean *only* the thing the fixture says it means.
+    monkeypatch.delenv("ZAYTOON_DATA_DIR", raising=False)
     monkeypatch.setenv("ZAYTOON_HOME", str(home))
     return home
 

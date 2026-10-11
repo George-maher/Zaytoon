@@ -47,11 +47,18 @@ def test_a_second_reading_after_an_interval_may_be_a_real_percentage():
     cpu = system_resources._cpu()
 
     # With a real interval the counters have usually moved; on a tickless
-    # platform sampling remains the honest answer. Both are accepted — what
-    # is not accepted is `ok` with a percent outside 0..100.
-    assert cpu["status"] in ("ok", "sampling")
+    # platform sampling remains the honest answer, and on a platform whose
+    # counter command is missing or blocked (`sysctl kern.cp_time` refused, no
+    # `/proc/stat`) the third answer is `unavailable` with a reason. All three are
+    # accepted because this test reads the *host's* counters, and a suite that
+    # assumes `/proc` exists is a suite that fails on the Mac leg for a reason
+    # that has nothing to do with the Mac code. What is not accepted is `ok`
+    # with a percent outside 0..100, or a degraded state with no explanation.
+    assert cpu["status"] in ("ok", "sampling", "unavailable"), cpu
     if cpu["status"] == "ok":
         assert 0 <= cpu["percent"] <= 100
+    else:
+        assert cpu["percent"] is None, f"{cpu['status']} must not carry a number"
 
 
 def test_memory_reports_bytes_when_ok():
@@ -88,3 +95,26 @@ def test_network_is_an_explicit_state():
 
     assert network["status"] == "unavailable"
     assert network["reason"]
+
+
+def test_a_windows_that_lacks_windll_reports_states_instead_of_raising(monkeypatch):
+    """The branch chosen by `platform.system()` must be as defensive as its siblings.
+
+    `ctypes.windll` exists on Windows and nowhere else, so the Windows branch was
+    the one place where a probe could raise. That is not a hypothetical that only
+    a mask can reach: Wine and a ctypes built without the extension both answer
+    "Windows", and `sample()` feeds `/system`, whose panel renders a *state* — a
+    traceback there costs the whole status card, not one number.
+    """
+    import ctypes
+
+    monkeypatch.setattr(system_resources.platform, "system", lambda: "Windows")
+    monkeypatch.delattr(ctypes, "windll", raising=False)
+    snapshot = system_resources.sample("/")
+
+    assert snapshot["cpu"]["status"] in ("sampling", "unavailable"), snapshot["cpu"]
+    assert snapshot["memory"]["status"] == "unavailable", snapshot["memory"]
+    assert snapshot["memory"]["reason"], "unavailable without a reason"
+    for name in ("cpu", "memory", "disk", "network"):
+        block = snapshot[name]
+        assert block["status"] in ("ok", "sampling", "unavailable"), (name, block)

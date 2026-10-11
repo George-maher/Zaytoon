@@ -90,7 +90,7 @@
   --text: #f3eef9;
   --text-mute: #7a6c8a;
   --text-faint: #5c4f6b;
-  --accent: var(--hud-cyan);   /* #22d3ee */
+  --accent: var(--hud-cyan);   /* #d946ef — the name is legacy, the colour is magenta */
   --green: var(--hud-green);   /* #35d399 */
   --amber: var(--hud-amber);   /* #f2b84b */
   --red: var(--hud-red);       /* #ff6b6b */
@@ -786,8 +786,12 @@ html[dir="rtl"] .hud-micro {
      reads as a well — a hole in the surface you type into — and matching it to
      the panel behind it is what makes it disappear on a low-contrast row. */
   --input-bg: #140c1e;                                /* opaque: a translucent fill over a light parent is how white-on-white happens */
-  --input-text: #f3eef9;                              /* 19.4:1 on --input-bg */
-  --input-placeholder: #5c4f6b;                       /* 8.0:1 on --input-bg — readable, clearly secondary */
+  --input-text: #f3eef9;                              /* 16.7:1 on --input-bg (AA is 4.5) */
+  /* 5.0:1 — AA, and still a third of the field text's ratio so it reads as a
+     hint. It was #5c4f6b with a comment claiming 8.0:1; the real ratio was
+     2.53:1. `input.visibility.test.js` now computes it from the token instead
+     of trusting the comment, which is how the discrepancy surfaced. */
+  --input-placeholder: #8b7c9c;
   --input-border: color-mix(in srgb, var(--hud-cyan) 16%, transparent);
   --input-border-hover: color-mix(in srgb, var(--hud-cyan) 34%, transparent);
   --input-border-focus: color-mix(in srgb, var(--hud-cyan) 70%, transparent);

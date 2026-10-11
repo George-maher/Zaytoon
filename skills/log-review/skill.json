@@ -1,0 +1,17 @@
+{
+  "name": "log-review",
+  "version": "1.0.0",
+  "description": "Reads log files already on disk and reports authentication failures, exposed secrets, and crash signatures with file and line evidence. Read-only: no scanners, no network, nothing is executed.",
+  "instructions": "instructions.md",
+  "tools": [],
+  "permissions": [
+    "filesystem.read"
+  ],
+  "enabled": false,
+  "tags": [
+    "security",
+    "passive",
+    "audit"
+  ],
+  "author": "Zaytoon (shipped)"
+}

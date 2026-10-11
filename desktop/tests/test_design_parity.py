@@ -24,7 +24,11 @@ from app import theme  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 THEME_CSS = REPO / "frontend" / "src" / "styles" / "theme.css"
-HUD_STATE = REPO / "frontend" / "src" / "components" / "hud" / "hudState.js"
+# `components/HUD`, capitalised. Lower-case here worked on the only runner that
+# ever ran this suite — Windows, where path casing is not significant — and
+# raised FileNotFoundError on Linux and macOS. `frontend/src/imports.case.test.js`
+# pins the same rule for the app's own imports; this is that bug in a test.
+HUD_STATE = REPO / "frontend" / "src" / "components" / "HUD" / "hudState.js"
 
 
 @pytest.fixture(scope="module")

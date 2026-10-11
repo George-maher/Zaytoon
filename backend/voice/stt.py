@@ -209,5 +209,8 @@ class SpeechToText:
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001 - cleanup, never the result
+                    # Worth a line rather than silence: the file left behind is
+                    # a recording of the user's own voice.
+                    safe_error(e, operation="stt.tmp_cleanup", component="STT",
+                               detail=os.path.basename(tmp_path))

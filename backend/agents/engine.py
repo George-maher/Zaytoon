@@ -50,9 +50,12 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from agents import fast_path
 from agents.events import EventBus, NullBus
+from config import config
 from common.audit import record as audit_record
 from common.reporting import safe_error
+from tools.safety import PERMISSION_SAFE
 from tools.metrics import (
     STATUS_DECLINED,
     STATUS_FAILED,
@@ -66,6 +69,7 @@ from services.completion_validator import (
     contract_from_registry,
 )
 from tools.registry import ToolRegistry
+from services.llm_client import user_notice
 
 logger = logging.getLogger("Zaytoon.AgentEngine")
 
@@ -76,6 +80,117 @@ DEFAULT_MAX_ITERATIONS = 8
 #: Ceiling on how much observation text is carried forward, so a chatty tool
 #: cannot blow the context window on the next request.
 MAX_OBSERVATION_CHARS = 4_000
+
+#: How many calls the model may dispatch in one reply. Without it, a small local
+#: model that falls into `{"action": "x"} {"action": "x"} ...` repetition gets to
+#: issue an unbounded number of actions from a single completion — and when those
+#: are confirm-tier, the user is asked to approve a hundred of them. The iteration
+#: cap bounds how many replies there are; nothing bounded what one reply could
+#: contain. Excess calls are *reported* to the model, not dropped silently, so it
+#: can continue next step if the work really needed them.
+MAX_CALLS_PER_ITERATION = 8
+
+#: How many calls one whole turn may dispatch. `8 x 8` is already more than any
+#: legitimate desktop request needs, and a turn that wants more is looping.
+MAX_CALLS_PER_TURN = 24
+
+#: Tools whose repeated execution is harmless, so a duplicate is not refused.
+#: This is a *deny-by-default* list on purpose: an unknown or newly added tool is
+#: treated as having effects, and the worst that does is one extra observation
+#: telling the model its earlier result still stands. The reverse mistake —
+#: assuming a launcher or a writer is idempotent because its name looked read-only
+#: — is launching the app twice.
+#:
+#: Why the list is written out instead of computed from the registry's tiers, even
+#: though every name in it is a registered, tier-``safe`` tool: **safe-tier is
+#: necessary and not sufficient.** ``screenshot`` is ``safe`` and writes a PNG on
+#: every call; ``process_logs`` is ``safe`` only because reading a log is, while
+#: ``open_app`` is ``safe``-tier on some configurations and obviously not
+#: repeatable. Deriving the set from tiers would re-admit exactly the tools this
+#: list exists to keep out. So the derivation runs the other way, as a check:
+#: :func:`repeat_safe_violations` asks the registry about every name here, and a
+#: test requires the answer to be empty. That keeps the list honest as tools are
+#: renamed, retiered or removed — the drift a hand-written list is afraid of —
+#: without letting the tier decide idempotence for it.
+#:
+#: Polling is why these need to be exempt: `process_logs` after `process_start`
+#: legitimately returns different text a second later, and refusing that would
+#: break the one loop that works today.
+REPEAT_SAFE_TOOLS = frozenset({
+    "get_time",
+    "get_volume",
+    "system_info",
+    "calculator",
+    "file_read",
+    "search_files",
+    "search_web",
+    "process_list",
+    "process_logs",
+    # A re-fetch costs one request and has no side effect, and refusing it would
+    # replace a possibly-changed page with the *truncated* text the model already
+    # saw — for research, stale-and-shorter is worse than repeated. The per-reply
+    # and per-turn caps bound how often that can happen.
+    "fetch_url",
+    "git_status",
+    "git_log",
+    "git_diff",
+    "git_branch_list",
+})
+
+def repeat_safe_violations(registry: Any) -> List[str]:
+    """Every way :data:`REPEAT_SAFE_TOOLS` has drifted from the registry.
+
+    Three failures, in order of how they are noticed in practice:
+
+    * **not registered** — the name is dead config. Harmless to the user and
+      fatal to a review, because a reader has to know that a tool that no longer
+      exists is not "exempted" from anything.
+    * **not tier-safe** — a tool that needs confirmation for its plain,
+      argument-free call must not be silently re-run twice by a loop that
+      decided it was a read.
+    * **registered under an alias but not as a canonical name** — the exemption
+      matches on the name the model used, so an alias-only entry would let the
+      canonical call through anyway.
+
+    Returns human-readable strings rather than raising: the caller is a test or a
+    startup log, and neither wants an exception on an ordinary mismatch.
+    """
+    problems: List[str] = []
+    if registry is None:
+        return problems
+    names = set(registry.list())
+    for tool in registry.tools():
+        names.update({tool.name(), *tool.aliases()})
+    for name in sorted(REPEAT_SAFE_TOOLS):
+        if name not in names:
+            problems.append(f"{name}: no such registered tool (the exemption is dead config)")
+            continue
+        canonical = registry.canonical(name) or name
+        if canonical != name:
+            problems.append(
+                f"{name}: an alias, not the canonical tool name — the canonical call"
+                f" ({canonical}) is not exempted by it"
+            )
+        try:
+            tier = registry.assess(name, {}).permission
+        except Exception:  # noqa: BLE001 - a check that throws is a check nobody runs
+            problems.append(f"{name}: the registry could not assess it")
+            continue
+        if tier != "safe":
+            problems.append(f"{name}: an argument-free call is tier {tier!r}, not 'safe'")
+    return problems
+
+
+#: A reply that says the work succeeded while steps of that work failed. The
+#: claim is not deleted — it may well be true about the parts that ran — but it
+#: is never delivered *alone*, because "Done!" from a model that ignored three
+#: FAILED observations is the most convincing kind of wrong answer.
+_SUCCESS_CLAIM = re.compile(
+    r"""(?:\b(?:done|finished|completed|created|saved|opened|installed|deleted|
+        moved|renamed|fixed|updated|written|launched|started|successfully)\b|
+        \u2705|\u2714|تم|خلص|اتنفذ|نجح|تمت)""",
+    re.IGNORECASE | re.VERBOSE,
+)
 
 #: The longest a single tool may run before the engine stops waiting. Tools
 #: have their own timeouts; this is the backstop for one that hangs.
@@ -547,6 +662,11 @@ Rules:
   or any fact about this machine must come from the tool, not from you.
   If the user asks what time or date it is, call the time tool first.
 - If a tool was refused or denied, say so plainly; do not pretend otherwise.
+- For a factual question the tools cannot answer: search, then OPEN the page
+  before quoting a number, date, version or name from it — a search snippet is a
+  lead, not a source. Two or three different queries beat one re-run. Cite as
+  [n] using the numbered list you are shown, and start anything you cannot place
+  on it with "Unverified:". Never invent a citation.
 """
 
 SYSTEM_AR = """\
@@ -568,6 +688,10 @@ SYSTEM_AR = """\
 قواعد:
 - متخترعش اسم أداة ولا بارامتر. استخدم الموجود في القائمة بس.
 - متقولش إنك عملت حاجة إلا لو النتيجة بتأكد.
+- في سؤال معرفي الأدوات مش بتجاوبه: دور، وبعدين **افتح الصفحة** قبل ما تقتبس
+  رقم أو تاريخ أو إصدار أو اسم — مقتطف البحث دليل مش مصدر. اتنين أو تلات عمليات
+  بحث بصيغ مختلفة أحسن من واحدة متكررة. اذكر المصدر كـ [n] من القائمة اللي
+  اتعرضت عليك، وأي حاجة مش فيها اكتب قبلها "غير موثّق:". ومتاخترعش مصدر.
 - متعرّفش من عندك حاجة الأدوات تقدر تقولها: الوقت والتاريخ وأي حقيقة عن
   الجهاز لازم تيجي من الأداة مش منك. لو المستخدم سأل الوقت، نادِ أداة الوقت
   الأول ومتقولش وقتك أنت.
@@ -786,6 +910,22 @@ def tool_label(name: str, language: str = "en") -> str:
 # ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
+#: The fast path's own sentences: short, bilingual, and never a claim that
+#: something worked when the tool said it did not.
+_FAST_PATH_DECLINED = {
+    "en": "That needs your approval, and it was not approved, so nothing was done.",
+    "ar": "الطلب ده كان محتاج موافقتك، ومفيش موافقة اتعملت، فمفيش حاجة اتنفذت.",
+}
+_FAST_PATH_FAILED = {
+    "en": "I ran that directly and it did not work",
+    "ar": "نفذته على طول ومبقاش شغال",
+}
+_FAST_PATH_EMPTY = {
+    "en": "It ran, and there was nothing to report back.",
+    "ar": "اتنفذ، ومفيش حاجة ترجعها.",
+}
+
+
 @dataclass
 class LoopResult:
     """Outcome of one agent turn."""
@@ -797,6 +937,10 @@ class LoopResult:
     failed_calls: List[str] = field(default_factory=list)
     stopped_reason: str = "answered"
     errors: List[str] = field(default_factory=list)
+    #: What this turn actually read, numbered the way the answer cites it
+    #: (`agents/sources.py`). Empty for a fast-path or provider-less turn, which
+    #: is the honest value: nothing was read.
+    sources: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def used_tools(self) -> bool:
@@ -811,6 +955,11 @@ class AgentEngine:
     tools until the request is satisfied, and returns.
     """
 
+    #: The provider exception behind the most recent failed `_ask`, if any.
+    #: A class default so the attribute always exists, even in a subclass that
+    #: does not call `__init__`; the instance value is set per turn.
+    last_llm_error: Optional[BaseException] = None
+
     def __init__(
         self,
         llm: Any,
@@ -818,6 +967,9 @@ class AgentEngine:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         metrics: Optional[Any] = None,
     ) -> None:
+        #: The exception behind the most recent failed `_ask`, if any. Per-turn
+        #: state on a per-turn object; see the comment in `_ask`.
+        self.last_llm_error = None
         self.llm = llm
         self.registry = registry
         self.max_iterations = max(1, int(max_iterations))
@@ -882,6 +1034,15 @@ class AgentEngine:
         guessed value is never delivered.
         """
         bus = bus or NullBus()
+
+        # Deterministic short circuit (see `agents/fast_path.py`). Placed before
+        # the prompt is assembled — not after a first model call — because the
+        # thing saved *is* the model call.
+        fast = await self._fast_path(user_message, language, bus, approval,
+                                     response_id)
+        if fast is not None:
+            return fast
+
         catalogue = self._catalogue(language)
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": build_system_prompt(catalogue, language)}
@@ -897,6 +1058,18 @@ class AgentEngine:
         failed: List[str] = []
         errors: List[str] = []
         last_prose = ""
+        #: What has already run this turn: effect identity -> the observation the
+        #: model was shown. This is what lets a repeat of a successful action be
+        #: refused with its earlier result attached, instead of dispatched again.
+        executed: Dict[str, str] = {}
+        #: Calls dispatched so far this turn, for the per-turn budget.
+        dispatched = 0
+        #: Numbered record of every page and result this turn touched, so the
+        #: answer can be stamped with citations instead of standing on the model's
+        #: confidence alone.
+        from agents.sources import SourceLedger
+
+        ledger = SourceLedger()
         #: One correction is allowed for a malformed reply. More than one and a
         #: confused model just burns the budget.
         nagged = False
@@ -923,13 +1096,20 @@ class AgentEngine:
         for iteration in range(1, self.max_iterations + 1):
             raw = await self._ask(messages)
             if raw is None:
-                # Every compatible free model was rate-limited or produced a
-                # completion that failed validation. Report that, and nothing
-                # else -- never the last invalid text.
-                message = _ALL_MODELS_FAILED.get(
+                # No model could answer. Report that, and nothing else -- never
+                # the last invalid text.
+                #
+                # "Free models" is only the truth for the OpenRouter path, and a
+                # user whose `ollama serve` is stopped does not need to "try
+                # again in a moment": they need the command that fixes it. The
+                # client already knows which of those it is, so ask it, and fall
+                # back to the generic notice when it has nothing better to say.
+                message = user_notice(self.last_llm_error, language) or _ALL_MODELS_FAILED.get(
                     language, _ALL_MODELS_FAILED["en"]
                 )
-                errors.append("every compatible free model failed")
+                errors.append(
+                    str(getattr(self.last_llm_error, "kind", "pool_exhausted"))
+                )
                 await bus.error(message)
                 await bus.response_chunk(message, response_id=response_id)
                 await bus.completed(reason="llm_unavailable", iterations=iteration)
@@ -1016,6 +1196,7 @@ class AgentEngine:
                             tool_calls=tool_names,
                             failed_calls=failed,
                             stopped_reason="no_tool_taken",
+                            sources=[s.to_dict() for s in ledger.items],
                             errors=errors,
                         )
                     nag = _TOOL_EXPECTED_NAG if tool_nags == 0 else _TOOL_NAG_FINAL
@@ -1052,7 +1233,14 @@ class AgentEngine:
                         "the model returned a placeholder instead of acting"
                     )
                     await bus.error(answer)
+                answer = self._verify_claims(answer, failed, language, errors)
+                answer, notes = ledger.stamp(answer, language)
+                errors.extend(notes)
                 await bus.response_chunk(answer, response_id=response_id)
+                await bus.sources(
+                    [source.to_dict() for source in ledger.items],
+                    response_id=response_id,
+                )
                 await bus.completed(reason="answered", iterations=iteration)
                 return LoopResult(
                     text=answer,
@@ -1061,6 +1249,16 @@ class AgentEngine:
                     failed_calls=failed,
                     stopped_reason="answered",
                     errors=errors,
+                    sources=[source.to_dict() for source in ledger.items],
+                )
+
+            # Bounds first, and *before* the plan is published: a plan of ten
+            # steps that becomes eight is a promise the turn does not keep.
+            calls, refusals = self._bound_calls(calls, executed, dispatched)
+            dispatched += len(calls)
+            if refusals:
+                errors.append(
+                    f"{len(refusals)} call(s) refused by the turn bounds"
                 )
 
             if iteration == 1 and len(calls) > 1:
@@ -1069,7 +1267,11 @@ class AgentEngine:
 
             messages.append({"role": "assistant", "content": raw})
 
-            observations: List[str] = []
+            # Refusals join the observations, not a side channel: the model needs
+            # to see why a call did not run, in the same text it reads results
+            # from, or the only "feedback" it gets is silence and it repeats
+            # itself into the next iteration.
+            observations: List[str] = list(refusals)
             # Increment B: safe-tier calls in a batch run concurrently; every
             # confirm/dangerous call is a barrier that runs on its own, in the
             # order the model wrote it. Results are keyed by index and folded
@@ -1096,6 +1298,10 @@ class AgentEngine:
                 if not outcome.get("success"):
                     errors.append(f"{call.name}: {outcome.get('error') or 'failed'}")
                 observations.append(render_observation(call, outcome))
+                # Sources are recorded from the outcome, not from the model's
+                # prose: a URL the model mentions is a claim, a URL this turn read
+                # is evidence.
+                ledger.ingest(call.name, call.params or {}, outcome)
                 # `tool_calls` is every tool dispatched, so the UI can show the
                 # full activity trail; `failed_calls` is what did not work, so a
                 # caller can tell "nothing happened" from "it tried and failed".
@@ -1103,13 +1309,24 @@ class AgentEngine:
                     tool_names.append(call.name)
                     if not outcome.get("success"):
                         failed.append(call.name)
+                if (
+                    isinstance(outcome, dict)
+                    and outcome.get("success")
+                    and call.name not in REPEAT_SAFE_TOOLS
+                ):
+                    # Only successes are recorded as "done": a failed write must
+                    # stay retryable, or the guard would turn one error into a
+                    # permanently unfixable request.
+                    executed[self._effect_key(call)] = observations[-1]
 
             last_prose = prose
+            block = ledger.prompt_block(language)
             messages.append({
                 "role": "user",
                 "content": (
                     "Tool results:\n"
                     + "\n".join(observations)
+                    + (f"\n\n{block}" if block else "")
                     + "\n\nContinue with the next step, or reply with a final "
                     "summary in prose if the work is done."
                 ),
@@ -1124,7 +1341,15 @@ class AgentEngine:
             force_prose=True,
         )
         answer = final or last_prose or "I ran out of steps before finishing that."
+        # Stamped here too: a turn that ran out of steps is the one where an
+        # unsupported "summary" is most likely, and most likely to be believed.
+        answer, notes = ledger.stamp(answer, language)
+        errors.extend(notes)
         await bus.response_chunk(answer, response_id=response_id)
+        await bus.sources(
+            [source.to_dict() for source in ledger.items],
+            response_id=response_id,
+        )
         await bus.completed(reason="max_iterations", iterations=self.max_iterations)
         return LoopResult(
             text=answer,
@@ -1133,6 +1358,7 @@ class AgentEngine:
             failed_calls=failed,
             stopped_reason="max_iterations",
             errors=errors,
+            sources=[source.to_dict() for source in ledger.items],
         )
 
     # ------------------------------------------------------------------
@@ -1173,6 +1399,7 @@ class AgentEngine:
         the budget is exhausted we get ``None`` and the loop reports that
         honestly rather than passing along the last invalid text.
         """
+        self.last_llm_error = None
         try:
             return await self.llm.complete(
                 messages,
@@ -1188,7 +1415,12 @@ class AgentEngine:
             # One structured line, no traceback in the return value: `None`
             # already means "no model could answer", and the loop reports that
             # honestly rather than echoing an exception at the user.
+            #
+            # The exception itself is kept on the instance (never returned) so
+            # the caller can name the *reason*. `AgentEngine` is built per turn
+            # (see `agents/tool_agent.py`), so this cannot leak between users.
             safe_error(e, operation="llm.complete", component="agents.engine")
+            self.last_llm_error = e
             return None
 
     async def _run_batch(
@@ -1255,6 +1487,181 @@ class AgentEngine:
             index = end
         return outcomes
 
+    async def _fast_path(
+        self,
+        user_message: str,
+        language: str,
+        bus: EventBus,
+        approval: Optional[Callable[..., Any]],
+        response_id: str,
+    ) -> Optional[LoopResult]:
+        """One safe tool call, no model, when the message *is* that call.
+
+        ``None`` means "ask the model" — the ordinary outcome, and it preserves
+        today's behaviour for everything this does not recognise exactly.
+
+        There is no fall-through **after** execution. A tool that already ran must
+        be answered from its own result, because otherwise the model may call it
+        again and `open_app` launches twice: a duplicate side effect is worse than
+        a terse reply. So once the call is dispatched, its outcome — including an
+        error — is the answer.
+        """
+        if not config.FAST_PATH_ENABLED:
+            return None
+        matched = fast_path.match(user_message)
+        if matched is None:
+            return None
+        name, params = matched
+
+        # The registry decides, not this module. An unknown name, or a tool whose
+        # tier is no longer `safe`, is not answerable from here and goes back to
+        # the ordinary path before anything runs.
+        if not self.registry.has(name):
+            return None
+        tool = self.registry.get(name)
+        if getattr(tool, "permission", None) != PERMISSION_SAFE:
+            return None
+        if self._needs_approval(ToolCall(name=name, params=params)):
+            # The confirmation policy for this exact call is not "safe" — e.g. the
+            # user listed it in TOOL_ALWAYS_CONFIRM. Prompting from here would
+            # duplicate machinery the loop owns, and skipping it would answer
+            # without asking, so the turn goes back to the model.
+            return None
+
+        call = ToolCall(name=name, params=params, raw="<fast_path>")
+        outcome = await self._run_one(
+            call, approval, bus, language,
+            audit={"trace_id": response_id, "user_request": user_message},
+        )
+
+        if isinstance(outcome, str):
+            # The caller's gate declined. Nothing happened, and that is what gets
+            # said — in the user's language, because this reaches a screen.
+            text = _FAST_PATH_DECLINED.get(language) or _FAST_PATH_DECLINED["en"]
+        elif isinstance(outcome, dict) and outcome.get("success"):
+            text = fast_path.render(fast_path.intent_for(name), outcome, language)
+            if not text:
+                # Success with nothing to show is still success. Inventing a
+                # result is the bug this codebase is organised against.
+                text = _FAST_PATH_EMPTY.get(language) or _FAST_PATH_EMPTY["en"]
+        else:
+            error = ""
+            if isinstance(outcome, dict):
+                error = str(outcome.get("error") or outcome.get("output") or "").strip()
+            prefix = _FAST_PATH_FAILED.get(language) or _FAST_PATH_FAILED["en"]
+            text = f"{prefix}{(': ' + error) if error else ''}"
+
+        await bus.response_chunk(text, response_id=response_id)
+        await bus.completed(reason="fast_path", iterations=0)
+        ok = isinstance(outcome, dict) and bool(outcome.get("success"))
+        return LoopResult(
+            text=text,
+            iterations=0,
+            tool_calls=[name],
+            failed_calls=[] if ok else [name],
+            stopped_reason="fast_path",
+        )
+
+    def _bound_calls(
+        self,
+        calls: List["ToolCall"],
+        executed: Dict[str, str],
+        dispatched: int,
+    ) -> Tuple[List["ToolCall"], List[str]]:
+        """Trim one reply's tool calls to the turn's bounds, with reasons.
+
+        Returns ``(to_run, refusals)``. A refusal is text for the *model*, in the
+        same channel as a tool observation — it is the only way the model can
+        change course rather than repeat itself.
+
+        Three separate bounds, in this order, because they catch different
+        failures: an accidental duplicate in one reply (a formatting slip), the
+        same effectful call repeated across replies (which would run it twice),
+        and sheer volume (which is either a loop or an attack on the approval
+        prompt).
+        """
+        kept: List["ToolCall"] = []
+        refusals: List[str] = []
+        seen_here: set = set()
+
+        for call in calls:
+            key = self._effect_key(call)
+            repeat_safe = call.name in REPEAT_SAFE_TOOLS
+
+            if key in seen_here and not repeat_safe:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: the identical call appeared "
+                    "twice in one reply. Running it twice is not what was asked."
+                )
+                continue
+            if not repeat_safe and key in executed:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: this exact action already ran "
+                    f"earlier in this turn and succeeded. Its result was: "
+                    f"{executed[key]}"
+                )
+                continue
+            if len(kept) >= MAX_CALLS_PER_ITERATION:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: a reply may dispatch at most "
+                    f"{MAX_CALLS_PER_ITERATION} calls. Send the rest in your next "
+                    "step if they are still needed."
+                )
+                continue
+            if dispatched + len(kept) >= MAX_CALLS_PER_TURN:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: this turn has used its whole "
+                    f"budget of {MAX_CALLS_PER_TURN} calls. Summarise what was "
+                    "accomplished instead of continuing."
+                )
+                continue
+            kept.append(call)
+            seen_here.add(key)
+        return kept, refusals
+
+    @staticmethod
+    def _effect_key(call: "ToolCall") -> str:
+        """Identity of a call for duplicate detection: name + canonical params.
+
+        JSON with sorted keys rather than `repr(params)`, because two dicts that
+        differ only in insertion order are the same request, and a model that
+        re-emits a call usually re-emits it in a different order.
+        """
+        try:
+            canonical = json.dumps(
+                call.params or {}, sort_keys=True, ensure_ascii=False, default=str
+            )
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            canonical = repr(sorted((call.params or {}).items()))
+        return f"{call.name}|{canonical}"
+
+    def _verify_claims(
+        self,
+        answer: str,
+        failed: List[str],
+        language: str,
+        errors: List[str],
+    ) -> str:
+        """Never let "Done!" stand unqualified over failed steps.
+
+        Appends rather than replaces: the parts that worked are real, and
+        deleting the model's sentence would hide them. The appended line says
+        which steps did not complete, in the user's language, because that is
+        the difference between a wrong answer and an incomplete one.
+        """
+        if not failed or not answer:
+            return answer
+        if not _SUCCESS_CLAIM.search(answer):
+            return answer
+        steps = ", ".join(dict.fromkeys(failed))
+        note = (
+            f"Note: {len(failed)} step(s) did not complete: {steps}."
+            if language != "ar"
+            else f"ملاحظة: {len(failed)} خطوة ما كملتش: {steps}."
+        )
+        errors.append(f"success claim with {len(failed)} failed step(s)")
+        return f"{answer}\n\n{note}"
+
     async def _run_one(
         self,
         call: "ToolCall",
@@ -1297,8 +1704,12 @@ class AgentEngine:
                     # Instrumentation must never fail the call it measures.
                     try:
                         self.metrics.begin(call.name)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
+                    except Exception as e:  # noqa: BLE001 - instrumentation
+                        # Still never fatal — but "instrumentation is broken"
+                        # used to be indistinguishable from "nothing happened",
+                        # which is how a metrics bug survived for months.
+                        safe_error(e, operation="engine.metrics_begin",
+                                   component="AgentEngine", detail=call.name)
                 beat = asyncio.create_task(
                     _heartbeat(call.name, bus, language), name=f"beat:{call.name}"
                 )
@@ -1356,15 +1767,24 @@ class AgentEngine:
                     )
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a display must not break a turn
-                pass
+            except Exception as e:  # noqa: BLE001 - a display must not break a turn
+                # The turn survives; the reason the panel stayed blank does not
+                # have to be invisible.
+                safe_error(e, operation="engine.tool_event", component="AgentEngine")
             finally:
                 if beat is not None:
                     beat.cancel()
                     try:
                         await beat
-                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    except asyncio.CancelledError:
+                        # The routine path: we asked for this cancellation.
                         pass
+                    except Exception as e:  # noqa: BLE001 - reported, not fatal
+                        # Anything *else* the heartbeat raised is a bug in the
+                        # heartbeat, and this used to be the one place that could
+                        # swallow it while the turn carried on looking normal.
+                        safe_error(e, operation="engine.heartbeat",
+                                   component="AgentEngine", detail=call.name)
                 elapsed_ms = (time.perf_counter() - started_at) * 1000.0
                 record_tool_call(
                     self.metrics, call.name, status, elapsed_ms,

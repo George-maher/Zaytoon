@@ -57,7 +57,7 @@ backend/
 ├── scripts/verify_tool_capability.py # Re-probe the supports_tools claim
 ├── domain/models.py        # Enums (Intent, Language, AgentType), dataclasses,
 │                           #   TokenBucketRateLimiter, SessionState, SpokenSentenceTracker
-├── common/exceptions.py    # ZaytoonError hierarchy
+├── common/reporting.py     # the failure vocabulary: redact / safe_error / client_error
 ├── common/reporting.py     # redact() / safe_error() / client_error()
 ├── common/audit.py         # execution_audit table + recent/count/clear
 ├── scheduler/              # TimeParser, SchedulerManager
@@ -84,7 +84,7 @@ backend/
 │   ├── providers/          # capabilities | store | client | router
 │   ├── workspace/          # files (service) | terminal | git (service)
 │   └── api/                # tasks | projects | files | git | registry routers
-├── tests/                  # 45 test files (16 of them tests/core/), pytest-asyncio
+├── tests/                  # 48 test files (19 of them tests/core/), pytest-asyncio
 ├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
 ├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
 ├── scripts/verify_execution.py    # Live probe: tools, audit, dedupe, processes
@@ -93,8 +93,8 @@ backend/
     data/core.db            # Core runtime (a THIRD file — see below)
 frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
-├── components/             # ChatMessage, MessageList, InputBar, VoicePanel,
-│                           #   StatusDot, SystemMonitor, ReminderPanel, ConfirmationDialog
+├── components/             # ChatMessage, MessageList, InputBar, SystemMonitor,
+│                           #   ReminderPanel, ConfirmationDialog, HUD/, workspace/
 │   ├── Chat/ActivityFeed.jsx  # Agent progress: plan + tool_started/finished log
 │   └── SettingsPanel.jsx   # workspace root, API key, model chain, LLM metrics
 └── styles/index.css        # Tailwind + CSS vars + animations
@@ -122,6 +122,9 @@ tools/
 ├── applications.py  # open_app, close_app, resolve_windows_app
 ├── system.py        # get_time, system_info, calculator, get_volume, screenshot
 ├── web.py           # search_web, open_url
+├── netguard.py      # URL + address policy for BOTH web tools: http(s) only,
+#                    #   no internal addresses (see "one policy, two entry points")
+├── fetch.py         # fetch_url: one bounded, guarded, labelled read of a page
 ├── git.py           # status, log, diff, branch_list | add, commit, checkout, push
 ├── coding.py        # create_project, run_npm, run_tests
 ├── media.py         # play_media (media keys)
@@ -413,9 +416,46 @@ writes under `C:\Windows\System32`, killing `explorer.exe`, …), and a static
 
 | Tier | Meaning | Examples |
 |---|---|---|
-| `safe` | runs without asking | `get_time`, `system_info`, `file_read`, `search_web`, `open_app`, `git_status`/`git_log`/`git_diff` |
+| `safe` | runs without asking | `get_time`, `system_info`, `file_read`, `search_web`, `fetch_url`, `open_app`, `git_status`/`git_log`/`git_diff` |
 | `confirm` | always asks, whatever the arguments | `file_write`, `create_folder`, `run_npm`, `system_command` (any command), `type_text`, `key_press`, `git_commit` |
 | `dangerous` | asks, and is often refused outright | `file_delete`, `delete_folder`, `registry_write`, `run_code`, plus argument-dependent escalation (killing a system-critical process) |
+
+**`fetch_url` is `safe` because a dialog would be the wrong guard.** A tool that reads
+one URL on the model's word can be pointed at the machine itself — Ollama on
+`127.0.0.1:11434`, a router admin page, and on a cloud VM `169.254.169.254`, which hands
+out credentials. What refuses those is `tools/netguard.py`: http(s) only (with `host:443/path`
+recognised as a host rather than a scheme, and `javascript:`/`data:` still refused), no
+credentials in the URL, no whitespace, and **the address class of every resolved answer**
+checked before connecting — so `127.1`, `0x7f000001`, `2130706433`, `::ffff:127.0.0.1` and
+`127.0.0.1.nip.io` are all caught by what they resolve to, not by how they are spelled —
+re-applied to **every redirect hop**. `FETCH_ALLOW_PRIVATE` opens the LAN and *still* refuses
+link-local. A body is capped in bytes, rendered to text, and prefixed with a header saying it
+is untrusted data and not instructions, because the payload that matters in a fetched page is
+prose. Prompting per page instead would train the user to click through it. Known residual:
+DNS rebinding (see the module docstring — httpx cannot pin a validated IP and verify the
+certificate at once, so this is mitigated, not eliminated). Tests: `tests/test_fetch_url.py`,
+including an opt-in live pair (`ZAYTOON_LIVE_NET=1`) that fetches a real page and asserts the
+local Ollama port is unreachable through the tool.
+
+**`open_url` runs the same policy, in its own words.** It used to keep its own scheme
+checks, which is how two copies of an address policy drift: `fetch_url` refused
+`169.254.169.254` while `open_url` would have opened it, and the page that *tells* the
+model to "open this link for me" is fetched content. So `tools/web.py` calls
+`netguard.parse_public_url` and hands the browser its **rebuilt** URL — host lower-cased,
+default port dropped, so the authority that was judged is byte-for-byte the authority that
+is contacted (the path is deliberately left alone: `..` resolution belongs to the browser,
+and a security component rewriting paths is how you open something nobody asked for).
+Refusals read "not *openable*" via `verb`/`action` kwargs, which exist so a message is
+understandable, never to change a decision. `OPEN_URL_ALLOW_PRIVATE` defaults to **true**
+where `FETCH_ALLOW_PRIVATE` defaults to false — `open_url` hands a URL to the user's own
+browser at the user's own privileges ("open my router page"), while `fetch_url` makes the
+request as the service. What does **not** change: rebinding is mitigated for `fetch_url`
+(name resolved and re-checked before connecting) and *not* mitigated for `open_url`,
+because the browser resolves it later. Found while writing this and fixed in the same
+place: Python's `ipaddress` does not count `100.64.0.0/10` (RFC 6598, carrier-grade NAT)
+as private, and that block is where some clouds serve instance metadata (Aliyun answers at
+`100.100.100.200`) — it is now governed by the same flag as the private ranges, which
+closes it for `fetch_url` by default without breaking a Tailscale user's NAS.
 
 **Two invariants are enforced structurally, and both are tested:**
 
@@ -469,6 +509,16 @@ are the modifier syntax — escaping them would break `ctrl+c`).
   not wire it back into a request path.
 - Bilingual notices (`en` / `ar`) for decline, timeout, and no-channel cases.
 - Manual check: `python scripts/smoke_confirmation.py deny`.
+- **`POST /chat` is the same turn, minus the stream.** Its payload is
+  `{reply, text, lang, intent, speak, sources}`, and `sources` is the same list the
+  `sources` WebSocket frame carries (`n`, `kind`, `url`, `host`, `title`, `retrieved_at`) —
+  captured in `Orchestrator.run_turn` by subscribing to the agent bus the dispatch is given
+  (`_source_recorder`), the same trick the tool recorder uses. Widening
+  `AgentService.dispatch`'s return type for one field would have been a breaking change to
+  every caller for no gain. Empty means *no page or snippet was read this turn*, which is a
+  fact about the turn, not a missing value — so the key is present on the error path too, and
+  a client never has to guess which shape it got. `TurnResult.to_dict()` carries it for the
+  task-record views.
 
 ## Anti-hallucination / deliberation prompts
 
@@ -628,7 +678,7 @@ half-installed system.
 ## Tests
 
 ```bash
-# backend (2307 tests)
+# backend (2,300+ tests; ~95 s)
 cd backend
 .venv\Scripts\activate && python -m pytest tests/ -v
 
@@ -637,7 +687,7 @@ cd backend
 cd desktop
 ..\backend\.venv\Scripts\python.exe -m pytest tests/ -v
 
-# frontend (376 tests + lint + build)
+# frontend (607 tests + lint + build)
 cd frontend
 npm run verify          # lint && test && build
 ```
@@ -660,7 +710,8 @@ npm run verify          # lint && test && build
 > assertion passed only because the test double's `__repr__` contained its
 > name. Everything downstream was broken and nothing noticed. The replacement
 > asserts `"bound method" not in catalogue` and runs against the real
-> 30-tool registry, because a double that can make a broken thing look fine is
+> the real 36-tool registry, because a double that can make a broken thing
+> look fine is
 > worse than no double. Run the app.
 - `tests/test_free_models.py` — free-model predicate, endpoint + payload guards,
   and an exploding HTTP client proving no request is attempted for a billable model.
@@ -708,8 +759,9 @@ npm run verify          # lint && test && build
   - `test_core_db.py`, `test_core_secrets.py`, `test_core_events.py`,
     `test_core_tasks.py`, `test_task_graph.py`, `test_core_projects.py`,
     `test_core_skills.py`, `test_core_providers.py`, `test_core_workspace.py`,
-    `test_core_terminal.py`, `test_api_core.py`, `test_api_providers.py`,
-    `test_api_tasks.py`, `test_api_workspace.py`.
+    `test_core_terminal.py`, `test_api_core.py` (files, projects, terminal,
+    tasks, reminders, providers, models — one file because they share the app
+    fixture and the unified `{error}` shape assertions).
 - `frontend/src/hooks/useWebSocket.test.js` — the WebSocket protocol reducer,
   the seam both the browser app and the desktop shell depend on.
 - `python scripts/verify_final.py` — live smoke check of all three areas. It is
@@ -766,15 +818,21 @@ React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
   the exact parameters. The `<pre>` block is `dir="ltr"` so an RTL UI cannot
   reorder a command the user is approving.
 
-### Orphaned components (resolved in Increment 1.5)
+### Orphaned components (resolved; the list is now empty)
 
 Eight root-level components existed but were imported nowhere, which is why the
 app had **no text input at all** and no reminders UI. `InputBar`,
-`ReminderPanel` and `SystemMonitor` are now wired. Still orphaned, pending
-deletion or adoption: `ChatInterface.jsx` and `VoiceControls.jsx` (both 0
-bytes), `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
-`useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css`.
-These are the remaining ESLint warnings.
+`ReminderPanel` and `SystemMonitor` are wired. The rest — `ChatInterface.jsx`,
+`VoiceControls.jsx`, `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
+`useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css` —
+were deleted, so `npm run lint` reports zero warnings. That is what makes a new
+warning mean something.
+
+Import **casing** is a portability matter here, not a style one: the HUD
+components live in `components/HUD/`, and a `components/hud/...` specifier
+resolves on Windows and fails to build on Linux.
+`src/imports.case.test.js` asserts exact casing for every relative import,
+because the build that mattered was the one nobody ran.
 
 ## Workspace (file-tool containment)
 
@@ -850,6 +908,10 @@ Intent enum: `chat | code | tools | scheduling | memory | complex | action`. Age
 `ToolAgent` delegates to **`agents/engine.AgentEngine`**, a bounded ReAct loop.
 
 ```
+fast_path.match(message)      (agents/fast_path.py) — anchored, safe-tier only
+  ├─ matched ────────► run the one tool call through the SAME gate/audit/metrics,
+  │                    answer from its output, 0 model calls, turn over
+  └─ no match / not safe / would need approval ──► the loop below
 ask the model (catalogue + observations so far)
   ├─ no tool call ────────────────────► final answer, streamed as prose
   └─ tool call
@@ -859,8 +921,61 @@ ask the model (catalogue + observations so far)
 budget exhausted ──► one forced summary call, so the user still gets an answer
 ```
 
-Three properties are load-bearing, and each has a test in
-`tests/test_agent_engine.py`:
+**Why the short circuit exists and what it may not do.** "what time is it" costs
+a small local model two generations (the call, then the narration of a result it
+already has) and can come back as an invented time. `agents/fast_path.py` matches a
+closed list of phrasings, anchored at both ends, to exactly one tool. It is not a
+permission shortcut: the registry's tier and `RiskAssessor`/`TOOL_ALWAYS_CONFIRM`
+are re-checked per call, so a tool that would prompt the model also bypasses the
+fast path, and re-tiering one closes the shortcut (`ALLOWED_TOOLS` is asserted
+against the live registry in `tests/test_fast_path.py`). There is no fall-through
+*after* execution — an already-run tool is answered from its own outcome, error
+included, because the model re-calling it would launch the app twice.
+`FAST_PATH_ENABLED=false` restores the old behaviour exactly (the engine test module
+disables it so it keeps testing the loop).
+
+**Model calls are bounded process-wide.** `services/llm_client.py` wraps `complete()`
+and `stream()` in `common.concurrency.BoundedGate` — `LLM_MAX_CONCURRENCY` (default
+2) simultaneous generations, strict FIFO queueing, `LLM_QUEUE_TIMEOUT_S` (default
+45) before a waiter is refused with `kind="llm_queue_timeout"` and a sentence that
+says the model is busy rather than broken. It is re-entrant per task because
+`stream()` falls back to a blocking `complete()` inside its own slot; a plain
+semaphore would deadlock there. Occupancy is published at `GET /health` →
+`llm.slots`. This is not a throughput dial: on one GPU, more concurrent
+generations means worse answers and a real chance of an OOM-killed daemon.
+`scripts/measure_fast_path.py` prints both measurements (fast path: 64 model calls
+→ 0, p50 1813 ms → 8 ms against a simulated 900 ms provider).
+
+**A turn has a contract, not just an iteration cap** (`agents/engine.py`).
+`MAX_CALLS_PER_ITERATION` (8) bounds what one reply may dispatch and `MAX_CALLS_PER_TURN`
+(24) bounds the turn; refused calls come back to the model as *observations* (with the
+earlier result attached), never as silence, because silence is what makes a model repeat
+itself. An identical `(name, canonical params)` call that already **succeeded** this turn is
+refused unless the tool is in `REPEAT_SAFE_TOOLS` — a **deny-by-default allow-list**, so any
+unknown or future tool is assumed to have effects (`open_app` is tier `safe`, so nothing else
+would stop a second launch). The list is written out and then *checked*, not derived from
+tiers: safe-tier is necessary and not sufficient (`screenshot` is `safe` and writes a PNG per
+call). `repeat_safe_violations(registry)` reports every drift — a name that is no longer a
+registered tool (dead config), a name whose argument-free call is not tier-safe, and a name
+listed as an alias rather than the canonical tool — and a test requires it to return
+`[]` against `build_default_registry()`. A final answer that claims success (`Done`, `successfully`, `تم`)
+while steps failed gets the unfinished steps appended to it, in the user's language: qualified,
+never deleted. Tests: `tests/test_agent_bounds.py`; removing any of the three guards reddens it.
+
+**Sources are stamped, not policed** (`agents/sources.py`). The ledger records only what a
+tool actually returned: `fetch_url` becomes a *read page*, `search_web` results become
+*snippet-only* entries, same URL = one number, and reading a page that was only seen as a
+snippet upgrades the entry instead of minting a second citation. The numbered list is shown to
+the model in the tool-results message (so `[1]` means the same thing on both sides) and the
+final answer gains a `**Sources**` block plus a method line ("1 search query, 1 page read in
+full, 2 snippets not opened", timestamps UTC). The one enforceable rule is the falsifiable one:
+`[7]` with two sources is called out in the answer and recorded in `LoopResult.errors` — style
+and "should this have had a citation" are left alone. Nothing is deleted from the model's text;
+the appendix is appended, as with P5's claim check. A turn with no sources gets no noise.
+`LoopResult.sources` carries the list for callers (`api`/websocket UI surfacing is P7.3).
+
+Three properties of the dispatch path are load-bearing, and each has a test in
+`tests/test_fast_path.py`:
 
 - **Bounded.** `max_iterations` is a hard ceiling, and hitting it is a *reported*
   outcome (`stopped_reason == "max_iterations"`), not an error.
@@ -990,6 +1105,7 @@ the `message` frame that has to land first.
 | `tool_started` | `{"type":"tool_started","name","label","response_id"}` | Server → Client |
 | `tool_progress` | `{"type":"tool_progress","name","message"}` | Server → Client |
 | `tool_finished` | `{"type":"tool_finished","name","success","summary"}` | Server → Client |
+| `sources` | `{"type":"sources","sources":[{"n","kind","url","host","title","retrieved_at"}]}` (≤12, after the prose) | Server → Client |
 | `error` | `{"type":"error","content":"..."}` | Server → Client |
 | `stt_result` | `{"type":"stt_result","language","voice","duration"}` | Server → Client |
 | `audio_start` | `{"type":"audio_start","language","voice","format":"mpeg"}` | Server → Client |
@@ -1068,33 +1184,59 @@ desktop/
   asserted by `tests/test_bridge.py::TestSecurity`. Destructive actions are *not*
   on the bridge; they travel through the backend's gated tool layer and its
   confirmation flow, which is unchanged.
+- **Paths and URLs leaving the bridge are policed** (`desktop/app/paths.py`):
+  `open_path` and `reveal_in_os` end in `os.startfile` / `open` / `xdg-open`, which
+  *execute* a file the OS calls a program, so a path is accepted only when it
+  resolves (symlinks followed first) inside a granted root — the backend's own
+  workspace, plus the desktop state dir — and only when it is not something the
+  shell would run (`.exe`/`.bat`/`.lnk`/… on Windows, the execute bit or
+  `.desktop` on Linux/macOS). `open_url` accepts `http`/`https` only. Refusals log
+  a reason and return `False`; the bool across the bridge never reveals whether a
+  file exists. `ZAYTOON_OPEN_ROOTS` widens the grant deliberately. Pinned by
+  `desktop/tests/test_bridge_paths.py`, which also pins the workspace-name mirror
+  against `backend/config.py`. **Anything new that hands a path to the OS must go
+  through `path_policy.classify()`.**
 - **The React side of the bridge** is `frontend/src/lib/desktop.js`: a wrapper
   that resolves `window.pywebview.api` once and degrades to no-ops in a plain
   browser, so the same bundle runs as web or desktop. `App.jsx` uses it for OS
   reminders notifications.
-- **Backend lifecycle** (`app/backend.py`, unchanged): probes `127.0.0.1:8000`
+- **Backend lifecycle** (`app/backend.py`): probes `127.0.0.1:8000`
   with a bare `socket.connect_ex`. If nothing answers it spawns
   `ZAYTOON_BACKEND_{PYTHON,MAIN,CWD}` resolved in three tiers — explicit
   override → `backend/.venv` → the running interpreter — with `shell=False`,
   `PYTHONUNBUFFERED=1` and `CREATE_NO_WINDOW`. It polls for up to
-  `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout.
+  `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout. On
+  close it signals the child's whole *process group* — politely first
+  (`SIGTERM` / `taskkill /T`, `/F` only if the group ignores the polite one) —
+  because uvicorn reloads into a child that is ours to clean up but not ours to
+  own; `killpg` runs only when the child is the group leader, and the whole path is
+  bounded so a wedged `wait()` can never hang window close (`desktop/tests/test_desktop_lifecycle.py`).
 - **The safety property that matters:** `BackendProcess.shutdown()` returns
   immediately unless `self._spawned_by_us` is true, and `ensure_running()`
   *releases* its handle if a foreign process took the port. A backend the user
   started by hand is never killed. Covered by
   `TestBackendNeverTouchesAForeignProcess`.
 - **Single instance:** `app/instance.py` claims a named Windows mutex
-  (`Local\Zaytoon.Desktop.Shell.Instance`) before the window exists; a second
-  launch prints a message and exits. The kernel releases the mutex if the
-  owning process dies, so a crash cannot leave a stale lock.
+  (`Local\Zaytoon.Desktop.Shell.Instance`) before the window exists; on
+  Linux/macOS it holds an `flock` on a sibling lock file for the same guarantee —
+  released by the kernel if the owning process dies, so a crash cannot leave a
+  stale lock. A second launch prints a message and exits.
 - **Startup sequence:** parse args → single-instance claim → `WebViewHost.run()`
   → `backend.ensure_running()` → resolve URL (production file vs dev server) →
   create window with `js_api=bridge` → start health-check thread →
   `webview.start()`. On window close: save window state → stop health check →
-  `backend.shutdown()` (only if we spawned it).
-- **Health check:** a daemon thread probes the backend every 5s (0.1s under
-  pytest) and dispatches a `backend-health` CustomEvent into the page, so the
-  React UI can show link status without polling itself.
+  `backend.shutdown()` (only if we spawned it). `run()` is single-shot and its
+  teardown is `try/finally`, so **a failure anywhere — including `import webview`
+  itself, which fails on a Linux box with no WebKit/GTK — still stops the backend**
+  instead of orphaning it in a window that never opened.
+- **Health check:** a daemon thread probes the backend every
+  `ZAYTOON_HEALTH_INTERVAL` seconds (default 5) and records the result on
+  `WebViewHost.backend_up`, which `diagnose()` reports. It deliberately does
+  **not** call `evaluate_js`/`load_html` any more: the page's own
+  `useWebSocket.js` already owns liveness and reconnection, there was no
+  consumer for a `backend-health` event, and touching the WebView from a thread
+  pywebview did not create is unsafe on GTK/Cocoa (WebView2 happens to tolerate
+  it). Cross-thread DOM pushes must go through pywebview's own events.
 - **The asset-server port is pinned, and the backend allowlists it.** In
   production pywebview serves `frontend/dist` itself from a *random* port, and
   a random origin is not one the backend's CORS allowlist recognises — the
@@ -1172,10 +1314,44 @@ desktop/
   `build_tools()`; `core.skills.load_skill_tools()` loads them into the one
   live `ToolRegistry` at lifespan (so `/tools`, health, the agent catalogue and
   execution all see them). Contained realpath import, per-skill module
-  namespace, **permission floor: a skill cannot self-declare `safe`** (raised
-  to `confirm` at registration *and* enforced at the gate — see
-  `TestSkillToolsAreGated`), name collisions refused, failures reported never
-  fatal.
+  namespace, name collisions refused, failures reported never fatal.
+- **The skill permission floor (P6).** A skill cannot self-declare `safe`: the
+  loader raises the instance tier *and* passes `floor=PERMISSION_CONFIRM` to
+  `ToolRegistry.register`, which records it in `self._floors` and applies it in
+  `assess()` via `_apply_floor`. The second half is the one that matters —
+  `BaseTool.permission` is a mutable attribute on third-party code, so a tool that
+  assigns `self.permission = "safe"` (or `""`) inside `execute()` used to leave the
+  gate after its first approval. Floors are **sticky and monotone**: `register` can
+  only raise one, an unknown floor string is a `ValueError` (a typo must not mean
+  "no floor"), and only `unregister` removes one. Anything *showing* a tier —
+  `describe()`, `by_tier()`, `effective_tier()` — reads the registry, never the
+  object, so a lying tool cannot advertise itself as harmless.
+- **Shipped security skills (P7.5).** `skills/` at the repository root holds three
+  read-only skills — `log-review`, `dependency-review`, `file-audit` — installed by
+  `python backend/scripts/install_shipped_skills.py` (explicit, offline, and **not enabled**
+  afterwards: an enabled skill injects instructions into every turn, so that is a decision).
+  They are passive **by construction, not by promise**: `tests/core/test_shipped_skills.py`
+  parses each shipped module and fails on any import outside
+  `{json, hashlib, os, re, typing, tools.*}`, any call to `os.remove`/`os.chmod`/
+  `shutil.*`/`subprocess`/`socket`/…, any `open()` in a write mode, and any `eval`/`exec`.
+  They also declare `permissions: ["filesystem.read"]` and the P6 gap check runs against
+  them, so a tool that later grows a need the manifest did not ask for fails the build.
+  Their tools still get the `confirm` floor — being shipped by us is not an exemption,
+  because an exemption list is where a floor leaks. Certificates are reported as
+  "PEM certificate (not decoded…)" rather than clean: `cryptography` is not a dependency,
+  `openssl` would mean running a program, and a skipped check printed as a pass is how an
+  audit tool lies.
+- **Skill policy gaps (P6).** `core.permissions.gaps_for(tool_name,
+  tool_declared, manifest_declared)` compares what a tool needs with what its
+  `skill.json` asked for, minus what the `confirm` floor grants anyway
+  (`SKILL_FLOOR_GRANTS`) — so a quiet hello tool reports nothing and a skill
+  shipping `git_reset_hard` without `git.destructive` reports exactly that.
+  Advisory by default (`report["policy"]` + a warning + one startup line);
+  `SKILL_STRICT_PERMISSIONS=true` turns a gap into a refusal to load that tool. An
+  unreadable manifest now refuses the skill's tools entirely: no manifest means no
+  approved policy. `Permission` is a `str` Enum whose `hash` is the member's, so
+  all comparisons go through `_names()` on `.value` — a raw set difference would
+  have reported every skill as a violator. Tests: `tests/core/test_skill_policy.py`.
 - **What the model changed (Ph6):** `BaseTool.mutates_files` + a per-turn
   recorder in the orchestrator → `task.tools_used` / `task.files_changed` and a
   `file.changed` event (failed/declined tools count as used but claim no file
@@ -1193,10 +1369,29 @@ desktop/
   keys and counters untouched). Every failing response across all failure
   classes is pinned as `{"error": str}` (never FastAPI's `{"detail": ...}`)
   by `TestErrorShapeIsUnified`.
-- **E2E verification (Ph9):** `backend/scripts/e2e_scenarios.py` drives seven
-  scripted acceptance scenarios over the real WebSocket (bilingual turn, safe
-  tool, confirmation approve/decline, reminder round-trip, diagnostics shapes,
-  containment + audit, policy guards) and finished **7/7**. It caught four
+- **OS parity contract (P8):** three systems, one contract — *the same answer, or
+  a stated reason*. Concretely: `tools/applications.py` resolves an app name via
+  Start-Menu shortcuts (Windows), a depth-one `.app` bundle scan of
+  `/Applications` (macOS, case- and space-insensitive) or `PATH` (Linux);
+  `core/system_resources.py` reads `GetGlobalMemoryStatusEx`, `/proc/meminfo`
+  + `/proc/stat`, and `vm_stat`/`sysctl -n kern.cp_time|hw.memsize|vm.page_size`
+  respectively, and every branch returns the **same keys** (`percent`,
+  `used_bytes`, `total_bytes`) so `GET /system` has one shape on every OS;
+  `tools/system.py` picks a volume backend by probing (`SendKeys` / `osascript`
+  / `pactl` / `amixer`) and refuses rather than approximating — `level` is
+  absolute (Windows: 100 up-keys then `100 - level` down-keys, because a raw
+  key-press count is a *relative* nudge), and mute is refused on Windows because
+  that key only toggles and nothing here can read the state back. Unavailable
+  counters report `status: unavailable` + `reason`; the first CPU sample is
+  `status: sampling`, never `0%`. `tests/test_posix_parity.py` pins all of it on
+  Linux by faking the platform and the command output; `macos-latest` in the CI
+  matrix is where the real `vm_stat`/`sysctl`/`open` behaviour gets answered.
+- **E2E verification (Ph9, nine scenarios since P8):**
+  `backend/scripts/e2e_scenarios.py` drives nine scripted acceptance scenarios
+  over the real WebSocket (bilingual turn, safe tool, confirmation
+  approve/decline, reminder round-trip, diagnostics shapes, containment + audit,
+  policy guards, **OS capability parity**, **citation discipline**) and finished
+  **7/7** in its original form. It caught four
   defects no unit test covered, each now pinned by a test: the WS
   `reminder_cmd` call site whose function was never written
   (`tests/test_websocket_reminders.py` drives the real handler), reminders
@@ -1209,6 +1404,17 @@ desktop/
   (`AgentEngine.gate_refused` exempts prose only after a real gate refusal;
   `test_a_decline_exempts_prose_from_the_tool_nag`). The runner waits for the
   terminal `done` frame, which the transport emits only after TTS drain.
+  Since P8 the runner is honest on a machine with **no model running**:
+  `classify_error()` reads both the `error` frame *and* the final message, because
+  the controlled unavailability notice is a normal `message` (P1 decision), so an
+  exhausted free tier SKIPs with what was still verified instead of FAILing. The
+  two platform-blind expectations were the other reason the script lied: a
+  `C:\Windows\…` write is only an escape on Windows (elsewhere it is a legal
+  filename *inside* the workspace, so `/etc/passwd`, `../` and `~/` are the POSIX
+  probes), and scenario 3 falls back to `_gate_without_model()`, which proves the
+  gate at the registry — a confirmation-required command denied with nothing on
+  disk, `echo hi & hostname` blocked — so "no model here today" never means "the
+  gate went untested".
 
 ## Notes
 

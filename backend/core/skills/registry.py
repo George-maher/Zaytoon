@@ -447,27 +447,52 @@ def create(
     return load(target).to_dict()
 
 
+class SkillOutsideRoot(ValueError):
+    """``name`` does not address something inside the skills root.
+
+    An explicit exception rather than a bare ``ValueError`` so the API layer can
+    map *this* refusal to 403 without also turning a malformed argument into a
+    "you are not allowed" answer.
+    """
+
+
 def remove(name: str, root: Optional[str] = None) -> bool:
     """Delete an installed skill directory.
 
-    Refuses anything outside the skills root, and refuses to follow a symlink —
-    ``shutil.rmtree`` on a symlinked directory has bitten a lot of tools.
+    Returns ``False`` when there is nothing to remove and raises
+    :class:`SkillOutsideRoot` when ``name`` addresses something outside the
+    skills root — "not found" and "not yours to delete" are different answers
+    and the UI has to be able to tell them apart.
+
+    Containment is judged on the *lexical* path, before symlinks are followed.
+    Resolving first was the bug: a link that lives inside the root and points
+    outside it resolved to the outside target, the containment check then
+    refused it, and the skill became permanently undeletable — which is the
+    opposite of what the guard is for. A symlink is removed *as a link*
+    (``os.unlink``), so the target is never touched; ``shutil.rmtree`` is only
+    ever reached for a real directory inside the root.
     """
     base = os.path.realpath(os.path.abspath(root or skills_root()))
-    target = os.path.join(base, name)
+    target = os.path.abspath(os.path.join(base, name))
 
-    try:
-        resolved = os.path.realpath(os.path.abspath(target))
-    except (OSError, ValueError):
-        return False
-    if resolved != base and os.path.commonpath([resolved, base]) != base:
-        raise ValueError(f"Refusing to remove a skill outside {base}")
+    lexical = os.path.commonpath([target, base]) == base or target == base
+    if not lexical:
+        raise SkillOutsideRoot(f"Refusing to remove a skill outside {base}")
+
     if os.path.islink(target):
         os.unlink(target)
         bus.publish(CoreEventType.SKILL_CHANGED, skill=name, action="removed")
+        logger.info("Removed skill link %s", name)
         return True
-    if not os.path.isdir(resolved):
+
+    if not os.path.isdir(target):
         return False
+
+    # A real directory is only removed if *it* also stays inside the root, which
+    # costs nothing here and catches a root that is itself under a symlink.
+    resolved = os.path.realpath(target)
+    if os.path.commonpath([resolved, base]) != base and resolved != base:
+        raise SkillOutsideRoot(f"Refusing to remove a skill outside {base}")
     shutil.rmtree(resolved)
     bus.publish(CoreEventType.SKILL_CHANGED, skill=name, action="removed")
     logger.info("Removed skill %s", name)
@@ -488,6 +513,7 @@ def skill_detail(name: str, root: Optional[str] = None) -> Optional[Dict[str, An
 
 __all__ = [
     "MAX_ENABLED",
+    "SkillOutsideRoot",
     "SkillExists",
     "SkillLimitExceeded",
     "build_skill_context",

@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import DesktopConfig, default_repo_root  # noqa: E402
+from app import theme  # noqa: E402
 from scripts.smoke_desktop import SmokeHost, _check  # noqa: E402
 
 
@@ -149,7 +150,14 @@ def main() -> int:
     print()
     print("  tokens resolved on :root")
     checks = [
-        _check("accent is the new cyan (#22d3ee)", s.get("accent") == "#22d3ee", s.get("accent", "")),
+        # The accent's *value* is a design decision, so the probe compares it against
+        # the theme token instead of a hex literal that was already stale (#22d3ee
+        # became magenta #d946ef in both clients).
+        _check(
+            "accent is theme.ACCENT",
+            s.get("accent", "").lower() == theme.ACCENT.lower(),
+            f"{s.get('accent', '')} vs {theme.ACCENT}",
+        ),
         _check("void is the new near-black (#05070a)", s.get("void") == "#05070a", s.get("void", "")),
         _check("input fill resolved (not empty)", bool(s.get("inputBg")), s.get("inputBg", "")),
         _check("input text resolved (not empty)", bool(s.get("inputText")), s.get("inputText", "")),

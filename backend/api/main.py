@@ -4,8 +4,7 @@ import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, UploadFile, File
@@ -28,7 +27,7 @@ from config import config, PROVIDER_OLLAMA, TIER_FAST, TIER_REASONING
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
 from services.auth import get_device_auth, PermissionScope
-from services.llm_client import get_llm_client
+from services.llm_client import get_llm_client, llm_gate
 from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
 from tools.metrics import get_tool_metrics
@@ -41,6 +40,8 @@ from api.websocket import (
 )
 from domain.models import TokenBucketRateLimiter
 from services.agent_service import AgentService
+from services import workspace_settings
+from services.provider_health import provider_health
 
 # The Zaytoon core runtime: task system, projects, files, skills, providers,
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
@@ -153,6 +154,15 @@ async def lifespan(app):
     except Exception as e:
         safe_error(e, operation="startup.ai_settings", component="api.startup")
 
+    # Before any tool can run: the workspace root is the containment boundary of
+    # every file tool, so a saved choice has to be in place when the first turn
+    # starts — and a saved path that no longer exists must warn and fall back
+    # rather than stop the backend from booting.
+    try:
+        await workspace_settings.restore(user_prefs)
+    except Exception as e:
+        safe_error(e, operation="startup.workspace", component="api.startup")
+
     # Log provider configuration
     if config.PROVIDER == "ollama":
         logger.info(
@@ -187,9 +197,10 @@ async def lifespan(app):
             logger.info("Free-model policy: OK (all configured models allow-listed)")
         if not config.llm_configured:
             logger.error(
-                "OPENROUTER_API_KEY is not set. Zaytoon calls OpenRouter only "
-                "(local model execution has been removed), so the assistant will "
-                "be unable to answer until a key is configured."
+                "OPENROUTER_API_KEY is not set, so the assistant cannot answer. "
+                "Set it in backend/.env, or run locally instead with "
+                "AI_PROVIDER=ollama (no key needed, `ollama serve` required). "
+                "There is no automatic switch between the two."
             )
     
     logger.info("Tool safety sandbox: %s (confirm timeout %.0fs)",
@@ -227,6 +238,17 @@ async def lifespan(app):
                 len(skill_report["tools"]),
                 ", ".join(skill_report["tools"]),
             )
+        # A startup that loaded nothing because every skill was broken has to be
+        # readable in one line, not reconstructed from per-module warnings.
+        if skill_report["errors"] or skill_report.get("policy"):
+            logger.warning(
+                "Skill tools incomplete: %d refusal(s), %d undeclared-permission "
+                "gap(s)%s",
+                len(skill_report["errors"]),
+                len(skill_report.get("policy", [])),
+                "" if config.SKILL_STRICT_PERMISSIONS
+                else " (SKILL_STRICT_PERMISSIONS=false: loaded anyway)",
+            )
     except Exception as e:
         safe_error(e, operation="startup.skill_tools", component="api.startup")
 
@@ -263,6 +285,17 @@ async def lifespan(app):
         await get_terminal_manager().close_all("backend shutting down")
     except Exception as e:
         safe_error(e, operation="shutdown.terminals", component="api.shutdown")
+    # Same reasoning, different table: interactive shells and `process_start`
+    # children are separate registries, and each had to be closed on its own.
+    if config.PROCESS_STOP_ON_SHUTDOWN:
+        try:
+            from tools.processes import registry as process_registry
+
+            stopped = await process_registry.close_all("backend shutting down")
+            if stopped:
+                logger.info("Stopped %d tracked process(es)", stopped)
+        except Exception as e:
+            safe_error(e, operation="shutdown.processes", component="api.shutdown")
     await scheduler.stop()
     await close_shared_client()
     await get_llm_client().aclose()
@@ -274,10 +307,32 @@ async def lifespan(app):
     # leaves that connection open until the process exits.
     from services.ollama_client import close_ollama_client
     await close_ollama_client()
+    # Last, because everything above may still log through it: the memory agent
+    # owns the only aiosqlite connection, and closing it after the loop is gone
+    # is what produced `RuntimeError: Event loop is closed` at the end of every
+    # test run — a warning that trained everyone to ignore the output.
+    try:
+        await memory_agent.close()
+    except Exception as e:
+        safe_error(e, operation="shutdown.memory", component="api.shutdown")
     logger.info("Zaytoon AI backend shut down")
 
 
-app = FastAPI(title="Zaytoon AI Assistant", version="3.0.0", lifespan=lifespan)
+#: The one version string: it appeared twice (here and in `/health`), and a
+#: bump that missed one left the two disagreeing for whoever compared them.
+APP_VERSION = "3.0.0"
+
+#: Process start, for `/health`. Monotonic for the duration, wall-clock for the
+#: "when did this process come up" the log and the UI can compare against.
+_STARTED_MONOTONIC = time.monotonic()
+_STARTED_AT = datetime.now(timezone.utc)
+
+
+def _uptime_seconds() -> float:
+    return round(time.monotonic() - _STARTED_MONOTONIC, 3)
+
+
+app = FastAPI(title="Zaytoon AI Assistant", version=APP_VERSION, lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -491,9 +546,37 @@ async def health():
         except Exception as e:  # pragma: no cover - defensive
             routing["tools"] = {"models": [], "error": redact(str(e))}
 
+    # The verdict has to combine two different questions that were previously
+    # conflated. `provider_ready` is "is it configured?"; the probe is "did a
+    # real handshake just succeed?". Reporting only the first made a stopped
+    # daemon look healthy to the desktop supervisor and to the HUD.
+    probe = await provider_health.status()
+    usable = (
+        config.provider_ready
+        and probe["state"] in ("reachable",)
+        and not probe.get("missing_models")
+    )
+    if not config.provider_ready:
+        status = "degraded"
+    elif usable:
+        status = "ok"
+    elif probe["state"] == "never_probed":
+        # Nothing has been tried yet on a metered provider, so there is no
+        # evidence either way. `ok` would be a guess; `degraded` would be an
+        # alarm. Say what is actually known.
+        status = "unverified"
+    else:
+        status = "degraded"
+
     return {
-        "status": "ok" if config.provider_ready else "degraded",
-        "version": "3.0.0",
+        "status": status,
+        "status_reason": (
+            "" if status == "ok"
+            else "provider not configured" if not config.provider_ready
+            else "no request has been made yet" if status == "unverified"
+            else probe.get("error") or "provider unreachable"
+        ),
+        "version": APP_VERSION,
         "llm": {
             **config.describe_llm(),
             "chain": chain,
@@ -502,6 +585,14 @@ async def health():
             "max_attempts": client.max_attempts,
             "model_health": client.health_snapshot(),
             "metrics": client.metrics.to_dict(),
+            # "Why is it slow?" deserves a number. With a cap in place, the
+            # difference between "the model is slow" and "eight of my own
+            # requests are queued behind each other" is only visible here.
+            "slots": llm_gate().stats(),
+            # The probe's own report card, next to the counters it complements:
+            # `configured` answers "is there an endpoint and a key", `probe`
+            # answers "can it answer right now".
+            "probe": probe,
         },
         "agents": ["router", "planner", "fast", "code", "tool", "memory", "scheduler"],
         # Tool-layer health, alongside (not inside) `llm.metrics`: one answers
@@ -521,7 +612,14 @@ async def health():
         # is `core`. Reporting only the first made the whole workspace look
         # absent when it was merely on a different code path.
         "core": await _core_health(),
-        "uptime": time.time(),
+        # `uptime` was `time.time()` — a Unix epoch in a field named for a
+        # duration, which read as ~56 years of uptime. `GET /system` already
+        # answers this correctly (`uptime_seconds` from psutil/boot time); this
+        # is the process's own clock, monotonic so a system-clock change cannot
+        # make the app appear to have started in the future.
+        "uptime": _uptime_seconds(),
+        "uptime_seconds": _uptime_seconds(),
+        "started_at": _STARTED_AT.isoformat(timespec="seconds"),
     }
 
 
@@ -652,7 +750,11 @@ async def chat_endpoint(data: dict):
     )
 
     if result.error:
-        return {"error": result.error, "speak": False}
+        # `sources` here for the same reason it is on the success path: a client
+        # should never have to know which branch it is parsing. An error turn that
+        # did read pages reports them, because "it failed, and here is what it had
+        # already read" is more useful than either half alone.
+        return {"error": result.error, "speak": False, "sources": list(result.sources)}
 
     reply = result.reply or ""
     if reply:
@@ -664,6 +766,12 @@ async def chat_endpoint(data: dict):
         "lang": lang,
         "intent": result.intent,
         "speak": bool(reply),
+        # The same list the `sources` WebSocket frame carries. Additive: a client
+        # that ignores it is no worse off, and one that shows it can answer
+        # "where did this come from?" without the model's say-so. An empty list
+        # means no page or snippet backed this turn — not that the answer is
+        # unverified *and* silent.
+        "sources": list(result.sources),
     }
 
 
@@ -709,38 +817,29 @@ async def get_workspace():
 async def set_workspace(data: dict):
     """Point the assistant at a different working directory.
 
-    The change is in-memory for the running process (and persisted as a
-    preference so a restart can restore it). A path that cannot be created is
-    rejected rather than silently ignored, so the UI never shows a workspace
-    the tools are not actually using.
+    Validation lives in `services/workspace_settings` because the startup path
+    applies the same rule: an endpoint that is stricter (or looser) than the
+    restore is how a setting works once and then silently stops working. A path
+    that cannot be used is rejected with the reason, never silently ignored, so
+    the UI cannot show a workspace the tools are not actually using.
     """
-    raw = (data.get("root") or data.get("path") or "").strip()
-    if not raw:
-        raise HTTPException(400, "No workspace path provided")
-
-    candidate = Path(os.path.expandvars(raw)).expanduser()
+    raw = data.get("root") or data.get("path") or ""
     try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        resolved = candidate.resolve()
-    except OSError as e:
+        resolved, note = workspace_settings.resolve_root(str(raw))
+    except workspace_settings.WorkspaceRejected as e:
         logger.warning("Rejected workspace %r: %s", raw, e)
-        raise HTTPException(400, f"Cannot use that directory: {redact(str(e))}")
+        raise HTTPException(400, redact(str(e))) from e
 
-    if not resolved.is_dir():
-        raise HTTPException(400, "Not a directory")
-
-    config.WORKSPACE_ROOT = str(resolved)
-    # Persist so a restart keeps the user's choice.
-    try:
-        await user_prefs.set("workspace_root", str(resolved))
-    except Exception as e:  # preferences are best-effort
-        safe_error(
-            e, operation="prefs.workspace", component="api.settings",
-            detail="workspace not persisted",
-        )
+    workspace_settings.apply_root(resolved)
+    persisted = await workspace_settings.persist(resolved, user_prefs)
 
     logger.info("Workspace root set to %s", resolved)
-    return {"status": "saved", **config.describe_workspace()}
+    return {
+        "status": "saved",
+        "note": note,
+        "persisted": persisted,
+        **config.describe_workspace(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +963,10 @@ async def set_ai_settings(data: dict):
     # Invalidate provider singleton so new settings take effect
     from services.ai_provider import close_provider
     await close_provider()
+    # ...and drop the cached health verdict, which describes the *old* endpoint.
+    # A user who just repointed the provider must not watch /health report the
+    # previous daemon for another TTL window.
+    provider_health.invalidate()
     
     # Verify new configuration
     from services.ai_provider import get_provider
@@ -956,8 +1059,8 @@ async def _run_pull(provider, model: str) -> None:
             # The next `GET /settings/ai` must see the model just installed.
             try:
                 provider.invalidate_cache()
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - best-effort cache refresh
+                safe_error(e, operation="settings.invalidate", component="api.startup")
 
 
 @app.post("/settings/ai/pull")

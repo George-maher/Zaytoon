@@ -13,12 +13,19 @@ keeps the two safety properties that mattered most:
 
 The TCP probe is a bare ``socket.connect_ex``, so this module never needs an
 HTTP client and never blocks on a slow response.
+
+Ownership is the whole design: a child we started is killed *as a tree*, because
+``uvicorn`` is not the only process involved — a dev server or watcher started
+through ``process_start`` is a grandchild of the shell, and terminating only the
+direct child leaves it holding the port and the database lock. A backend we did
+not start is never signalled at all.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -30,6 +37,14 @@ logger = logging.getLogger(__name__)
 
 #: ``CREATE_NO_WINDOW`` — keeps a console window from flashing on Windows.
 CREATE_NO_WINDOW = 0x08000000
+
+#: How long a managed backend gets to stop itself before the tree is killed.
+SHUTDOWN_GRACE_S = 8.0
+
+#: And how long it then gets to actually be gone. After this the child is
+#: abandoned with a log line: a shell that hangs on exit is a worse outcome for a
+#: user than one that reports an unkillable grandchild.
+KILL_WAIT_S = 5.0
 
 VENV_PYTHON_CANDIDATES = (
     Path("Scripts") / "python.exe",  # Windows
@@ -175,6 +190,11 @@ class BackendProcess:
         kwargs: dict = {"cwd": cwd, "env": env}
         if os.name == "nt":
             kwargs["creationflags"] = CREATE_NO_WINDOW
+        else:
+            # Its own process group, so `shutdown` can signal the backend *and*
+            # whatever the backend started. Without this, SIGTERM reaches uvicorn
+            # only and a managed child of the agent outlives the shell.
+            kwargs["start_new_session"] = True
 
         try:
             self._child = subprocess.Popen(  # noqa: S603 - argv list, no shell
@@ -204,25 +224,97 @@ class BackendProcess:
 
         return self.status()
 
+    def _is_our_group_leader(self, child: subprocess.Popen) -> bool:
+        """True when the child heads the process group we gave it.
+
+        The guard that makes tree-signalling safe: `start_new_session=True` makes
+        the child a leader, so its group contains the backend and nothing else. If
+        that ever failed, or the child re-parented itself, `os.getpgid(pid)` would
+        be *our* group and `killpg` would send SIGKILL to the shell itself.
+        """
+        try:
+            return os.getpgid(child.pid) == child.pid
+        except (OSError, AttributeError):  # AttributeError: no getpgid on Windows
+            return False
+
+    def _signal_tree(self, child: subprocess.Popen, *, force: bool) -> bool:
+        """Signal the backend and everything it started. Returns whether it worked.
+
+        `force=False` is the polite request (SIGTERM / `taskkill` without `/F`),
+        which matters because a backend that exits promptly on SIGTERM would
+        otherwise leave *its own* children — a dev server started through
+        `process_start`, a watcher — holding the port and the SQLite lock. Killing
+        the tree is the point of owning the process, not an escalation footnote.
+        """
+        try:
+            if os.name == "nt":
+                # argv list, no shell. `TerminateProcess` (what Popen.kill does)
+                # kills one process and orphans the rest, hence taskkill /T.
+                argv = ["taskkill", "/PID", str(child.pid), "/T"] + (["/F"] if force else [])
+                result = subprocess.run(  # noqa: S603 - fixed argv, no user input
+                    argv,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=CREATE_NO_WINDOW,
+                    timeout=15,
+                    check=False,
+                )
+                return result.returncode == 0
+            if not self._is_our_group_leader(child):
+                return False
+            os.killpg(os.getpgid(child.pid), signal.SIGKILL if force else signal.SIGTERM)
+            return True
+        except Exception:  # noqa: BLE001 - deliberately broad
+            # `shutdown()` is called from a window-close handler and from a
+            # `finally`, and its contract is "never raise": a teardown that throws
+            # takes the caller's cleanup with it and leaves the backend running.
+            # OSError and SubprocessError cover the expected cases; anything else
+            # (a stubbed `subprocess` in a test, an unsupported flag, a fake child)
+            # is still a reason to give up on signalling, not a reason to propagate.
+            logger.debug("tree signalling failed", exc_info=True)
+            return False
+
     def shutdown(self) -> None:
-        """Terminate the child — but only if this process started it."""
+        """Terminate the child — but only if this process started it.
+
+        Bounded at ``SHUTDOWN_GRACE_S + KILL_WAIT_S`` and exception-free by
+        contract: this runs from the window-close handler, and a raise here used
+        to surface as a traceback during shutdown (``child.wait`` after the kill
+        was unguarded, so a `TimeoutExpired` escaped into `_on_closed`).
+        """
         child, self._child = self._child, None
         if child is None or not self._spawned_by_us:
             self._spawned_by_us = False
             return
         self._spawned_by_us = False
-        if child.poll() is not None:
-            return
-        logger.info("stopping backend pid=%s", child.pid)
         try:
-            child.terminate()
+            if child.poll() is not None:
+                return
+            logger.info("stopping backend pid=%s (and its tree)", child.pid)
+            if not self._signal_tree(child, force=False):
+                child.terminate()  # the group was unavailable: at least take the child
             try:
-                child.wait(timeout=8)
+                child.wait(timeout=SHUTDOWN_GRACE_S)
             except subprocess.TimeoutExpired:
-                logger.warning("backend pid=%s ignored terminate; killing", child.pid)
-                child.kill()
-                child.wait(timeout=5)
-        except OSError as exc:  # pragma: no cover - process already gone
+                logger.warning("backend pid=%s ignored terminate; killing its tree", child.pid)
+                if not self._signal_tree(child, force=True):
+                    child.kill()
+                try:
+                    child.wait(timeout=KILL_WAIT_S)
+                except subprocess.TimeoutExpired:  # pragma: no cover - unkillable
+                    logger.warning(
+                        "backend pid=%s did not exit %.0fs after a tree kill; abandoning it",
+                        child.pid,
+                        KILL_WAIT_S,
+                    )
+        except Exception as exc:  # noqa: BLE001 - deliberately broad
+            # "Exception-free by contract" has to mean every step, not every step
+            # we predicted: `poll`/`terminate`/`kill` raise `OSError` when the
+            # process is already gone (the expected case) and anything else when the
+            # handle itself is unusual, and this runs inside a `finally` and inside
+            # the window-close handler, where a raise replaces cleanup with a
+            # traceback. A regression test on the Windows leg found the fallback
+            # path unguarded.
             logger.warning("error stopping backend: %s", exc)
 
     def __enter__(self) -> "BackendProcess":

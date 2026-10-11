@@ -1,0 +1,17 @@
+{
+  "name": "file-audit",
+  "version": "1.0.0",
+  "description": "Hashes files, checks permissions and file-type structure (exec bits, world-writable, setuid, PEM certificates, symlinks leaving the workspace). Reads and computes only; it changes nothing.",
+  "instructions": "instructions.md",
+  "tools": [],
+  "permissions": [
+    "filesystem.read"
+  ],
+  "enabled": false,
+  "tags": [
+    "security",
+    "passive",
+    "audit"
+  ],
+  "author": "Zaytoon (shipped)"
+}

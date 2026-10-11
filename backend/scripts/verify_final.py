@@ -13,7 +13,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 sys.path.insert(0, ".")
 
 from config import config, is_free_model, NonFreeModelError  # noqa: E402
-from services.llm_client import get_llm_client, _AttemptBudget  # noqa: E402
+from services.llm_client import get_llm_client, LLMError, _AttemptBudget  # noqa: E402
 from services.model_registry import is_free_router, spec_for  # noqa: E402
 from services.completion_validator import validate_completion  # noqa: E402
 from voice import routing  # noqa: E402
@@ -36,6 +36,32 @@ def check(label, condition, detail=""):
     if not condition:
         ok = False
     print(f"  [{'PASS' if condition else 'FAIL'}] {label} {detail}")
+
+
+def skip(label, detail=""):
+    """A check the environment could not answer — never a silent pass.
+
+    This verifier's job is policy, and policy is checkable offline. What is *not*
+    offline is building a model chain: `build_chain` raises `LLMError` on a
+    machine with no key and no local runtime — which is exactly a fresh clone and
+    exactly CI — and the traceback used to kill the script at line 72 with the
+    remaining ~25 checks never run. A SKIP says what went unmeasured; a crash
+    says nothing and hides them all.
+    """
+    print(f"  [SKIP] {label} {detail}")
+
+
+def chain(tier, intents=()):
+    """Build a model chain, or return None with the reason it could not be built.
+
+    `build_chain` raises `LLMError` when the configured provider has no
+    credentials — normal on a fresh clone and on CI — and a verifier that dies
+    there reports nothing at all.
+    """
+    try:
+        return get_llm_client().build_chain(tier, intents), ""
+    except Exception as exc:  # noqa: BLE001 - reported as an unmeasured check
+        return None, str(exc).splitlines()[0][:150]
 
 
 print("=" * 68)
@@ -69,17 +95,26 @@ check(
     not any(is_free_router(m) for m in config.free_fallback_models),
 )
 
-chain = get_llm_client().build_chain("fast")
-print(f"  chain     : {[e.label for e in chain]}")
-check("every chain endpoint is free", all(e.is_free for e in chain))
-check("the auto-router is never in a chain", not any(is_free_router(e.model) for e in chain))
-
-tool_chain = get_llm_client().build_chain("fast", ("tools",))
-print(f"  tool chain: {[e.label for e in tool_chain]}")
-check(
-    "every model in a tool chain can call tools",
-    all(spec_for(e.model) and spec_for(e.model).supports_tools for e in tool_chain),
-)
+fast_chain, why = chain("fast")
+if fast_chain is None:
+    skip("every chain endpoint is free / no auto-router", f"— no chain: {why}")
+    tool_chain, _ = None, why
+else:
+    print(f"  chain     : {[e.label for e in fast_chain]}")
+    check("every chain endpoint is free", all(e.is_free for e in fast_chain))
+    check(
+        "the auto-router is never in a chain",
+        not any(is_free_router(e.model) for e in fast_chain),
+    )
+    tool_chain, _ = chain("fast", ("tools",))
+if tool_chain is None:
+    skip("every model in a tool chain can call tools", "— no chain to inspect")
+else:
+    print(f"  tool chain: {[e.label for e in tool_chain]}")
+    check(
+        "every model in a tool chain can call tools",
+        all(spec_for(e.model) and spec_for(e.model).supports_tools for e in tool_chain),
+    )
 
 budget = _AttemptBudget(config.OPENROUTER_MAX_ATTEMPTS)
 taken = [budget.take() for _ in range(config.OPENROUTER_MAX_ATTEMPTS + 3)]
@@ -113,12 +148,19 @@ originals = {
 }
 try:
     config.OPENROUTER_PRIMARY_MODEL = "openai/gpt-4o"
-    degraded = [e.model for e in get_llm_client().build_chain("fast")]
-    check(
-        "a billable model is dropped from the pool, not called",
-        "openai/gpt-4o" not in degraded and degraded,
-        f"-> {degraded[:2]}",
-    )
+    degraded_chain, why = chain("fast")
+    if degraded_chain is None:
+        skip(
+            "a billable model is dropped from the pool, not called",
+            f"— nothing left to drop to: {why}",
+        )
+    else:
+        degraded = [e.model for e in degraded_chain]
+        check(
+            "a billable model is dropped from the pool, not called",
+            "openai/gpt-4o" not in degraded and bool(degraded),
+            f"-> {degraded[:2]}",
+        )
 
     # ...and with nothing free left, it must refuse rather than call.
     for attr in (
@@ -133,6 +175,14 @@ try:
         check("a billable-only pool is refused", False, "(it was allowed!)")
     except NonFreeModelError as e:
         check("a billable-only pool is refused before any request", True, f"-> {e}")
+    except LLMError as e:
+        # It refused — but for the wrong reason (no credentials at all), so the
+        # policy under test was not exercised. Reporting that as a pass would be
+        # the kind of green this script exists to catch.
+        skip(
+            "a billable-only pool is refused before any request",
+            f"— refused for the wrong reason, unmeasured: {str(e)[:80]}",
+        )
 finally:
     for attr, value in originals.items():
         setattr(config, attr, value)

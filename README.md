@@ -2,20 +2,32 @@
 
 **A production-ready multi-agent AI assistant** with voice, memory, scheduling, and streaming TTS. Bilingual Arabic (Egyptian) and English.
 
-Cloud-only and **zero cost**: every model is a hard-allow-listed OpenRouter
-`:free` variant. Local model execution (Ollama / llama.cpp / on-device GGUF) has
-been removed entirely, and a non-free or non-allow-listed model is rejected
-before any network request is made.
+**Local-first.** `AI_PROVIDER=ollama` is the default: inference runs against your
+own Ollama daemon, needs no key, and Zaytoon never downloads a model for you — a
+missing one is reported with the exact `ollama pull` command.
+
+`AI_PROVIDER=openrouter` is the optional cloud path, and its zero-cost policy is
+unchanged: every model must be a hard-allow-listed OpenRouter `:free` variant, so
+a non-free or un-listed id is rejected before any network request is made.
+
+**There is no fallback between the two.** A stopped daemon does not start cloud
+calls, and a rate-limited cloud response does not start running weights on your
+machine. Degradation is a reported failure with a bilingual message, never a
+silent switch. (Until 2026-10-10 this page claimed local execution "has been
+removed entirely", two weeks after `config.py` made it the default — see
+`docs/PHASE0_BASELINE.md`, decision D6).
 
 ## Quick Start
 
 ```bash
-# One-command start (requires Python, Node.js):
-start.bat
+# One-command start (requires Python 3.11+ and Node.js):
+start.bat          # Windows
+./start.sh         # Linux / macOS
 
 # Or manually:
-cd backend && .venv\Scripts\activate && python main.py     # Terminal 1
-cd frontend && npm run dev                                   # Terminal 2
+cd backend && .venv/Scripts/activate && python main.py   # Terminal 1 (Windows)
+cd backend && source .venv/bin/activate && python main.py # Terminal 1 (POSIX)
+cd frontend && npm run dev                                # Terminal 2
 ```
 
 | Service | URL |
@@ -28,14 +40,15 @@ cd frontend && npm run dev                                   # Terminal 2
 ## Features
 
 - **Multi-Agent Architecture** — Router → FastAgent (chat), PlannerAgent (complex), CodeAgent (code), ToolAgent (system), SchedulerAgent (reminders), MemoryAgent (history)
-- **Zero-Cost LLM Stack** — OpenRouter `:free` models only, with an explicit fallback chain (primary → configured free pool); the allow-list and free-form checks both run before any request. `openrouter/free` is explicitly excluded as an uncontrolled auto-router.
+- **Local-first inference** — Ollama with one model per tier (`general` / `coding` / `fast`), env-configurable, never auto-downloaded.
+- **Zero-cost cloud option** — OpenRouter `:free` models only, with an explicit fallback chain (primary → configured free pool); the allow-list and free-form checks both run before any request. `openrouter/free` is explicitly excluded as an uncontrolled auto-router.
 - **Tool Safety Sandbox** — high-risk OS actions pause and require explicit human approval over the WebSocket; shell injection is blocked outright
 - **Voice Interface** — Speech-to-text (faster-whisper) + streaming text-to-speech (edge-tts) with voice activity detection
 - **Dynamic Bilingual TTS** — voice is chosen per message from the detected language: `ar-EG-ShakirNeural` for Egyptian Arabic, `en-GB-RyanNeural` for English, with automatic fallbacks
 - **Arabic / English** — Full bilingual support with Egyptian Arabic dialect detection
 - **Scheduling** — Parse natural time expressions in Arabic/English, persistent reminders across sessions
 - **Streaming Responses** — Real-time token streaming + early TTS trigger for immediate audio feedback
-- **Desktop App** — a native window hosting the same React UI through pywebview (WebView2 on Windows), with a closed OS bridge (file dialogs, reveal-in-OS, notifications, clipboard) and PyInstaller `.exe` builds
+- **Desktop App** — a native window hosting the same React UI through pywebview (WebView2 on Windows, WebKit/GTK on Linux), with a closed OS bridge (file dialogs, reveal-in-OS, notifications, clipboard) and PyInstaller `.exe` builds
 
 ## Architecture
 
@@ -43,12 +56,12 @@ cd frontend && npm run dev                                   # Terminal 2
 root/
 ├── backend/        # Python FastAPI — agents, voice, scheduler, tools, memory
 │   ├── api/        # REST + WebSocket endpoints
-│   ├── agents/     # 6 specialized AI agents
+│   ├── agents/     # 7 agents + a bounded ReAct engine
 │   ├── services/   # LLMClient (provider + model fallback chain)
 │   ├── voice/      # STT (whisper) + TTS (edge-tts) + language routing
 │   ├── scheduler/  # Time parser + reminder manager
 │   ├── tools/      # OS toolkit (cmd, file, system) + safety sandbox
-│   └── tests/      # 2307 pytest tests
+│   └── tests/      # 2,600+ pytest tests (contract-level, not implementation)
 ├── frontend/       # React + Vite web client
 └── desktop/        # pywebview desktop host — wraps the React UI, spawns the backend
 ```
@@ -62,14 +75,16 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements-dev.txt      # or requirements.txt for runtime only
 cp .env.example .env
-# Edit .env -> set OPENROUTER_API_KEY (https://openrouter.ai/keys)
-# The key is required: there is no local model fallback.
+# Defaults to AI_PROVIDER=ollama, which needs no key — it needs `ollama serve`
+# and the three models pulled (see backend/.env.example for the exact commands).
+# Only set AI_PROVIDER=openrouter + OPENROUTER_API_KEY if you want the cloud
+# path. Nothing falls back between the two.
 
 # 2. Frontend
 cd frontend
 npm install
 
-# 3. (Optional) Desktop orb
+# 3. (Optional) Desktop host
 cd desktop && python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python main.py            # or: python main.py --diagnose
 ```
@@ -87,17 +102,18 @@ refused, so a typo or an injected model id can never reach the network.
 | `OPENROUTER_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | explicit fallback (not auto-router) |
 | `OPENROUTER_FREE_FALLBACK_MODELS` | `nvidia/nemotron-3-super-120b-a12b:free,nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,poolside/laguna-s-2.1:free` | ordered fallback pool |
 
-Anything else raises `NonFreeModelError` before any network call. There is no
-local fallback — if OpenRouter is unreachable the assistant says so rather than
-switching providers. `GET /health` reports the chain, per-model health, and
-request/response metrics.
+Anything else raises `NonFreeModelError` before any network call. If OpenRouter
+is unreachable the assistant says so rather than switching providers — and if you
+are on `AI_PROVIDER=ollama`, these four variables are not what runs; the
+`OLLAMA_*` models are. `GET /health` reports the provider, the chain, per-model
+health and request/response metrics.
 
 ## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.10+, FastAPI, httpx, Uvicorn |
-| AI | OpenRouter free models only (hard-allow-listed) |
+| AI | Ollama (default, local) or OpenRouter `:free` (optional, cloud) |
 | STT | faster-whisper (tiny model, int8) |
 | TTS | edge-tts — auto-selected: `ar-EG-ShakirNeural` / `en-GB-RyanNeural` |
 | Database | SQLite via aiosqlite |
@@ -107,14 +123,15 @@ request/response metrics.
 ## Development
 
 ```bash
-cd backend && python -m pytest tests/ -q      # 2307 tests
+cd backend && python -m pytest tests/ -q      # 2,600+ tests, ~100 s, no network needed
 cd backend && python scripts/verify_final.py  # live smoke check
 cd desktop && python scripts/build_exe.py     # PyInstaller onefile build
 ```
 
-CI runs the backend suite, the free-only guard, the frontend build, and the
-desktop shell tests on every push. See `AGENTS.md` for full architecture
-notes and `desktop/README.md` for packaging.
+CI runs the backend suite (Windows **and** Linux), the provider-policy guards, the
+frontend lint/test/build, and the desktop shell tests on every push. See
+`AGENTS.md` for the full architecture notes; desktop packaging lives in
+`desktop/scripts/build_exe.py` and `docs/ARCHITECTURE.md` §5.
 
 ## Security model
 

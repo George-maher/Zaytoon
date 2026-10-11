@@ -367,6 +367,44 @@ class TestAssetServerPort:
         monkeypatch.setenv("ZAYTOON_DESKTOP_PORT", "5177")
         assert host_mod.pick_asset_server_port() == 5177
 
+    def test_the_backend_cors_policy_covers_every_port_in_the_range(self):
+        """The two halves of one rule, in two packages, kept honest.
+
+        `app/host.py` pins pywebview's asset server into `DESKTOP_PORT_RANGE`, and
+        `backend/api/main.py` allows the desktop origin with a *regex*, because a
+        random port produced an origin the API rejected and every REST call from
+        the shipped UI failed silently. The backend cannot be imported from this
+        venv, so the policy is read as text — the same way this suite pins
+        AGENTS.md and the workflow file. If either side moves alone, this fails.
+        """
+        import pathlib
+        import re
+
+        import app.host as host_mod
+
+        backend_main = (
+            pathlib.Path(__file__).resolve().parents[2] / "backend" / "api" / "main.py"
+        )
+        source = backend_main.read_text(encoding="utf-8")
+        match = re.search(r"allow_origin_regex=r?['\"](.*?)['\"]", source)
+        assert match, (
+            "backend/api/main.py no longer allows the desktop origin by regex; if "
+            "the policy moved somewhere else, update this test and the comment in "
+            "app/host.py that points at it"
+        )
+        pattern = re.compile(match.group(1))
+        for port in host_mod.DESKTOP_PORT_RANGE:
+            for host in ("localhost", "127.0.0.1"):
+                assert pattern.match(f"http://{host}:{port}"), (
+                    f"host.py can bind :{port} but the backend would reject its "
+                    f"origin — DESKTOP_PORT_RANGE and allow_origin_regex must stay in step"
+                )
+        # And the loopback-only half of the promise: a page from another machine
+        # must not read the API just because the port matches, and plain http on
+        # a loopback port is the only scheme the rule is about.
+        assert not pattern.match("http://192.168.0.10:5175")
+        assert not pattern.match("https://localhost:5175")
+
     def test_bad_env_falls_back_to_the_range(self, monkeypatch):
         import app.host as host_mod
 

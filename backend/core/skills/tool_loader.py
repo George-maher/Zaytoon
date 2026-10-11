@@ -17,6 +17,13 @@ Three properties make this safe rather than merely useful:
   ``dangerous`` — only the too-quiet ``safe`` (and any unrecognised value)
   is raised.
 
+A fourth property is checked but not assumed: **a tool may not need more than
+the skill declared**. :func:`core.permissions.gaps_for` compares what each tool
+requires with the manifest's ``permissions``, the loader reports the difference,
+and ``SKILL_STRICT_PERMISSIONS`` turns the report into a refusal. This stays
+*inspection with teeth* rather than a sandbox — the loader cannot know what
+arbitrary Python does, only what the tool admits to and what its tier implies.
+
 The contract lives in the *directory*, not in the manifest's ``tools`` list:
 ``README.md`` inside a created skill says modules in ``tools/`` are picked up,
 and a list that must be edited in step with the folder is a list that goes
@@ -32,6 +39,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from common.reporting import redact, safe_error
+from core.permissions import gaps_for
 from tools.base import BaseTool
 from tools.safety import PERMISSION_CONFIRM, PERMISSION_DANGEROUS, PERMISSION_SAFE
 
@@ -122,6 +130,24 @@ def _build(module: Any) -> List[BaseTool]:
     return result
 
 
+def _declared_permissions(tool: BaseTool) -> List[str]:
+    """``tool.permissions()`` (or a plain ``permissions`` attribute), defensively.
+
+    Third-party code, so the shape is not trusted: a method that raises or
+    returns a string instead of a list must not become a startup failure. The
+    empty answer is the conservative one — it can only report *more* gaps.
+    """
+    try:
+        value = tool.permissions
+        if callable(value):
+            value = value()
+        if isinstance(value, (str, bytes)):
+            value = [value]
+        return [str(item) for item in (value or [])]
+    except Exception:  # noqa: BLE001 - a broken declaration is not a crash
+        return []
+
+
 def _raise_floor(tool: BaseTool) -> None:
     """Never quieter than ``confirm`` — see the module docstring."""
     declared = str(getattr(tool, "permission", PERMISSION_CONFIRM))
@@ -146,6 +172,10 @@ async def load_skill_tools(
         "modules": 0,
         "tools": [],
         "errors": [],
+        #: Tools whose needs exceed their skill's declaration. Advisory unless
+        #: ``SKILL_STRICT_PERMISSIONS``; kept out of ``errors`` in that case so a
+        #: caller's "did anything break" check keeps meaning what it used to.
+        "policy": [],
     }
     base = root or skills_root()
 
@@ -157,6 +187,10 @@ async def load_skill_tools(
             {"skill": "*", "file": "", "error": "could not read enabled skills"}
         )
         return report
+
+    from config import config
+
+    strict = bool(getattr(config, "SKILL_STRICT_PERMISSIONS", False))
 
     for name in names:
         skill_dir = os.path.join(base, name)
@@ -171,6 +205,23 @@ async def load_skill_tools(
         if not files:
             continue
         report["skills"] += 1
+        # The manifest is the approved policy, so the comparison needs it. A
+        # skill that got this far was validated at discovery, so a failure here
+        # means the file changed underneath us: report it and fall back to an
+        # empty declaration, which can only ever *widen* the reported gaps.
+        try:
+            from core.skills.manifest import ManifestError, load as load_manifest
+
+            declared = list(load_manifest(skill_dir).permissions)
+        except (ManifestError, OSError) as exc:
+            # No tools at all, not "assume nothing was declared": with no
+            # manifest there is no approved policy to check against, and loading
+            # third-party code that nobody has approved since it last validated is
+            # the case the check exists for.
+            report["errors"].append(
+                {"skill": name, "file": "skill.json", "error": redact(str(exc))[:200]}
+            )
+            continue
         for path in files:
             report["modules"] += 1
             try:
@@ -190,10 +241,37 @@ async def load_skill_tools(
                 )
                 continue
             for tool in tools:
-                _raise_floor(tool)
                 try:
-                    registry.register(tool, replace=False)
-                except ValueError as e:
+                    # Both halves of the floor. `_raise_floor` makes the tool
+                    # honest about itself for anything that reads the object (the
+                    # LLM's tool list, an audit row); `floor=` makes the registry
+                    # independent of that honesty, so a tool that mutates its own
+                    # tier later still cannot run unprompted. See
+                    # `ToolRegistry.register`.
+                    _raise_floor(tool)
+                    gap = sorted(
+                        gaps_for(
+                            tool.name(),
+                            _declared_permissions(tool),
+                            declared,
+                        )
+                    )
+                    if gap and strict:
+                        raise ValueError(
+                            "needs " + ", ".join(gap)
+                            + " which this skill's manifest does not declare"
+                        )
+                    if gap:
+                        report["policy"].append(
+                            {
+                                "skill": name,
+                                "tool": tool.name(),
+                                "undeclared": gap,
+                                "note": "loaded; set SKILL_STRICT_PERMISSIONS to refuse",
+                            }
+                        )
+                    registry.register(tool, replace=False, floor=PERMISSION_CONFIRM)
+                except Exception as e:  # noqa: BLE001 - one bad tool, not one bad boot
                     # A skill may not overwrite a built-in (or another skill's
                     # tool): the built-in keeps its name and its behaviour, and
                     # the refusal is reported rather than silently swallowed.
@@ -207,6 +285,13 @@ async def load_skill_tools(
                 else:
                     report["tools"].append(f"{name}.{tool.name()}")
 
+    for entry in report["policy"]:
+        logger.warning(
+            "Skill tool %s.%s needs undeclared permission(s) %s",
+            entry["skill"],
+            entry["tool"],
+            ", ".join(entry["undeclared"]),
+        )
     if report["tools"]:
         logger.info(
             "Registered %d skill tool(s): %s",

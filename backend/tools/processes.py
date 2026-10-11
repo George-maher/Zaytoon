@@ -45,6 +45,11 @@ LOG_LINES = 500
 #: How long a stopped process is given to exit before it is killed.
 STOP_GRACE_S = 3.0
 
+#: How long the output readers are given to see EOF after a process is stopped.
+#: A dead child's pipe reaches EOF at once, so this only ever waits on a child
+#: that spawned grandchildren holding the handle open.
+PUMP_DRAIN_S = 0.5
+
 #: Upper bound on tracked processes. Exited ones are pruned oldest-first, so
 #: this bounds the *table*, not the number of live dev servers.
 MAX_TRACKED = 32
@@ -203,8 +208,14 @@ class ProcessRegistry:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=entry.timeout_s)
                 except asyncio.TimeoutError:
-                    entry.status = "timed_out"
+                    # Reap first, publish second. The old order set `timed_out`
+                    # and *then* terminated, so for up to two grace periods the
+                    # registry reported an ended process whose `returncode` was
+                    # still None — a caller that read the status in that window
+                    # saw "timed_out, exit_code=null" for a child still running.
+                    # Linux wins the race by being fast; macOS lost it in CI.
                     await _terminate(entry)
+                    entry.status = "timed_out"
                     return
             await proc.wait()
             entry.exit_code = proc.returncode
@@ -234,10 +245,52 @@ class ProcessRegistry:
             return None
         if entry.status == "running":
             await _terminate(entry)
+        # Let the readers finish rather than cancelling them. A subprocess
+        # transport closes itself once every pipe has drained, so a cancel here
+        # leaves the descriptor open until the transport's `__del__` runs — which
+        # for a backend that keeps running is a leaked fd per stopped process,
+        # and for a test is `RuntimeError: Event loop is closed` after teardown.
+        # (Python 3.11 has no public `Process.close()`, so draining is the fix
+        # rather than a version-guarded call.) The wait is bounded: a child whose
+        # own grandchildren still hold the pipe must not be able to hang shutdown,
+        # and the cancel below is the correct answer to *that* case.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + PUMP_DRAIN_S
         for task in entry.pumps:
-            if not task.done():
+            if task.done():
+                continue
+            try:
+                await asyncio.wait_for(task, timeout=max(0.0, deadline - loop.time()))
+            except asyncio.TimeoutError:
                 task.cancel()
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - drained
+                # The pump's failure says nothing about whether the process was
+                # stopped, which is the only thing this method reports.
+                pass
         return entry.to_dict(with_lines=False)
+
+    async def close_all(self, reason: str = "shutdown") -> int:
+        """Stop every running process this registry started. Returns how many.
+
+        The registry lives in memory, so without this a backend restart orphans
+        whatever the agent launched: `npm run dev` keeps holding port 5173 while
+        the *new* process has no idea it exists. On POSIX there is not even a
+        group signal to fall back on (`_own_group` is Windows-only), so the child
+        outlives us by construction. The next session then fails to bind the
+        port and cannot `process_stop` it either — the id died with the old
+        registry. That is a worse user experience than a dev server that stops
+        when its manager does, which is also what the terminal manager already
+        does for shells.
+
+        Only *own* children are touched, through the same `stop()` path a user
+        calls; nothing here scans the machine for matching command lines.
+        """
+        running = [entry for entry in self._procs.values() if entry.status == "running"]
+        for entry in running:
+            logger.info("Stopping tracked process %s (%s): %s",
+                        entry.id, entry.name, reason)
+            await self.stop(entry.id)
+        return len(running)
 
     def _prune_locked(self) -> None:
         """Forget the oldest *exited* entries once the table is full."""
@@ -270,9 +323,15 @@ async def _terminate(entry: ManagedProcess) -> None:
     except asyncio.TimeoutError:
         try:
             proc.kill()
-            await asyncio.wait_for(proc.wait(), timeout=STOP_GRACE_S)
-        except (ProcessLookupError, OSError, asyncio.TimeoutError):
-            logger.warning("Process %s did not die after kill", entry.id)
+            # Unbounded, on purpose. SIGKILL cannot be caught or ignored, so a
+            # child not yet reaped here is already in the kernel's hands; the
+            # bounded wait this replaces was the mechanism that let `_terminate`
+            # return with `returncode is None` — and then write a status that
+            # claimed the process had stopped.
+            await proc.wait()
+        except (ProcessLookupError, OSError):
+            logger.warning("Process %s could not be killed", entry.id)
+            return
     entry.exit_code = proc.returncode
     if entry.status != "timed_out":
         entry.status = "stopped"

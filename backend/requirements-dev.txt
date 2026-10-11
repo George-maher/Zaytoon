@@ -5,3 +5,10 @@
 
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+
+# The scheduler's documented last-resort parser imports `dateparser` lazily and
+# degrades to "I could not understand that time" without it. That path is
+# exercised here, so it has to be installed here — and `tests/
+# test_scheduler_regression.py` asserts the structured matchers win *before* it,
+# which is only provable when it exists.
+dateparser>=1.2.0

@@ -12,8 +12,8 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend tests (py${{ matrix.python-version }})
-    runs-on: windows-latest   # the OS tools are Windows-specific
+    name: Backend tests (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: backend
@@ -22,6 +22,23 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
+        # All three are product targets (decision 2, 2026-10-10): Windows is the
+        # primary one, and the product ships `install.sh`, a Linux Docker image
+        # and a pywebview WebKit host. Each leg therefore has to run, not be
+        # skipped into greenness. The platform-dependent assertions are scoped in
+        # the tests themselves (skipif), not by dropping an OS here.
+        #
+        # What macOS does and does not prove: it runs the same suite, so the
+        # `Darwin` branches of `core/system_resources.py` (vm_stat/sysctl) and
+        # `tools/applications.py` (.app bundle resolution) execute against real
+        # `vm_stat`, real `sysctl` and a real `/Applications`. It cannot prove the
+        # *desktop* shell works, because the pywebview/Cocoa host is not
+        # installed on the runner — the desktop suite is excluded on that leg, and
+        # `tools/system.py`'s `osascript` volume path stays asserted only at argv
+        # level, since a runner has no audio device to set. The `desktop` job below
+        # is pinned to windows-latest, so no leg here says anything about the
+        # macOS/Linux desktop shells.
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Guard: the free-only policy must never be relaxed
+      - name: "Guard: the free-only policy must never be relaxed"
         run: |
           python -c "
           from config import config, ALLOWED_FREE_MODELS
@@ -49,34 +66,66 @@ jobs:
           print('allow-list:', sorted(ALLOWED_FREE_MODELS))
           "
 
-      - name: Guard: local model execution must stay removed
+      # The product decision (2026-10-10): Ollama is the primary provider and
+      # OpenRouter is optional. The guard that stood here asserted the *opposite*
+      # ("local model execution must stay removed") and so failed on every push to
+      # main, because config.py has made ollama the default. What actually needs
+      # protecting is not the absence of local execution — it is that a turn can
+      # never drift from one provider into the other without being told to.
+      - name: "Guard: local-first providers and no implicit fallback"
         run: |
           python -c "
-          from config import config
-          banned = [a for a in ('OLLAMA_BASE_URL','OLLAMA_MODEL','OLLAMA_FALLBACK_MODEL','PRIMARY_PROVIDER') if hasattr(config, a)]
-          assert not banned, f'local-model config reintroduced: {banned}'
-          print('no local-model configuration present')
+          from config import config, PROVIDER_OLLAMA, PROVIDER_OPENROUTER, VALID_PROVIDERS
+          assert config.PROVIDER == PROVIDER_OLLAMA, f'default provider moved to {config.PROVIDER!r}; local-first is the product decision'
+          assert VALID_PROVIDERS == (PROVIDER_OPENROUTER, PROVIDER_OLLAMA)
+          for tier in ('general', 'reasoning', 'fast'):
+              assert config.ollama_model_for_tier(tier), f'ollama {tier} tier has no model'
+          # Nothing may be downloaded on the app's own initiative: the config
+          # module in particular must not be able to run anything.
+          import pathlib as _p
+          assert 'subprocess' not in _p.Path('config.py').read_text(), 'config.py must not shell out'
+          print('provider=ollama by default, three tiers configured, no auto-download')
           "
 
       # A malformed requirements.txt does not fail locally (the venv already
       # has everything installed) but breaks `docker compose build`. Validate it
       # against a clean resolver.
-      - name: Guard: requirements files are pip-parseable
+      - name: "Guard: requirements files are pip-parseable"
         run: |
           python -m pytest tests/test_packaging.py -q
 
       - name: Build the backend image
+        # Linux only: the image is built FROM python:3.11-slim, and a Windows
+        # runner has no Linux daemon — a step that cannot succeed on half the
+        # matrix turns a real regression into a red X nobody reads.
+        if: matrix.os == 'ubuntu-latest'
         working-directory: .
         run: docker compose build backend
 
       - name: Run tests
-        run: python -m pytest tests/ -q --maxfail=1
+        # `-p ci_annotate` prints every failure as a `::error` workflow command,
+        # which lands in the check annotations — the one channel that survives
+        # when a job's log body is served from somewhere the reader cannot
+        # reach. It changed nothing about the run except its exit cost: `--maxfail`
+        # was 1 (abort on the first failure), and with the annotator in place a
+        # first-and-only failure names one test per run, so each red leg cost a
+        # full queue cycle to learn. 40 still aborts a broken leg early and
+        # reports every distinct breakage in one pass. `tests/test_ci_annotator.py`
+        # pins the plugin, including that it cannot be injected through an
+        # assertion message and that it changes no result.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github
+        run: python -m pytest tests/ -q --maxfail=40 -p ci_annotate
 
       - name: Live smoke check (free-only, voice routing, sandbox)
         run: python scripts/verify_final.py
 
   frontend:
     name: Frontend lint / test / build
+    # Ubuntu, deliberately: a relative import whose casing disagrees with the
+    # directory (`components/hud` for a folder named `components/HUD`) builds on
+    # Windows and fails here. `src/imports.case.test.js` asserts exact casing so
+    # it cannot come back quietly.
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -109,8 +158,18 @@ jobs:
         run: npm run build
 
   desktop:
-    name: Desktop shell
-    runs-on: windows-latest   # the shell is a Windows desktop application
+    name: Desktop shell (${{ matrix.os }})
+    # The shell is a Windows application, but the *guarantees* it is built from
+    # — the palette parity with the web client, the wire protocol, the
+    # single-instance guard, the state vocabulary — are cross-platform code, and
+    # every one of those was asserted only on a runner nobody could read. Three
+    # legs because the answer to "does it work on Linux and Mac too" was
+    # previously "the suite does not run there".
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     defaults:
       run:
         working-directory: desktop
@@ -134,8 +193,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      - name: Install the native libraries the suite links against
+        # `sounddevice` loads libportaudio at import time and `customtkinter` needs
+        # a Tk in the interpreter. Without the library the audio modules fail at
+        # *collection*, which looks exactly like a broken audio pipeline; the
+        # conftest can skip them honestly, but installing is better — it is the
+        # difference between the tests not running and the tests running.
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
       - name: Run desktop shell tests
-        run: python -m pytest tests/ -q
+        # Same annotator as the backend leg. Three legs on purpose: the failures
+        # that used to be unreadable were the Windows-only ones, and the answers
+        # to "does it work on Linux and Mac too" were previously untestable.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github
+        run: python -m pytest tests/ -q -p ci_annotate
 
       # The PyInstaller build is deliberately not run here: it takes several
       # minutes and needs the GUI dependencies. `check_prerequisites()` is the

@@ -1,0 +1,17 @@
+{
+  "name": "dependency-review",
+  "version": "1.0.0",
+  "description": "Parses lockfiles and manifests in the workspace and reports supply-chain smell: unpinned versions, plaintext registries, direct git sources and install-script hooks. Never contacts a registry, never runs a package manager.",
+  "instructions": "instructions.md",
+  "tools": [],
+  "permissions": [
+    "filesystem.read"
+  ],
+  "enabled": false,
+  "tags": [
+    "security",
+    "passive",
+    "audit"
+  ],
+  "author": "Zaytoon (shipped)"
+}

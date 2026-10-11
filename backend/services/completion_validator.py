@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional
 
 from services.model_registry import CAP_TOOLS
+from common.reporting import safe_error
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +190,12 @@ def contract_from_registry(registry: Any, **kwargs) -> CompletionContract:
             for alias in _aliases_of(tool):
                 # A primary name always wins over another tool's alias.
                 tools.setdefault(alias, shape)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - a broken tool must not block boot
+            # This one is load-bearing to get wrong: an empty `tools` map means
+            # the validator quietly stops validating anything, while still
+            # reporting "no violations" — the most convincing kind of useless.
+            safe_error(e, operation="completion_validator.load_shapes",
+                       component="CompletionValidator")
     return CompletionContract(tools=tools, **kwargs)
 
 

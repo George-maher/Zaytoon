@@ -194,7 +194,7 @@ class TestChainConstruction:
         assert chain[1].model == "nvidia/nemotron-3-super-120b-a12b:free"
 
     def test_missing_key_raises_a_clear_error(self, monkeypatch):
-        """No key and no local fallback means we must fail loudly, not silently."""
+        """No key and no implicit cross-provider fallback: fail loudly."""
         monkeypatch.setattr(config, "OPENROUTER_API_KEY", "", raising=False)
 
         with pytest.raises(LLMError) as exc:

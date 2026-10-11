@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -210,7 +211,12 @@ class GetVolume(BaseTool):
     def description(self) -> str:
         return (
             "Get the current system output volume and mute state, and set the "
-            "volume. Reading is safe; setting requires confirmation."
+            "volume. Reading is safe; setting requires confirmation. `level` is "
+            "absolute (0-100), never a step count. Supported: Windows "
+            "(SendKeys), macOS (osascript), PipeWire/PulseAudio (pactl) and ALSA "
+            "(amixer) — where a backend cannot report a percentage (Windows) the "
+            "answer says so instead of guessing, and mute is refused there because "
+            "the key only toggles."
         )
 
     def schema(self) -> Dict[str, Any]:
@@ -237,47 +243,246 @@ class GetVolume(BaseTool):
             return "confirm"
         return "safe"
 
-    async def execute(
-        self, level: Any = None, mute: Any = None, **_: Any
-    ) -> ToolResult:
+    async def execute(self, level: Any = None, mute: Any = None, **_: Any) -> ToolResult:
+        backend = _volume_backend()
+        if not backend:
+            # A precise refusal beats a stack trace or a fake "volume is 50".
+            return ToolResult.fail(
+                "No supported volume control here: this tool speaks Windows "
+                "(SendKeys), macOS (osascript), PipeWire/PulseAudio (pactl) or ALSA "
+                "(amixer), and found none of them."
+            )
+
         if level is None and mute is None:
-            return await _in_executor(self._read_volume)
+            return await _read_volume(backend)
 
-        if os.name != "nt":
-            return ToolResult.fail("Volume control is only implemented on Windows.")
-        script = _volume_script(level, mute)
-        if script is None:
-            return ToolResult.fail("Could not build a volume command.")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "powershell", "-NoProfile", "-NonInteractive", "-Command", script,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        argv = volume_argv(backend, level=level, mute=mute)
+        if argv is None:
+            return ToolResult.fail(volume_refusal(backend, level=level, mute=mute))
+        code, out, err = await _run_argv(argv)
+        if code != 0:
+            return ToolResult.fail(
+                f"Volume change failed ({backend}): {(err or out).strip()[:200] or f'exit {code}'}"
             )
-            out, _err = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except FileNotFoundError:
-            return ToolResult.fail("powershell is not available on this system.")
-        except (asyncio.TimeoutError, OSError) as e:
-            return ToolResult.fail(f"Volume change failed: {e}")
-        text = out.decode("utf-8", errors="replace").strip()
-        return ToolResult.ok(text or "Volume updated", {"output": text})
+        state = {"backend": backend}
+        if level is not None:
+            state["level"] = max(0, min(100, int(level)))
+        if mute is not None:
+            state["muted"] = bool(mute)
+        return ToolResult.ok(
+            f"Volume updated via {backend}"
+            + (f" (level {state['level']}%)" if "level" in state else "")
+            + (f", muted={state['muted']}" if "muted" in state else ""),
+            state,
+        )
 
-    @staticmethod
-    def _read_volume() -> ToolResult:
-        if os.name != "nt":
-            return ToolResult.fail("Volume control is only implemented on Windows.")
+
+#: The virtual key codes, named because the numbers are otherwise unreadable — and
+#: because one of them used to be wrong. 173 is mute; 174 is volume *down*;
+#: 175 is volume *up*. A caller had a `mute ? 175 : 175` in both branches, and the
+#: level path pressed "down" N times from wherever the volume happened to be.
+_VK_VOLUME_DOWN = 174
+_VK_VOLUME_UP = 175
+
+
+def _volume_backend() -> str:
+    """Which dialect of "set the volume" this machine answers to.
+
+    Probed, not assumed: `pactl` exists on PulseAudio and PipeWire, and a box with
+    neither but with `amixer` is a plain ALSA system. Empty means "no way to do
+    this here", which the caller turns into a refusal the user can act on.
+    """
+    if os.name == "nt":
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if shutil.which("pactl"):
+        return "pulse"
+    if shutil.which("amixer"):
+        return "alsa"
+    return ""
+
+
+async def _run_argv(argv: List[str], timeout: float = 8.0) -> "tuple[int, str, str]":
+    import asyncio
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]} is not installed"
+    except asyncio.TimeoutError:
+        return 124, "", "timed out"
+    except OSError as exc:
+        return 125, "", str(exc)
+    return (
+        proc.returncode if proc.returncode is not None else 0,
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
+    )
+
+
+async def _read_volume(backend: str) -> ToolResult:
+    """The current level and mute state, from whichever tool answers here.
+
+    Windows is the exception: SendKeys can press the keys but nothing in this
+    reading path reports the *level*, so it says which device is configured and
+    states the rest plainly rather than implying it knows the volume.
+    """
+    if backend == "macos":
+        code, out, _err = await _run_argv(
+            ["osascript", "-e",
+             "output volume of (get volume settings)\n"
+             "output muted of (get volume settings)"]
+        )
+        lines = [line.strip() for line in (out or "").splitlines()]
+        level = parse_volume_number(lines[0]) if lines else None
+        if code != 0 or level is None:
+            return ToolResult.fail(f"Could not read the macOS volume ({(out or '').strip()[:80]})")
+        muted = (lines[1].lower() == "true") if len(lines) > 1 else None
+        return ToolResult.ok(
+            f"Output volume: {level}%" + ("" if muted is None else f", {'muted' if muted else 'not muted'}"),
+            {"backend": backend, "level": level, "muted": muted},
+        )
+    if backend == "pulse":
+        _c1, out1, _e1 = await _run_argv(
+            ["pactl", "get-sink-volume", "@DEFAULT_SINK@"]
+        )
+        _c2, out2, _e2 = await _run_argv(
+            ["pactl", "get-sink-mute", "@DEFAULT_SINK@"]
+        )
+        level = parse_pactl_volume(out1)
+        if level is None:
+            return ToolResult.fail("Could not read the PulseAudio/PipeWire volume.")
+        muted = "yes" in (out2 or "").lower()
+        return ToolResult.ok(
+            f"Output volume: {level}%, {'muted' if muted else 'not muted'}",
+            {"backend": backend, "level": level, "muted": muted},
+        )
+    if backend == "alsa":
+        _c, out, _e = await _run_argv(["amixer", "get", "Master"])
+        level = parse_amixer_percent(out)
+        if level is None:
+            return ToolResult.fail("Could not read the ALSA mixer state.")
+        muted = "[off]" in (out or "")
+        return ToolResult.ok(
+            f"Output volume: {level}%, {'muted' if muted else 'not muted'}",
+            {"backend": backend, "level": level, "muted": muted},
+        )
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "(Get-CimInstance Win32_SoundDevice | Select-Object -First 1 "
+                "Name).Name",
+            ],
+            capture_output=True, text=True, timeout=10, shell=False,
+        )
+        device = (proc.stdout or "").strip() or "unknown"
+    except (subprocess.SubprocessError, OSError):
+        device = "unknown"
+    return ToolResult.ok(
+        f"Output device: {device}. Windows has no level read-back through this "
+        "path, so the current percentage is unknown — set one to change it.",
+        {"backend": backend, "device": device, "level": None},
+    )
+
+
+def parse_volume_number(text: str) -> Optional[int]:
+    try:
+        value = int(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if 0 <= value <= 100 else None
+
+
+def parse_pactl_volume(text: str) -> Optional[int]:
+    """`pactl get-sink-volume` → the first channel's percent.
+
+    The real line is `Volume: front-left: 65536 /  100% / 0x11000` — no closing
+    paren, and `pactl` reports over-100% amplification faithfully (base volume ×
+    boost), so the value is returned as read rather than clamped: a system at
+    153% is *at* 153%, and quietly calling that 100 is how an audit tool starts
+    inventing numbers. Setting still clamps, because the schema promises 0-100.
+    """
+    match = re.search(r"(\d{1,4})%", text or "")
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def parse_amixer_percent(text: str) -> Optional[int]:
+    match = re.search(r"\[\s*(\d{1,3})%\]", text or "")
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if value <= 100 else None
+
+
+def volume_argv(backend: str, *, level: Any = None, mute: Any = None) -> Optional[List[str]]:
+    """The command that sets the volume, or None when this backend cannot.
+
+    Kept apart from the subprocess call so the argv is testable on any OS: the
+    values are coerced to an int and a bool here, so nothing a caller typed can
+    reach an argument list.
+    """
+    if level is not None:
         try:
-            proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                [
-                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
-                    "(Get-CimInstance Win32_SoundDevice | Select-Object -First 1 "
-                    "Name).Name",
-                ],
-                capture_output=True, text=True, timeout=10, shell=False,
-            )
-            device = (proc.stdout or "").strip() or "unknown"
-        except (subprocess.SubprocessError, OSError):
-            device = "unknown"
-        return ToolResult.ok(f"Output device: {device}", {"device": device})
+            value = max(0, min(100, int(level)))
+        except (TypeError, ValueError):
+            return None
+    else:
+        value = None
+
+    if backend == "pulse":
+        if value is not None:
+            return ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"]
+        if mute is not None:
+            return ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if bool(mute) else "0"]
+        return None
+    if backend == "alsa":
+        if value is not None:
+            return ["amixer", "set", "Master", f"{value}%"]
+        if mute is not None:
+            return ["amixer", "set", "Master", "mute" if bool(mute) else "unmute"]
+        return None
+    if backend == "macos":
+        script = []
+        if value is not None:
+            script.append(f"set volume output volume {value}")
+        if mute is not None:
+            script.append(f"set volume output muted {'true' if bool(mute) else 'false'}")
+        if not script:
+            return None
+        return ["osascript", "-e", "\n".join(script)]
+    if backend == "windows":
+        # Windows has no absolute level here, so the level path climbs to the top
+        # (where extra presses are clamped) and steps back down. Mute, though, is
+        # a *toggle* on these keys with no read-back — setting it would need the
+        # current state, which this path cannot get. Refusing beats guessing.
+        if mute is not None or value is None:
+            return None
+        return [
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
+            _volume_script(value, None),
+        ]
+    return None
+
+
+def volume_refusal(backend: str, *, level: Any = None, mute: Any = None) -> str:
+    if backend == "windows" and mute is not None:
+        return (
+            "Windows volume keys only toggle mute, and this path cannot read the "
+            "current state to know which way — so set level to 0 to silence, or "
+            "back to a number to un-mute."
+        )
+    if level is not None:
+        return "'level' must be a whole number from 0 to 100."
+    return "Could not build a volume command for that request on this system."
 
 
 def _volume_script(level: Any, mute: Any) -> Any:
@@ -285,6 +490,15 @@ def _volume_script(level: Any, mute: Any) -> Any:
 
     Values are coerced with ``int()``/``bool()`` before interpolation, so no
     caller-supplied string can reach the script.
+
+    The level is expressed as a climb then a descent: SendKeys has no absolute
+    volume, but pressing up 100 times lands on the ceiling — extra presses there
+    are clamped by the OS — so pressing down ``100 - level`` times afterwards is
+    the same position every time. The first version of this function pressed
+    "down" ``level`` times from wherever the volume happened to be, which made
+    "set volume to 20" mean "lower by twenty steps", and had ``[char]175`` in both
+    arms of the mute ternary (175 is *volume up*; 173 is mute). Mute is refused
+    upstream instead, because a toggle with no read-back cannot be set.
     """
     parts: List[str] = []
     if level is not None:
@@ -292,11 +506,13 @@ def _volume_script(level: Any, mute: Any) -> Any:
             value = max(0, min(100, int(level)))
         except (TypeError, ValueError):
             return None
-        parts.append(f"(New-Object -ComObject WScript.Shell).SendKeys("
-                     f"[char]175, {value})")
-    if mute is not None:
-        key = "[char]175" if mute else "[char]175"
-        parts.append(f"(New-Object -ComObject WScript.Shell).SendKeys({key})")
+        down = 100 - value
+        sends = [f"(New-Object -ComObject WScript.Shell).SendKeys([char]{_VK_VOLUME_UP}, 100)"]
+        if down:
+            sends.append(
+                f"(New-Object -ComObject WScript.Shell).SendKeys([char]{_VK_VOLUME_DOWN}, {down})"
+            )
+        parts.extend(sends)
     return "; ".join(parts) if parts else None
 
 

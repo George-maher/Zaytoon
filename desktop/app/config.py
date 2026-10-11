@@ -69,6 +69,61 @@ def _looks_like_repo_root(candidate: Path) -> bool:
     return (candidate / "backend" / "main.py").is_file()
 
 
+def _is_writable(directory: Path) -> bool:
+    """True when ``directory`` exists-and-can-be-written, or can be created.
+
+    Walking up to the nearest existing ancestor is the whole trick: `mkdir -p`
+    succeeds only if some ancestor is writable, and asking that question here —
+    without creating anything — is what lets a *constructor* stay side-effect
+    free while still choosing the right directory.
+    """
+    target = directory
+    while not target.exists():
+        parent = target.parent
+        if parent == target:
+            return False
+        target = parent
+    if not target.is_dir():
+        # Something else already owns the name — a plain file at `<repo>/Config`
+        # passes an `os.access(W_OK)` test and then cannot contain a file. A
+        # directory that *exists* is only usable if we can write into it.
+        return False
+    return os.access(target, os.W_OK)
+
+
+def default_state_dir() -> Path:
+    """Where the shell persists state, per platform convention.
+
+    ``ZAYTOON_HOME`` wins. Then, for a *development* checkout that already has a
+    ``Config/`` directory with a saved window state in it, that directory keeps
+    being used — a launcher must not relocate a user's existing state as a side
+    effect of an upgrade. Only a fresh install falls through to the platform dir
+    (``%LOCALAPPDATA%\\Zaytoon`` / ``~/Library/Application Support/Zaytoon`` /
+    ``$XDG_STATE_HOME/zaytoon``), because that is the one location that is
+    guaranteed writable when the app is installed for all users.
+    """
+    override = os.environ.get("ZAYTOON_HOME")
+    if override:
+        return Path(override).expanduser()
+
+    repo_dir = default_repo_root() / "Config"
+    if _is_writable(repo_dir):
+        # A checkout, or anywhere the repo-adjacent directory can be written:
+        # keep the state where it has always been, so an upgrade does not move a
+        # user's saved geometry out from under them.
+        return repo_dir
+
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "Zaytoon"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Zaytoon"
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "zaytoon"
+    return Path.home() / ".local" / "state" / "zaytoon"
+
+
 def default_repo_root() -> Path:
     """Resolve the repository root.
 
@@ -192,6 +247,22 @@ class DesktopConfig:
     window_min_width: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_MIN_WIDTH", 800))
     #: Minimum window height.
     window_min_height: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_MIN_HEIGHT", 600))
+
+    # --- state -----------------------------------------------------------
+    #: Where `window_state.json` (and anything else the shell must persist) goes.
+    #: It used to be ``<repo>/Config``, which is fine in a checkout and wrong in an
+    #: installed application: a per-machine Windows install lives under
+    #: ``Program Files``, where a standard user cannot write, so the window
+    #: geometry silently stopped being remembered (the failure was swallowed into a
+    #: log line). The platform conventions below are writable by the user always.
+    state_dir: Path = field(default_factory=lambda: default_state_dir())
+
+    #: Seconds between backend health samples. A knob rather than a
+    #: ``"pytest" in sys.modules`` check, which made production code branch on the
+    #: identity of whatever interpreter happened to import it.
+    health_check_interval_s: float = field(
+        default_factory=lambda: _env_float("ZAYTOON_HEALTH_INTERVAL", 5.0)
+    )
 
     # --- derived ---------------------------------------------------------
     @property

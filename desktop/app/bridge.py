@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import paths as path_policy
 from .backend import BackendProcess
 from .config import DesktopConfig
 
@@ -190,10 +191,16 @@ class NativeBridge:
         """
         if not path:
             return False
-        p = Path(path)
-        if not p.exists():
-            logger.warning("reveal_in_os: path does not exist: %s", path)
+        # The path is the user's (or the page's) input to a *file manager* call,
+        # so containment is checked but no executable rule is needed here: nothing
+        # this branch runs can execute the target, it only shows its parent.
+        allowed, reason = path_policy.classify(path, self.config)
+        if not allowed:
+            # Same policy as `open_path`, and the reason goes to the log only: a
+            # bool across the bridge cannot tell an attacker whether a file exists.
+            logger.warning("reveal_in_os refused %s: %s", path, reason)
             return False
+        p = Path(path).resolve()
         try:
             if sys.platform == "win32":
                 # explorer /select,"path" opens the parent with the item selected
@@ -219,10 +226,15 @@ class NativeBridge:
         """
         if not path:
             return False
-        p = Path(path)
-        if not p.exists():
-            logger.warning("open_path: path does not exist: %s", path)
+        # `os.startfile` / `open` / `xdg-open` *execute* what they are given when
+        # the OS thinks the type is a program, so this is the sink that needs both
+        # checks: inside a granted root, and not something runnable. See
+        # `app/paths.py`.
+        allowed, reason = path_policy.classify(path, self.config)
+        if not allowed:
+            logger.warning("open_path refused %s: %s", path, reason)
             return False
+        p = Path(path).resolve()
         try:
             if sys.platform == "win32":
                 os.startfile(str(p))  # noqa: S606 - os.startfile is the Windows API
@@ -343,6 +355,10 @@ class NativeBridge:
         Returns True on success, False on failure.
         """
         if not url:
+            return False
+        allowed, reason = path_policy.classify_url(url)
+        if not allowed:
+            logger.warning("open_url refused %r: %s", url, reason)
             return False
         try:
             import webbrowser

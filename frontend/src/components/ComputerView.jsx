@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import Panel, { TelemetryRow } from "./HUD/HUDPanel";
 import SystemStatus from "./HUD/SystemStatus";
-import StatusRing from "./hud/StatusRing";
+import StatusRing from "./HUD/StatusRing";
 import { desktop } from "../lib/desktop";
 import {
   getComputerApps,

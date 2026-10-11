@@ -32,6 +32,22 @@ from agents.events import AgentEvent, AgentEventType, EventBus, NullBus  # noqa:
 from tools.base import BaseTool, ToolResult  # noqa: E402
 from tools.registry import ToolRegistry  # noqa: E402
 from tools import sandbox  # noqa: E402
+from config import config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _model_path_only(monkeypatch):
+    """Keep the deterministic fast path out of the loop's tests.
+
+    `agents/fast_path.py` answers "what time is it" *before the engine runs*, which
+    is exactly its purpose — and it also means a test here that stubs `_ask` and
+    posts that prompt would silently be asserting nothing about the loop. Thirteen
+    cases did precisely that when the shortcut landed, which is the real reason
+    this fixture exists: not to make them pass, but to make them test what they
+    say they test. The shortcut has its own suite (`tests/test_fast_path.py`) that
+    enables it and asserts the opposite direction.
+    """
+    monkeypatch.setattr(config, "FAST_PATH_ENABLED", False)
 
 
 # ---------------------------------------------------------------------------
@@ -1144,3 +1160,80 @@ class TestPlaceholderIsNeverTheAnswer:
         assert result.text == _MALFORMED_REPLY["ar"]
         assert "[أكتب" not in result.text and "[اكتب" not in result.text
         assert any("placeholder" in e for e in result.errors)
+
+
+class TestProviderFailureIsExplained:
+    """A dead local model is not a cloud rate limit, and must not be reported as one.
+
+    The loop used to answer every provider failure with the same sentence about
+    "free AI models" being "temporarily unavailable". For `AI_PROVIDER=ollama`
+    with a stopped daemon that is doubly wrong: there are no free cloud models in
+    the path, and "try again in a moment" is advice for a fault that a moment
+    cannot fix. The client raises with a `kind`; the engine must use it.
+    """
+
+    @staticmethod
+    def _raising(exc):
+        class _Raises:
+            tier = "fast"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(self, messages, **kwargs):
+                self.calls += 1
+                raise exc
+
+        return _Raises()
+
+    async def test_an_unreachable_local_provider_names_the_fix(self, registry):
+        from services.llm_client import AllModelsUnavailableError
+
+        exc = AllModelsUnavailableError(
+            "Ollama is not reachable at http://localhost:11434: refused. "
+            "Start it with `ollama serve`.",
+            None,
+            kind="provider_unreachable",
+        )
+        result = await AgentEngine(self._raising(exc), registry).run(
+            "what time is it", bus=NullBus()
+        )
+        assert result.stopped_reason == "llm_unavailable"
+        assert "ollama serve" in result.text, "the user needs the command"
+        # The old wording survives here only as a fallback; asserting its absence
+        # is what stops the generic notice from swallowing this one again.
+        assert "free AI models" not in result.text
+
+    async def test_the_notice_is_bilingual(self, registry):
+        from services.llm_client import AllModelsUnavailableError
+
+        exc = AllModelsUnavailableError("Ollama is not reachable.", None,
+                                        kind="provider_unreachable")
+        result = await AgentEngine(self._raising(exc), registry).run(
+            "الوقت كام", language="ar", bus=NullBus()
+        )
+        assert "الموديل المحلي مش شغال" in result.text
+
+    async def test_cloud_exhaustion_keeps_the_free_model_notice(self, registry):
+        """The one case the generic sentence describes correctly stays as it was."""
+        from services.llm_client import AllModelsUnavailableError
+
+        exc = AllModelsUnavailableError(
+            "All compatible free models failed (3 attempts): 429 everywhere",
+            None,
+            kind="pool_exhausted",
+        )
+        result = await AgentEngine(self._raising(exc), registry).run(
+            "hi", bus=NullBus()
+        )
+        assert "free AI models" in result.text
+
+    async def test_a_provider_that_returns_nothing_is_still_reported_honestly(
+        self, registry
+    ):
+        """No exception, no notice — and never a fabricated answer."""
+        result = await AgentEngine(ScriptedLLM([None]), registry).run(
+            "hi", bus=NullBus()
+        )
+        assert result.stopped_reason == "llm_unavailable"
+        assert result.text

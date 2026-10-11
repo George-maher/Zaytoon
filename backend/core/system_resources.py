@@ -22,11 +22,18 @@ from __future__ import annotations
 
 import ctypes
 import platform
+import sys
 import shutil
 import time
 from typing import Any, Dict, Optional, Tuple
 
 #: ``(monotonic_ts, total_ticks, busy_ticks)`` of the previous CPU reading.
+
+#: The Linux memory source, named so a test can point it at a canned file. It is
+#: a *literal* read of /proc, which is what made the Darwin/Linux parity test a
+#: statement about the runner: on a mac the Linux arm has nothing to read, so the
+#: comparison silently became "macOS is not Linux".
+_LINUX_MEMINFO = "/proc/meminfo"
 _PREV: Optional[Tuple[float, int, int]] = None
 
 
@@ -44,10 +51,18 @@ def _cpu_ticks() -> Optional[Tuple[int, int]]:
                 ("dwHighDateTime", ctypes.c_uint32),
             ]
 
-        idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
-        ok = ctypes.windll.kernel32.GetSystemTimes(
-            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
-        )
+        try:
+            idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
+            ok = ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+            )
+        except (AttributeError, OSError, ValueError):
+            # `ctypes.windll` is missing on hosts that still answer
+            # platform.system() == "Windows" — Wine, a ctypes built without the
+            # extension. The Linux and Darwin branches already answer `None`
+            # when their counters are unreadable; raising here instead turns a
+            # missing figure into a 500 on /system, which renders this panel.
+            return None
         if not ok:
             return None
         # Kernel time *includes* idle time on Windows.
@@ -65,7 +80,98 @@ def _cpu_ticks() -> Optional[Tuple[int, int]]:
             return total, max(total - idle, 0)
         except (OSError, ValueError, IndexError):
             return None
+    if system == "Darwin":
+        reading = _darwin_cpu_ticks()
+        if reading is not None:
+            return reading
     return None
+
+
+def parse_cp_time(text: str) -> Optional[Tuple[int, int]]:
+    """`kern.cp_time` → (total, busy) ticks. Pure, so it is testable anywhere.
+
+    Fields are user, nice, system, idle, irq — the same order Linux reports in
+    /proc/stat, minus the extras older kernels add.
+    """
+    try:
+        numbers = [int(part) for part in text.split()]
+    except ValueError:
+        return None
+    if len(numbers) < 4:
+        return None
+    total = sum(numbers)
+    idle = numbers[3]
+    return total, max(total - idle, 0)
+
+
+def _darwin_cpu_ticks() -> Optional[Tuple[int, int]]:
+    """macOS has no /proc; `sysctl kern.cp_time` is the same counter."""
+    text = _run(["sysctl", "-n", "kern.cp_time"])
+    return parse_cp_time(text) if text else None
+
+
+def parse_vm_stat(
+    text: str, page_size: int, total_bytes: int
+) -> Optional[Dict[str, Any]]:
+    """`vm_stat` page counts → the same shape the Linux branch returns.
+
+    Two traps here. One: the compressor label is "Pages occupied by compressor",
+    so matching a key called "compressed" silently drops tens of gigabytes on a
+    MacBook — which is precisely the machine this branch exists for. Two: the
+    keys must match the other platforms (`used_bytes`/`total_bytes`/`percent`),
+    or every consumer of `/system` has to know which OS it is running on.
+
+    A missing label counts as zero, but a file with none of the three labels we
+    need yields ``None``, so an unparseable ``vm_stat`` degrades to
+    "unavailable" instead of a confident 0%.
+    """
+    if page_size <= 0 or total_bytes <= 0:
+        return None
+    pages: Dict[str, int] = {}
+    for line in text.splitlines():
+        key, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        fields = rest.split()
+        if not fields:
+            continue
+        # `vm_stat` terminates each count with a period ("Pages free:  1234.").
+        token = fields[0].rstrip(".")
+        if token.isdigit():
+            pages[" ".join(key.split()).lower()] = int(token)
+    wanted = ("pages active", "pages wired down", "pages occupied by compressor")
+    if not any(label in pages for label in wanted):
+        return None
+    used_pages = sum(pages.get(label, 0) for label in wanted)
+    used_pages -= pages.get("pages purgeable", 0)
+    used_pages = max(used_pages, 0)
+    used = min(used_pages * page_size, total_bytes)
+    return {
+        "percent": round(100.0 * used / total_bytes, 1),
+        "used_bytes": used,
+        "total_bytes": total_bytes,
+    }
+
+
+def _run(argv: List[str]) -> str:
+    """Run one fixed-argv system query. ``""`` means "treat as unavailable".
+
+    No shell, no user input in the argv, and a short timeout: a health probe must
+    not be able to hang the caller. A missing binary is the normal case on
+    another OS, so it is silence here and an honest "unavailable" upstream —
+    never an exception out of `/health`.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            argv, capture_output=True, text=True, timeout=3.0, shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
 
 
 def _cpu() -> Dict[str, Any]:
@@ -113,7 +219,14 @@ def _memory() -> Dict[str, Any]:
 
         status = MEMORYSTATUSEX()
         status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        try:
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        except (AttributeError, OSError, ValueError):
+            return {
+                "status": "unavailable",
+                "reason": "ctypes.windll is not available on this Windows-shaped host",
+            }
+        if not ok:
             return {"status": "unavailable", "reason": "GlobalMemoryStatusEx failed"}
         total = int(status.ullTotalPhys)
         avail = int(status.ullAvailPhys)
@@ -123,10 +236,27 @@ def _memory() -> Dict[str, Any]:
             "total_bytes": total,
             "status": "ok",
         }
+    if system == "Darwin":
+        text = _run(["vm_stat"])
+        total_text = _run(["sysctl", "-n", "hw.memsize"])
+        page_text = _run(["sysctl", "-n", "vm.page_size"])
+        if text and total_text.isdigit():
+            try:
+                page = int(page_text)
+            except ValueError:
+                page = 4096
+            measured = parse_vm_stat(text, page, int(total_text))
+            if measured is not None:
+                measured["free_bytes"] = max(measured["total_bytes"] - measured["used_bytes"], 0)
+                return {**measured, "status": "ok"}
+        return {
+            "status": "unavailable",
+            "reason": "vm_stat/hw.memsize unavailable",
+        }
     if system == "Linux":
         try:
             values: Dict[str, int] = {}
-            with open("/proc/meminfo", "r", encoding="ascii") as handle:
+            with open(_LINUX_MEMINFO, "r", encoding="ascii") as handle:
                 for line in handle:
                     key, _, rest = line.partition(":")
                     fields = rest.split()

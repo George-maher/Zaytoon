@@ -28,6 +28,9 @@ logger = logging.getLogger("Zaytoon.Scheduler.Parser")
 
 
 class TimeParser:
+    #: Set once by :meth:`_match_dateparser` so the missing-dependency warning
+    #: is emitted a single time per process.
+    _dateparser_warned = False
     ARABIC_NUMBERS = {
         "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
         "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
@@ -317,6 +320,18 @@ class TimeParser:
         try:
             import dateparser
         except ImportError:
+            # Silent degradation is how this became a bug report instead of a
+            # log line: the module is optional at runtime, so an install without
+            # it answers every unusual phrasing with "no time found" and nothing
+            # ever says why. Warned once — a per-call warning on a fallback path
+            # is just noise with a timestamp on it.
+            if not cls._dateparser_warned:
+                cls._dateparser_warned = True
+                logger.warning(
+                    "dateparser is not installed; free-form time expressions "
+                    "outside the built-in patterns will not resolve. "
+                    "Install it with: pip install dateparser"
+                )
             return None
         try:
             result = dateparser.parse(

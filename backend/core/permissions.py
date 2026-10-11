@@ -24,7 +24,7 @@ tries to subtract is a bug, and :func:`required_for` is where it would show up.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, FrozenSet, Iterable, List, Optional
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional
 
 from tools.safety import (
     PERMISSION_CONFIRM,
@@ -198,6 +198,45 @@ def _capabilities_for(name: str) -> FrozenSet[Permission]:
 
 
 # ---------------------------------------------------------------------------
+# Policy gaps
+# ---------------------------------------------------------------------------
+#: What the skill loader's `confirm` floor grants by itself. Not reported as a
+#: gap: a skill is not obliged to declare the consequences of a floor it did not
+#: choose, and demanding it would bury the real mismatches under noise.
+SKILL_FLOOR_GRANTS: FrozenSet[str] = frozenset(
+    p.value for p in _TIER_FLOOR[PERMISSION_CONFIRM]
+)
+
+
+def _names(values: Iterable[Any]) -> set:
+    """Permission names as plain strings, from enum members or raw strings.
+
+    Needed because `Permission` is a `str` *Enum*: `hash(member)` is the member's,
+    so `frozenset - {"filesystem.write"}` would subtract nothing and every skill
+    would look like a violation. Compare values, never members to strings.
+    """
+    return {str(getattr(v, "value", v)).strip() for v in (values or ())}
+
+
+def gaps_for(
+    action: str,
+    tool_declared: Optional[Iterable[Any]] = None,
+    manifest_declared: Optional[Iterable[Any]] = None,
+) -> FrozenSet[str]:
+    """What this tool needs that the skill's manifest never asked for.
+
+    ``required_for`` already folds in the tier floor; the floor's own grants are
+    subtracted so the answer means "extra capability the user did not approve",
+    not "the loader did its job". A gap is reported to the skill author and, with
+    ``SKILL_STRICT_PERMISSIONS``, refused at load.
+    """
+    needed = {p.value for p in required_for(action, extra=tool_declared)}
+    needed -= set(SKILL_FLOOR_GRANTS)
+    asked = _names(manifest_declared) | _names(tool_declared)
+    return frozenset(needed - asked)
+
+
+# ---------------------------------------------------------------------------
 # Grants
 # ---------------------------------------------------------------------------
 #: A grant is ``allow`` / ``deny`` / ``ask``. ``ask`` is the default, meaning
@@ -222,6 +261,8 @@ def describe() -> List[Dict[str, str]]:
 
 __all__ = [
     "ALL_PERMISSIONS",
+    "SKILL_FLOOR_GRANTS",
+    "gaps_for",
     "DECISION_ALLOW",
     "DECISION_ASK",
     "DECISION_DENY",

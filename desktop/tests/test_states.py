@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import protocol, states  # noqa: E402
+from app import protocol, states, theme  # noqa: E402
 from app.states import CONNECTION_CONNECTED, CONNECTION_OFFLINE, CONNECTION_RECONNECTING
 from app.states import Inputs, UiState  # noqa: E402
 
@@ -154,17 +154,24 @@ class TestHudMapping:
             assert states.status_to_state(raw) is state, (state, raw)
 
     def test_accents_come_from_the_theme(self):
-        # The accent is the reference's cyan (#22d3ee), measured from the
-        # source image. The set is closed on purpose: an accent here that is
-        # not a theme token is a colour the two clients cannot agree on.
+        # Deliberately literal: `allowed = set(theme.ACCENTS.values())` would be
+        # `accent()` applied to itself and could never fail. The values are the
+        # accent's current ones (the reference's accent turned out to be magenta
+        # `#d946ef`, not the cyan `#22d3ee` this list used to assert), and updating
+        # them is the reviewable half of a palette change.
         #
         # Green is in the set on its own account. It used to be omitted because
         # CYAN and GREEN shared a value, so a distinct entry would have been
         # redundant; the reference-derived palette separates them, and
         # `listening` legitimately paints green.
-        allowed = {"#22d3ee", "#35d399", "#f2b84b", "#ff6b6b", "#8bffff"}
+        allowed = {"#d946ef", "#35d399", "#f2b84b", "#ff6b6b", "#e879f9"}
         for state in UiState:
             assert states.accent(state).lower() in allowed, (state, states.accent(state))
+        # The property that is not a restatement of `accent()`: the vocabulary of
+        # token *names* is closed too, so a new accent has to be chosen from the
+        # palette and recorded in both places rather than invented in `states.py`.
+        assert set(theme.ACCENTS) == {"cyan", "green", "amber", "red", "violet"}
+        assert set(states.STATE_ACCENT.values()) <= set(theme.ACCENTS)
 
 
 def event(kind: str, **data) -> protocol.ServerEvent:

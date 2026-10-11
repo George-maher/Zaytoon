@@ -132,7 +132,16 @@ def is_allowed_model(model: str) -> bool:
     return is_allowlisted(model)
 
 
-# The single supported provider. Local model execution has been removed.
+#: The supported providers. **Ollama is the default** (local, no key); OpenRouter
+#: is the optional cloud path. Which one runs is decided once, here, and no path
+#: ever falls back into the other implicitly — a local-only install must not
+#: start making cloud calls because a daemon is down, and a cloud install must
+#: not start running weights on the user's machine because a request was rate
+#: limited. (This comment used to claim local execution "has been removed", with
+#: `AI_PROVIDER` defaulting to `ollama` four lines below it. The README and a CI
+#: guard repeated the claim. Whichever way the product moves, the code, the docs
+#: and the guard have to say the same thing — that is what the guard below is
+#: for now.)
 PROVIDER_OPENROUTER = "openrouter"
 PROVIDER_OLLAMA = "ollama"
 VALID_PROVIDERS = (PROVIDER_OPENROUTER, PROVIDER_OLLAMA)
@@ -318,16 +327,55 @@ class Config:
         """True when we have what we need to call OpenRouter at all."""
         return bool(self.OPENROUTER_API_KEY)
 
+    #: Model calls allowed to run at the same time, process-wide. This is not a
+    #: throughput knob: a local runtime getting *more* concurrent generations
+    #: gives every one of them a worse answer, or takes the daemon down. Raise it
+    #: only on a machine that provably has the memory for another context.
+    LLM_MAX_CONCURRENCY: int = _env_int("LLM_MAX_CONCURRENCY", 2)
+    #: How long a request waits for a slot before it is refused with an
+    #: explanation. Queueing is the normal case (two questions in one second is
+    #: ordinary use); refusing is the exception, and the ceiling exists so a wedged
+    #: generation cannot hold the whole assistant behind it forever.
+    LLM_QUEUE_TIMEOUT_S: float = _env_float("LLM_QUEUE_TIMEOUT_S", 45.0)
+
+    #: Answer a closed set of one-tool requests ("what time is it", "open spotify")
+    #: without a model call. Off, every such turn goes through the LLM exactly as
+    #: it always did — the path only removes a round trip, so the flag is a
+    #: behaviour switch for debugging, not a safety switch: the registry tier and
+    #: the confirmation gate are re-checked before anything runs.
+    FAST_PATH_ENABLED: bool = _env_bool("FAST_PATH_ENABLED", True)
+
+    #: How stale the cached provider probe in ``services/provider_health`` may
+    #: be before ``/health`` re-probes. The UI and the desktop supervisor poll this
+    #: endpoint, so a short TTL bounds staleness while keeping the daemon off the
+    #: critical path; 0 forces a probe per call.
+    HEALTH_PROBE_TTL_S: float = _env_float("HEALTH_PROBE_TTL_S", 5.0)
+    #: The probe's own timeout, deliberately nothing like ``OLLAMA_TIMEOUT`` (a
+    #: generation may run for minutes; a version handshake must not).
+    HEALTH_PROBE_TIMEOUT_S: float = _env_float("HEALTH_PROBE_TIMEOUT_S", 2.0)
+    #: Stop tracked background processes (`process_start`) when the backend
+    #: shuts down. The registry is in-memory, so leaving them running orphans
+    #: them: a dev server still holding its port, invisible to the next session.
+    #: Off, and `process_stop` becomes a tool the user must remember to drive.
+    PROCESS_STOP_ON_SHUTDOWN: bool = _env_bool("PROCESS_STOP_ON_SHUTDOWN", True)
+
+    #: Also ask ``/api/tags`` and report which tier models are absent. One extra
+    #: local GET, and it is what turns "provider unreachable" into the specific
+    #: "`ollama pull qwen3.5:9b`" the user can act on.
+    HEALTH_PROBE_MODELS: bool = _env_bool("HEALTH_PROBE_MODELS", True)
+
     @property
     def provider_ready(self) -> bool:
-        """True when the *active* provider can serve requests.
+        """True when the *active* provider is configured well enough to try.
 
-        Ollama needs no credentials — only a reachable endpoint — so this is
-        what ``/health`` should report, while ``llm_configured`` keeps its
-        OpenRouter-specific meaning for the free-model policy checks.
+        This is a **configuration** predicate, not a reachability one, and the two
+        must not be confused: ``/health`` used to treat this as the second, so an
+        Ollama install with a stopped daemon read ``status: "ok"`` while the same
+        process logged ``AI provider not connected`` two seconds earlier. Reach
+        is ``services/provider_health``, which actually asks.
         """
         if self.PROVIDER == PROVIDER_OLLAMA:
-            return True
+            return bool(self.OLLAMA_BASE_URL)
         return bool(self.OPENROUTER_API_KEY)
 
     def model_for_tier(self, tier: str) -> str:
@@ -554,6 +602,47 @@ class Config:
     TOOL_ALWAYS_CONFIRM: str = _env_str(
         "TOOL_ALWAYS_CONFIRM", "run_code,file_delete,registry_write"
     )
+
+    # ------------------------------------------------------------------
+    # Web fetch (`fetch_url`) — the only place the assistant reads a remote
+    # body. Caps, not preferences: raising any of them widens what a fetched
+    # page can do to this machine, so they are stated here and tested.
+    # ------------------------------------------------------------------
+    #: Seconds before a fetch is abandoned (connection is capped at 6 of these).
+    FETCH_TIMEOUT_S: float = _env_float("FETCH_TIMEOUT_S", 12.0)
+    #: Bytes read from the wire. Beyond this the response is refused, not kept.
+    FETCH_MAX_BYTES: int = _env_int("FETCH_MAX_BYTES", 512_000)
+    #: Characters of extracted text handed on. `agents/engine.py` shows a tool
+    #: the first 4 000 characters of an observation either way.
+    FETCH_MAX_CHARS: int = _env_int("FETCH_MAX_CHARS", 4_000)
+    #: Redirect hops followed, each one re-checked against the address policy.
+    FETCH_MAX_REDIRECTS: int = _env_int("FETCH_MAX_REDIRECTS", 3)
+    #: Allow private/loopback addresses. Off: the machine's own services (Ollama
+    #: on 127.0.0.1, a router admin page, a database HTTP port) are then not
+    #: readable through a model-supplied URL. Link-local stays refused whatever
+    #: this says, because 169.254.169.254 is cloud credentials, not a LAN device.
+    FETCH_ALLOW_PRIVATE: bool = _env_bool("FETCH_ALLOW_PRIVATE", False)
+    #: Whether `open_url` may hand the browser a private/loopback address.
+    #:
+    #: Default **true**, unlike the fetch knob, and the asymmetry is the reason
+    #: both exist: `fetch_url` reads the bytes itself, so a LAN address is a
+    #: server-side request the *service* makes on someone else's behalf.
+    #: `open_url` hands a URL to the user's own browser, where their own
+    #: privileges and cookies apply — and "open my router page" is a normal
+    #: thing to ask a desktop assistant for. The classes that are never a
+    #: legitimate target for either (link-local metadata, unspecified,
+    #: multicast) are refused by `tools/netguard.py` regardless of this flag,
+    #: and the scheme policy (http/https only) is shared with it.
+    OPEN_URL_ALLOW_PRIVATE: bool = _env_bool("OPEN_URL_ALLOW_PRIVATE", True)
+
+    #: Refuse to load a skill tool that needs a permission its manifest did not
+    #: ask for, instead of reporting the mismatch and loading it. Off by default:
+    #: the report is the product behaviour (a skill author gets a precise warning),
+    #: and silently refusing a user's already-installed skill on a code change
+    #: would be its own kind of breakage. Turn it on where a skills directory is
+    #: fed by someone else — a shared folder, a team repo, a download.
+    #: See `core.permissions.gaps_for` for what counts as a gap.
+    SKILL_STRICT_PERMISSIONS: bool = _env_bool("SKILL_STRICT_PERMISSIONS", False)
 
     # ------------------------------------------------------------------
     # Logging

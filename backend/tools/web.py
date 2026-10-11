@@ -5,6 +5,15 @@ new and is deliberately limited to http/https: a ``file://`` or ``javascript:``
 URL handed to a desktop assistant's "open this" tool is a local-read and
 script-execution primitive respectively, and there is no legitimate reason for
 the assistant to open one on the user's behalf.
+
+The URL policy itself is **not** implemented here: it is
+:func:`tools.netguard.parse_public_url`, the same function ``fetch_url`` runs on
+its way out. Two copies of an address policy is how one of them ends up accepting
+``http://169.254.169.254/`` while the other refuses it — and the page that
+*tells* the assistant to open that URL is exactly the kind of text a fetched page
+contains. What `open_url` deliberately does not do is resolve the name first:
+the browser resolves it, so DNS-rebinding is mitigated for ``fetch_url`` and not
+eliminated here (see the module docstring in ``tools/netguard.py``).
 """
 
 from __future__ import annotations
@@ -14,22 +23,19 @@ import logging
 import re
 import webbrowser
 from typing import Any, Dict, List
-from urllib.parse import urlparse
 
+from tools import netguard
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop
 from tools.sandbox import SecurityError
 
 logger = logging.getLogger("Zaytoon.Tools.Web")
 
-#: Only these schemes may be opened. See the module docstring.
-ALLOWED_SCHEMES = ("http", "https")
+#: Re-exported so a caller that read the scheme list off this module still gets
+#: the truth: the policy lives in `tools/netguard.py`, and a second tuple here
+#: would be a second policy to forget.
+ALLOWED_SCHEMES = netguard.ALLOWED_SCHEMES
 
 MAX_RESULTS = 8
-
-#: RFC 3986 scheme grammar. Used to tell "has a scheme" from "has no scheme",
-#: which a naive ``"://" in url`` test gets wrong for ``javascript:`` and
-#: ``data:`` — the two schemes most worth refusing.
-_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
 
 
 class SearchWeb(BaseTool):
@@ -102,7 +108,12 @@ class OpenUrl(BaseTool):
         return ["browse", "visit_url", "open_website"]
 
     def description(self) -> str:
-        return "Open an http or https URL in the default browser."
+        return (
+            "Open an http or https URL in the user's default browser. Only web "
+            "schemes are accepted, and addresses no browser should be sent to "
+            "(a cloud metadata endpoint, a link-local or multicast address, this "
+            "machine's own name) are refused with the reason."
+        )
 
     def schema(self) -> Dict[str, Any]:
         return {
@@ -116,28 +127,39 @@ class OpenUrl(BaseTool):
         url = params.get("url")
         if not isinstance(url, str) or not url.strip():
             raise ToolValidationError("'url' is required")
-        # A refused scheme is a policy decision, so it surfaces as `blocked`
-        # rather than as a validation error the user could retry around.
+        # A refused scheme or address is a policy decision, so it surfaces as
+        # `blocked` rather than as a validation error the user could retry
+        # around. `validate` is sync, so this is the string-level half of
+        # netguard's policy only — the same split `fetch_url` uses.
         self._check(url)
 
     @staticmethod
+    def _allow_private() -> bool:
+        from config import config
+
+        return bool(getattr(config, "OPEN_URL_ALLOW_PRIVATE", True))
+
+    @staticmethod
     def _check(url: str) -> str:
-        candidate = url.strip()
-        # Detect a scheme properly. Testing for "://" is not enough: both
-        # "javascript:alert(1)" and "data:text/html,..." are schemeless-looking
-        # to that test, so prefixing them with "https://" would turn a refused
-        # scheme into an accepted one with a nonsense netloc.
-        if not _SCHEME_RE.match(candidate):
-            candidate = f"https://{candidate}"
-        parsed = urlparse(candidate)
-        if parsed.scheme.lower() not in ALLOWED_SCHEMES:
-            raise SecurityError(
-                f"Only {' and '.join(ALLOWED_SCHEMES)} URLs may be opened "
-                f"(got {parsed.scheme or 'no scheme'!r})"
-            )
-        if not parsed.netloc:
-            raise ToolValidationError(f"Not a valid URL: {url}")
-        return candidate
+        """The canonical, policy-approved URL to hand the browser.
+
+        ``netguard`` owns every rule in here (scheme grammar, credentials in the
+        netloc, address class), so the answer is its ``Target.url`` — a rebuilt
+        URL — rather than the caller's string. That is the part that matters: an
+        unmodified ``http://host@metadata.attacker/`` reads as a host to a
+        sloppy parser and as credentials to a browser.
+        """
+        # Nothing is decided here, including the missing-scheme case: netguard
+        # knows that `pypi.org:443/x` has a *port* where a naive test sees a
+        # scheme, and that a bare `example.com` is an https page. A second copy of
+        # that reasoning is a second thing to get wrong.
+        target = netguard.parse_public_url(
+            (url or "").strip(),
+            allow_private=OpenUrl._allow_private(),
+            verb="openable",
+            action="opened",
+        )
+        return target.url
 
     async def execute(self, url: str = "", **_: Any) -> ToolResult:
         try:

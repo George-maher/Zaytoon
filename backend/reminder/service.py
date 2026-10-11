@@ -181,20 +181,39 @@ class ReminderService:
                 session_id=raw.get("session_id", "default"),
                 created_at=datetime.fromisoformat(raw["created_at"]) if raw.get("created_at") else None,
                 timezone_offset=raw.get("timezone_offset", 0),
-                notify_attempts=raw.get("notify_attempts", 0),
+                # The persisted count, not the data class's ephemeral one: it
+                # used to restart at 0 on every tick because nothing ever wrote
+                # it back, so "attempt 3 of 3" was only ever true in memory.
+                notify_attempts=raw.get("attempts", raw.get("notify_attempts", 0)),
                 notify_channel=raw.get("notify_channel", "websocket"),
                 tags=raw.get("tags", []),
             )
         return None
 
     async def get_due(self) -> List[ReminderData]:
+        """Due reminders, already **claimed** (status `firing`) in the store.
+
+        The status used to be set on the returned object only — the row stayed
+        `pending`, so a second tick saw the same reminder again while the first
+        was still being delivered. The claim is the store's job now
+        (`MemoryAgent.get_due_reminders`), and this reflects it instead of
+        dressing up the value.
+        """
         rows = await self._memory.get_due_reminders()
-        reminders = []
-        for row in rows:
-            reminder = ReminderData.from_db_row(dict(row))
-            reminder.status = ReminderStatus.FIRING
-            reminders.append(reminder)
-        return reminders
+        return [ReminderData.from_db_row(dict(row)) for row in rows]
+
+    async def release(self, reminder_id: int, max_attempts: int = 3) -> str:
+        """Undo a claim after a failed delivery; returns the new row status.
+
+        This is the counterpart to `mark_completed`. Without it a delivery
+        failure had exactly one outcome — the reminder was consumed anyway — and
+        the "retry" in the scheduler only re-notified inside one tick.
+        """
+        return await self._memory.release_reminder(reminder_id, max_attempts)
+
+    async def requeue_stale_claims(self) -> int:
+        """Recover reminders orphaned by a crash between claim and delivery."""
+        return await self._memory.requeue_stale_claims()
 
     async def format_list_for_display(self, reminders: List[dict], language: str) -> str:
         if not reminders:

@@ -411,13 +411,33 @@ class TestFilesystemTools:
         assert result["data"]["count"] == 10
         assert result["data"]["truncated"] is True
 
-    def test_every_escape_attempt_is_blocked(self, registry):
+    def test_every_escape_attempt_is_blocked(self, registry, workspace):
+        """No escape attempt may end up reading something outside the workspace.
+
+        The assertion is about the outcome, not the mechanism.
+        ``C:/Windows/…`` is an absolute path in Windows and a perfectly ordinary
+        *relative* name on POSIX — a directory literally called ``C:`` — so on
+        Linux the honest question is not "was it refused?" but "did it stay
+        inside the root?". Asserting `blocked` everywhere tested the shape of
+        the string, and reported a containment bug on a machine where the
+        containment was correct.
+        """
         for path in (
             "../outside.txt", "../../etc/passwd", "a/../../b",
             "C:/Windows/System32/drivers/etc/hosts", "~/secret",
         ):
             result = asyncio.run(registry.execute("file_read", {"path": path}))
-            assert result.get("blocked") is True, path
+            if os.name == "nt":
+                # Every one of these is an escape on Windows, including the
+                # drive-absolute one, and `file_read` is tier `safe` so the only
+                # possible refusal is the sandbox's.
+                assert result.get("blocked") is True, path
+                continue
+            if result.get("blocked"):
+                continue
+            resolved = sandbox.resolve_workspace(path, str(workspace))
+            assert resolved, f"{path} was neither refused nor resolved"
+            assert os.path.commonpath([resolved, str(workspace)]) == str(workspace), path
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +481,59 @@ class TestWebTools:
     def test_open_url_accepts_https(self, registry):
         from tools.web import OpenUrl
 
-        assert OpenUrl._check("https://example.com") == "https://example.com"
+        # Canonical, not echoed: `_check` returns netguard's rebuilt URL, which is
+        # the whole point of delegating — the string the browser receives is the
+        # one whose host and port were actually judged.
+        assert OpenUrl._check("https://example.com") == "https://example.com/"
 
     def test_open_url_adds_a_missing_scheme(self, registry):
         from tools.web import OpenUrl
 
-        assert OpenUrl._check("example.com") == "https://example.com"
+        assert OpenUrl._check("example.com") == "https://example.com/"
+        # A bare host with a port is a *port*, not a scheme. `re.match`-style
+        # tests read it as `pypi.org:` and produce a nonsense host.
+        assert OpenUrl._check("pypi.org:443/project") == "https://pypi.org/project"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://0.0.0.0/",
+            "http://224.0.0.1/",
+        ],
+    )
+    def test_open_url_refuses_the_addresses_fetch_url_refuses(self, registry, url):
+        """The point of delegating: one address policy for both tools.
+
+        A page the model read can instruct it to "open this for me", so an
+        `open_url` that accepted what `fetch_url` refuses is a hole even though
+        the browser, not the service, makes the request.
+        """
+        result = asyncio.run(registry.execute("open_url", {"url": url}))
+        assert result.get("blocked") is True, url
+        assert "not openable" in result["error"], result
+
+    def test_open_url_obeys_its_own_private_network_knob(self, registry, monkeypatch):
+        """Loopback is allowed by default and refused when told not to be.
+
+        The default differs from `fetch_url`'s on purpose: this hands a URL to
+        the user's own browser ("open my router page"), it does not make the
+        service read something. See `OPEN_URL_ALLOW_PRIVATE` in config.py.
+        """
+        from config import config
+        from tools.web import OpenUrl
+
+        assert OpenUrl._check("localhost:5173") == "https://localhost:5173/"
+        monkeypatch.setattr(config, "OPEN_URL_ALLOW_PRIVATE", False)
+        result = asyncio.run(registry.execute("open_url", {"url": "http://localhost:5173"}))
+        assert result.get("blocked") is True
+        assert "this machine" in result["error"]
+
+    def test_open_url_refuses_credentials_in_the_url(self, registry):
+        result = asyncio.run(registry.execute("open_url", {"url": "http://admin@evil.test/"}))
+        assert result.get("blocked") is True
+        assert "credentials" in result["error"]
 
     @pytest.mark.parametrize(
         "url",

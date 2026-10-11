@@ -85,7 +85,21 @@ class _ListeningPort:
 
 
 class _FakeChild:
-    """Stands in for ``subprocess.Popen`` so nothing is actually spawned."""
+    """Stands in for ``subprocess.Popen`` so nothing is actually spawned.
+
+    ``__enter__``/``__exit__`` are not decoration: ``subprocess.run`` uses the
+    context-manager protocol, and code under test that shells out during teardown
+    (the Windows ``taskkill`` path in ``BackendProcess._signal_tree``) reaches
+    ``run`` while ``subprocess.Popen`` is patched, and died with
+    ``TypeError: '_FakeChild' object does not support the context manager
+    protocol`` on the windows leg until this was added.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
     def __init__(self, pid: int = 4242) -> None:
         self.pid = pid
