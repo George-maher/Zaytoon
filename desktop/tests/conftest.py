@@ -50,14 +50,48 @@ def _tk_unavailable_reason() -> str:
     return ""
 
 
-_TK_MISSING = _tk_unavailable_reason()
+#: Modules that reach `sounddevice`, which loads the PortAudio shared library at
+#: import time and raises `OSError: PortAudio library not found` on a Linux box
+#: without `libportaudio2` — a collection *error*, indistinguishable from a broken
+#: audio pipeline. Same policy as Tk above: skip, name the missing library, and
+#: let the CI leg install it so the tests run rather than vanish.
+_AUDIO_DEPENDENT = [
+    "test_audio_pipeline.py",
+    "test_telemetry.py",
+]
 
-if _TK_MISSING:
-    collect_ignore = list(_TK_DEPENDENT)
+
+def _native_module_reason(module: str) -> str:
+    try:
+        __import__(module)
+    except Exception as exc:  # noqa: BLE001 - "cannot be imported" is the question
+        return f"{type(exc).__name__}: {exc}"
+    return ""
+
+
+_TK_MISSING = _tk_unavailable_reason()
+_AUDIO_MISSING = _native_module_reason("sounddevice") if not _TK_MISSING else ""
+
+for _reason, _modules in ((_TK_MISSING, _TK_DEPENDENT), (_AUDIO_MISSING, _AUDIO_DEPENDENT)):
+    if _reason:
+        print(
+            f"desktop suite: skipping {len(_modules)} module(s) needing a native library "
+            f"this host cannot provide ({_reason})"
+        )
+
+if _TK_MISSING or _AUDIO_MISSING:
+    _skipped = (_TK_DEPENDENT if _TK_MISSING else []) + (
+        _AUDIO_DEPENDENT if _AUDIO_MISSING else []
+    )
+    collect_ignore = _skipped
+    _missing = "; ".join(
+        reason for reason in (_TK_MISSING, _AUDIO_MISSING) if reason
+    )
     _message = (
-        f"desktop suite: {len(_TK_DEPENDENT)} Tk-dependent modules skipped because "
-        f"this interpreter cannot import Tk ({_TK_MISSING}); the other "
-        f"modules — including the palette, protocol and instance guards — still run."
+        f"desktop suite: {len(_skipped)} native-dependent modules skipped on this host "
+        f"({_missing}); everything else — the palette parity, the wire protocol, the "
+        f"single-instance guard — still runs. On Linux: "
+        f"`sudo apt-get install -y python3-tk libportaudio2`."
     )
     print(_message)
     if os.environ.get("GITHUB_ACTIONS") == "true":

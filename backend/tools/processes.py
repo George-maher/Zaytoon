@@ -208,8 +208,14 @@ class ProcessRegistry:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=entry.timeout_s)
                 except asyncio.TimeoutError:
-                    entry.status = "timed_out"
+                    # Reap first, publish second. The old order set `timed_out`
+                    # and *then* terminated, so for up to two grace periods the
+                    # registry reported an ended process whose `returncode` was
+                    # still None — a caller that read the status in that window
+                    # saw "timed_out, exit_code=null" for a child still running.
+                    # Linux wins the race by being fast; macOS lost it in CI.
                     await _terminate(entry)
+                    entry.status = "timed_out"
                     return
             await proc.wait()
             entry.exit_code = proc.returncode
@@ -317,9 +323,15 @@ async def _terminate(entry: ManagedProcess) -> None:
     except asyncio.TimeoutError:
         try:
             proc.kill()
-            await asyncio.wait_for(proc.wait(), timeout=STOP_GRACE_S)
-        except (ProcessLookupError, OSError, asyncio.TimeoutError):
-            logger.warning("Process %s did not die after kill", entry.id)
+            # Unbounded, on purpose. SIGKILL cannot be caught or ignored, so a
+            # child not yet reaped here is already in the kernel's hands; the
+            # bounded wait this replaces was the mechanism that let `_terminate`
+            # return with `returncode is None` — and then write a status that
+            # claimed the process had stopped.
+            await proc.wait()
+        except (ProcessLookupError, OSError):
+            logger.warning("Process %s could not be killed", entry.id)
+            return
     entry.exit_code = proc.returncode
     if entry.status != "timed_out":
         entry.status = "stopped"

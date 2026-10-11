@@ -229,6 +229,30 @@ class TestLifecycle:
         assert await _await_exit(entry) == "timed_out"
         assert entry.proc.returncode is not None
 
+    async def test_a_child_that_ignores_SIGTERM_is_killed_and_then_reported(
+        self, workspace
+    ):
+        """The escalated path must not publish a status it has not earned.
+
+        `proc.terminate()` is a request; a child that traps SIGTERM turns the
+        escalation into a two-step. The registry used to write `timed_out`
+        before it had reaped anything, so `exit_code` was null for as long as two
+        grace periods while the child was still running — and on the macOS
+        runner a caller landed in that window. A reported outcome now always
+        follows the wait, so a SIGTERM-trapping child still ends with a real code.
+        """
+        script = workspace / "stubborn.py"
+        script.write_text(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        entry = await process_registry.start([PYTHON, str(script)], cwd=str(workspace), timeout=0.5)
+        assert await _await_exit(entry) == "timed_out"
+        assert entry.proc.returncode is not None, "a status was published before the child was reaped"
+        assert entry.exit_code == entry.proc.returncode
+
     async def test_no_timeout_means_it_keeps_running(self, workspace):
         entry = await process_registry.start(
             [PYTHON, "-c", "import time; time.sleep(30)"], cwd=str(workspace)

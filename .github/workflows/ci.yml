@@ -193,6 +193,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
+      - name: Install the native libraries the suite links against
+        # `sounddevice` loads libportaudio at import time and `customtkinter` needs
+        # a Tk in the interpreter. Without the library the audio modules fail at
+        # *collection*, which looks exactly like a broken audio pipeline; the
+        # conftest can skip them honestly, but installing is better — it is the
+        # difference between the tests not running and the tests running.
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
       - name: Run desktop shell tests
         # Same annotator as the backend leg; this job is Windows-only, which is
         # exactly the host whose failures have been unreadable.

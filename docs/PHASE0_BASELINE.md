@@ -1390,3 +1390,34 @@ backend → **2649 passed, 5 skipped**; frontend → **37 files / 613 tests pass
 `probe_webview_styles.py` compiles and imports its theme. Not verified: Windows and macOS
 behaviour themselves — `flock` is the mechanism the code now uses there, and the next run's
 annotations will name anything still wrong.
+
+### 19.1 The next two annotations, and what each turned out to be
+
+The 3-OS desktop leg and the annotator together produced two new names, and both were real:
+
+- **`tools/processes.py` published an outcome before it had reaped the child.** `_watch`'s
+  timeout branch set `entry.status = "timed_out"` and *then* awaited `_terminate`, whose
+  escalation was `kill()` + `wait_for(proc.wait(), 3s)` — so when that bounded wait expired,
+  `_terminate` returned with `proc.returncode is None` and still wrote a status. For up to two
+  grace periods the registry reported an ended process that was still running, with
+  `exit_code: null` in the `process_stop` output. Linux won the race by being fast; macOS lost
+  it, which is what `assert None is not None` in `test_process_manager.py:230` had been trying
+  to say on the leg nobody could read. Reaping now happens before publication, the SIGKILL wait
+  is unbounded (SIGKILL cannot be caught, and the bounded wait was the lie), and
+  `test_a_child_that_ignores_SIGTERM_is_killed_and_then_reported` traps SIGTERM to keep the
+  escalated path honest.
+- **`sounddevice` loads libportaudio at import time**, so three desktop modules failed at
+  *collection* on the ubuntu runner — indistinguishable from a broken audio pipeline. The
+  conftest now skips native-dependent modules with the missing library named on stdout and as a
+  `::notice`, and the ubuntu leg installs `libportaudio2` so the tests run rather than vanish.
+  Skipping with a reason is the fallback, not the plan.
+
+`test_ci_annotator.py` also failed on macOS for a reason worth keeping: it built the child's
+environment as `dict(**os.environ, PYTHONPATH=…)`, and the CI step that loads the annotator
+*sets* `PYTHONPATH`, so the duplicate keyword raised `TypeError`. A test of the diagnostics was
+the second failure on the leg the diagnostics exist to explain.
+
+The `Event loop is closed` annotation is still present on some runs and absent on others with
+identical code (2650 passed / 2 warnings, then 2650 passed / 0 warnings), which is what a
+non-deterministic shutdown race looks like from outside. It has not been patched, and it has not
+been hidden: no test's result depends on it, and the ubuntu leg that first carried it is green.
