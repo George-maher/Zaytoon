@@ -158,8 +158,18 @@ jobs:
         run: npm run build
 
   desktop:
-    name: Desktop shell
-    runs-on: windows-latest   # the shell is a Windows desktop application
+    name: Desktop shell (${{ matrix.os }})
+    # The shell is a Windows application, but the *guarantees* it is built from
+    # — the palette parity with the web client, the wire protocol, the
+    # single-instance guard, the state vocabulary — are cross-platform code, and
+    # every one of those was asserted only on a runner nobody could read. Three
+    # legs because the answer to "does it work on Linux and Mac too" was
+    # previously "the suite does not run there".
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
     defaults:
       run:
         working-directory: desktop

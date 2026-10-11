@@ -1317,3 +1317,76 @@ annotated, the cap honoured at 40 — and that an assertion message containing
 `\n::error title=pwned::` produces exactly one command line, because `%`/CR/LF (and `,`/`:` inside
 parameters) are escaped. Model- and user-controlled text reaches these messages through
 assertions, so the plugin must not be an injection point into the build log.
+
+## 19. Cross-platform: what "works on Windows, Linux and macOS" turned out to mean
+
+The annotations from §17.8 came back with names, and the names told a different story than
+"the CI legs are flaky". Three legs, four causes:
+
+| leg | what actually failed | |
+| --- | --- | --- |
+| macOS `Run tests` | `test_posix_parity.py` comparing the Darwin arm with a *real* `/proc/meminfo` read | fixed: the Linux arm is canned too, so the assertion measures the code on any host |
+| macOS `Run tests` | `tests/test_ci_annotator.py` — `dict(**os.environ, PYTHONPATH=…)` collided with the `PYTHONPATH` the CI step sets | fixed: my own diagnostics test, caught by the leg it was written for |
+| Windows `Run tests` | (same two, plus whatever the next run names) | annotations will say |
+| Desktop shell | `theme.py` and the desktop tests disagreed with the shipped web palette, in *both* directions at once | fixed, and the job is now a 3-OS matrix |
+
+### The desktop suite had never run anywhere but Windows
+
+`desktop/tests/test_design_parity.py` pins `desktop/app/theme.py` token-for-token against
+`frontend/src/styles/theme.css`. Its own header says that is the whole point — *"nothing but a
+test stops the desktop palette from quietly becoming its own thing again"* — and the test had
+been right all along while nobody ran it:
+
+- The web client restyled to the purple/magenta HUD reference (`--hud-void: #0a0510`,
+  `--hud-cyan: #d946ef`, …, recorded in `FINAL_REPORT.md`). The desktop theme followed for
+  `CYAN` and `BLUE` only. `VOID`, `DEEP`, `RAISED`, `LINE`, `TEXT`, `TEXT_MUTED`, `TEXT_DIM`,
+  `CYAN_CORE`, `INDIGO`, and the accent-derived `GLOW`/`ACCENT_DIM` stayed on the old blue-grey
+  scale — so the shell really did look like a different product, which is a user-visible defect
+  that no unit test on Linux or macOS was ever going to show.
+- `theme.py` also kept a *second* set of names for the same surfaces (`BG0/BG1/BG2`,
+  `TEXT_BASE`, `TEXT_MUTE`, `TEXT_FAINT`, `HAIRLINE`) whose comment claimed they were the same
+  scale while they carried the previous scale's literals. They are aliases of Layer 1 now, so a
+  restyle moves the shell once instead of twice.
+- `test_theme_tokens.py` pinned `CYAN = "#22d3ee"` and `VIOLET = "#8bffff"`; the parity test
+  pinned the same module to `#d946ef`/the CSS. **Two tests in one suite asserted opposite
+  values for one token**, and since the suite only ran on a leg whose output could not be read,
+  both stayed. The palette table is literal on purpose (a derived one could never fail) and now
+  matches the redesign it documents.
+- `test_states.py` asserted the state accents against a literal palette that predated the
+  magenta change; updated, and it gained the assertion that actually has teeth — the accent
+  *token-name* vocabulary is closed on both sides, which deriving colours from `theme.ACCENTS`
+  would have made impossible to express.
+
+### The single-instance guard was Windows-only, in the product, not just in the tests
+
+`desktop/app/instance.py` refused a second shell through a named mutex and was — in its own
+words — "a no-op" elsewhere. The module exists because a leftover instance contending for the
+keyboard hook crashed the next launch inside `keyboard`. That hazard is not Windows-specific:
+the file lock is the same guarantee on Linux and macOS (`flock`, released by the kernel on exit
+including SIGKILL), so `acquire()` now uses the mutex on Windows and `flock` on anything with
+`fcntl`, and records the holder's pid. `ZAYTOON_DESKTOP_LOCK_DIR` relocates the file; the tests
+use a tmp dir. `test_second_claim_is_refused` — "a second shell must not start" — used to be a
+test of the *runner's* OS (it asserted `False` where the guard was a no-op and passed only on
+Windows); it now runs on all three.
+
+Two other Windows-only-looking failures were the tests reaching past their subject: four hotkey
+tests patched attributes on `keyboard`, which `app.hotkeys` sets to `None` where the package
+cannot work (it needs a low-level OS hook), so on Linux they raised `AttributeError` instead of
+exercising the degrade-and-report path; they install a stand-in now. And `test_bridge`'s
+Windows-fallback test did `setattr(ctypes, "windll", …)` without `raising=False` — `windll` is
+a Windows-only attribute, so the *test* failed on the platforms it was meant to prove safe.
+
+### The desktop job runs on three OSes
+
+`.github/workflows/ci.yml`: `Desktop shell (windows-latest | ubuntu-latest | macos-latest)`,
+`fail-fast: false`. Seven modules need a Tk that a CI interpreter may not have, so
+`desktop/tests/conftest.py` ignores exactly those when `customtkinter` cannot be imported —
+and says so, on stdout and as a `::notice` annotation, so a leg reports which guarantees it did
+not check instead of silently shrinking. A stale entry in that list surfaces as a collection
+error on a host that does have Tk; it cannot rot quietly.
+
+**Measured here (Linux):** `cd desktop && pytest tests/` → **322 passed, 2 skipped, 0 failed**;
+backend → **2649 passed, 5 skipped**; frontend → **37 files / 613 tests passed**;
+`probe_webview_styles.py` compiles and imports its theme. Not verified: Windows and macOS
+behaviour themselves — `flock` is the mechanism the code now uses there, and the next run's
+annotations will name anything still wrong.

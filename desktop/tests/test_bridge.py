@@ -250,7 +250,10 @@ class TestNotificationSafety:
         class _BrokenWindll:
             user32 = None  # attribute access on None raises -> fallback path
 
-        monkeypatch.setattr(ctypes, "windll", _BrokenWindll())
+        # `raising=False` because `ctypes.windll` is a Windows-only attribute:
+        # without it this test of a Windows code path errored on Linux and macOS
+        # instead of exercising the fallback it describes.
+        monkeypatch.setattr(ctypes, "windll", _BrokenWindll(), raising=False)
 
         captured: list[list[str]] = []
         monkeypatch.setattr(sp, "Popen", lambda argv, **kw: captured.append(argv))

@@ -10,6 +10,7 @@ line, and that nothing about the run's *result* changes.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -27,10 +28,11 @@ pytestmark = pytest.mark.skipif(
 
 def _run(tmp_path: Path, source: str) -> subprocess.CompletedProcess:
     (tmp_path / "test_subject.py").write_text(source, encoding="utf-8")
-    env = dict(
-        **{key: value for key, value in __import__("os").environ.items()},
-        PYTHONPATH=str(ANNOTATOR_DIR),
-    )
+    # `dict(**os.environ, PYTHONPATH=...)` raises TypeError when the parent
+    # already exports PYTHONPATH — and the CI step that loads this plugin does
+    # exactly that, so a test of the CI diagnostics became a red leg by itself.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ANNOTATOR_DIR)
     return subprocess.run(
         [
             sys.executable,

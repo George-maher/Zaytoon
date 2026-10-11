@@ -37,10 +37,15 @@ import os
 # pixels, lifted only enough that a panel reads as a surface rather than a
 # hole. These names are pinned token-for-token against
 # frontend/src/styles/theme.css by tests/test_design_parity.py.
-VOID = "#05070A"
-DEEP = "#080B11"
-RAISED = "#0D1219"
-LINE = "#121924"
+# The purple-tinted near-black scale `frontend/src/styles/theme.css` has served
+# since the HUD restyle. These four are pinned token-for-token by
+# `tests/test_design_parity.py`; the shell kept the pre-restyle blue-grey for
+# long enough that only a Windows leg (the one job that runs the desktop suite)
+# reported it.
+VOID = "#0A0510"
+DEEP = "#110A1A"
+RAISED = "#180F24"
+LINE = "#1A0E2A"
 
 # --- accents ---------------------------------------------------------------
 # The accent is the reference's own cyan: 96% of its saturated pixels are in
@@ -48,9 +53,9 @@ LINE = "#121924"
 # stays ``CYAN`` because test_design_parity pins it against the stylesheet;
 # renaming it would move the drift, not remove it.
 CYAN = "#D946EF"
-CYAN_CORE = "#67E8F9"
+CYAN_CORE = "#C026D3"     # --hud-cyan-core: the fuchsia core, not a cyan
 BLUE = "#8B2A9E"
-INDIGO = "#2563EB"
+INDIGO = "#6B1F8E"
 # Amber is the reference's only warm element (its two orange bars) and is kept
 # deliberately scarce so it still reads as an alert rather than as decoration.
 AMBER = "#F2B84B"
@@ -58,7 +63,11 @@ GREEN = "#35D399"
 RED = "#FF6B6B"
 
 ACCENT = CYAN
-ACCENT_DIM = "#0E7490"
+# The dim/glow pair used to be Tailwind cyan-700 / cyan-900 under a cyan accent.
+# The accent is magenta now, so they are the same two steps of fuchsia — the
+# relationship (a muted accent, and an accent darkened to a ring) is what the
+# widgets depend on, and it was left behind by the restyle.
+ACCENT_DIM = "#A21CAF"
 SUCCESS = GREEN
 WARNING = AMBER
 DANGER = RED
@@ -68,9 +77,13 @@ BG = VOID
 BG_PANEL = DEEP
 BG_ELEVATED = RAISED
 BORDER = "#182230"
-TEXT = "#E8F6FF"
-TEXT_MUTED = "#6D8296"
-TEXT_DIM = "#A3B8CC"
+TEXT = "#F3EEF9"
+# The purple-tinted text ramp that `frontend/src/styles/theme.css` has been
+# serving since the HUD moved to the magenta reference; the tokens above them
+# (CYAN, BLUE) followed that restyle and these two did not, which is what
+# `desktop/tests/test_design_parity.py` exists to catch.
+TEXT_MUTED = "#7A6C8A"
+TEXT_DIM = "#B4A7C2"
 
 #: Corner radius for instrument chrome. Square is the point: a rounded panel
 #: reads as a card, and the design language is an instrument bay, not a
@@ -89,8 +102,8 @@ RADIUS_SM = 2
 #: Hex colour plus the 1px edge tints used for frames, borders and focus.
 EDGE = "#182230"
 EDGE_STRONG = "#24344A"
-EDGE_FAINT = "#121924"
-GLOW = "#164E5C"
+EDGE_FAINT = LINE
+GLOW = "#701A75"
 
 # --- density: the compact HUD ----------------------------------------------
 # Every spacing / font / thickness decision in the chat panel lives here, so
@@ -150,31 +163,37 @@ WRAP_MIN = 180                 # never wrap narrower than this
 #   the values the redesign specifies, and every widget in the shell reads them
 #   from here rather than hard-coding a colour.
 #
-# The accents already agree across both layers (cyan/green/amber/red are the
-# same hex values); only the surfaces and text tones differ, which is why the
-# two layers can coexist without the shell looking like two themes stitched
-# together.
+# The accents now agree across both layers *by construction*: Layer 2 reads
+# Layer 1's constants instead of repeating their literals, so a restyle moves the
+# shell once.
 
 # --- surfaces ---------------------------------------------------------------
 # Same reference-derived scale as the HUD palette above, so the shell and the
 # browser are one product rather than two dark themes.
-BG0 = "#05070a"                # app background
-BG1 = "#080b11"                # panels
-BG2 = "#0d1219"                # raised cards
+# Aliases, deliberately: Layer 2's comment claimed "the same reference-derived
+# scale" while carrying the *previous* scale's literal values, which is a second
+# source of truth for the same three surfaces.
+BG0 = VOID                     # app background
+BG1 = DEEP                     # panels
+BG2 = RAISED                   # raised cards
 
 # --- edges ------------------------------------------------------------------
-HAIRLINE = "#182230"           # 1px separators, card borders
+HAIRLINE = LINE              # 1px separators, card borders
 BORDER_STRONG = "#24344a"      # focused / emphasized frames
 
 # --- text -------------------------------------------------------------------
-TEXT_BASE = "#e8f6ff"          # body copy
-TEXT_MUTE = "#6d8296"          # secondary labels
-TEXT_FAINT = "#55697d"         # timestamps, disabled, placeholders
+TEXT_BASE = TEXT             # body copy
+TEXT_MUTE = TEXT_MUTED        # secondary labels — one value, two names
+TEXT_FAINT = TEXT_MUTED        # timestamps, disabled — the CSS alias
+                               # `--hud-text-faint` *is* `--hud-text-mute`
 
 # --- accents ----------------------------------------------------------------
 #: The assistant hue. In the reference the "hotter" tone is the near
 #: white-cyan rim on its circular dial rather than a second hue, so the AI
 #: state reads as *brighter* — which also survives greyscale.
+# The "hotter tone" of the accent, i.e. fuchsia-400 under a magenta accent. It
+# was `#8bffff` when the accent was cyan; `tests/test_theme_tokens.py` still
+# asserted that, which is a pin that has outlived the palette it was written for.
 VIOLET = "#e879f9"
 
 #: Every accent the shell may colour something with, in one place.

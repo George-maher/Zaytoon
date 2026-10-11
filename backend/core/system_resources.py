@@ -28,6 +28,12 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 #: ``(monotonic_ts, total_ticks, busy_ticks)`` of the previous CPU reading.
+
+#: The Linux memory source, named so a test can point it at a canned file. It is
+#: a *literal* read of /proc, which is what made the Darwin/Linux parity test a
+#: statement about the runner: on a mac the Linux arm has nothing to read, so the
+#: comparison silently became "macOS is not Linux".
+_LINUX_MEMINFO = "/proc/meminfo"
 _PREV: Optional[Tuple[float, int, int]] = None
 
 
@@ -250,7 +256,7 @@ def _memory() -> Dict[str, Any]:
     if system == "Linux":
         try:
             values: Dict[str, int] = {}
-            with open("/proc/meminfo", "r", encoding="ascii") as handle:
+            with open(_LINUX_MEMINFO, "r", encoding="ascii") as handle:
                 for line in handle:
                     key, _, rest = line.partition(":")
                     fields = rest.split()

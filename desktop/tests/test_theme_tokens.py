@@ -23,24 +23,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import theme  # noqa: E402
 
 #: Every colour token the redesign specifies, with its required value.
+# A literal table, and it has to stay one: deriving these values from `theme`
+# would restate the module's own definitions and make the test unbreakable. The
+# point is that the *restyle* is recorded twice, here and in
+# `frontend/src/styles/theme.css`, and this file is the half that was written by
+# hand. It disagreed with `test_design_parity.py` about CYAN for as long as the
+# shell had been magenta — one pin saying `#22d3ee`, the other comparing the CSS
+# `#d946ef` — and only the Windows leg ran either.
 REQUIRED_COLORS = {
-    "BG0": "#05070a",
-    "BG1": "#080b11",
-    "BG2": "#0d1219",
-    "HAIRLINE": "#182230",
+    "BG0": "#0a0510",
+    "BG1": "#110a1a",
+    "BG2": "#180f24",
+    "HAIRLINE": "#1a0e2a",
     "BORDER_STRONG": "#24344a",
-    "TEXT_BASE": "#e8f6ff",
-    "TEXT_MUTE": "#6d8296",
-    "TEXT_FAINT": "#55697d",
-    # The accent is the reference's own cyan: 96% of the source image's
-    # saturated pixels sit in the blue/cyan family, measured brightest
-    # #8bffff. Kept in step with frontend/src/styles/theme.css, which
-    # test_design_parity pins token-for-token against this module.
-    "CYAN": "#22d3ee",
+    "TEXT_BASE": "#f3eef9",
+    "TEXT_MUTE": "#7a6c8a",
+    "TEXT_FAINT": "#7a6c8a",
+    # The accent is the HUD reference's magenta. The name `CYAN` and the
+    # `--hud-cyan` token both outlived the colour, and `test_design_parity` pins
+    # them together, so the name stays and the value moved.
+    "CYAN": "#d946ef",
     "GREEN": "#35d399",
     "AMBER": "#f2b84b",
     "RED": "#ff6b6b",
-    "VIOLET": "#8bffff",
+    "VIOLET": "#e879f9",
 }
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")

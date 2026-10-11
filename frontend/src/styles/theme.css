@@ -90,7 +90,7 @@
   --text: #f3eef9;
   --text-mute: #7a6c8a;
   --text-faint: #5c4f6b;
-  --accent: var(--hud-cyan);   /* #22d3ee */
+  --accent: var(--hud-cyan);   /* #d946ef — the name is legacy, the colour is magenta */
   --green: var(--hud-green);   /* #35d399 */
   --amber: var(--hud-amber);   /* #f2b84b */
   --red: var(--hud-red);       /* #ff6b6b */

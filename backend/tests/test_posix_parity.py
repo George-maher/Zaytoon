@@ -296,7 +296,22 @@ class TestVolumeBackends:
 
 
 class TestShapeConsistencyAcrossSystems:
-    def test_darwin_memory_reports_the_same_keys_as_linux(self, monkeypatch):
+    def test_darwin_memory_reports_the_same_keys_as_linux(self, monkeypatch, tmp_path):
+        # The Linux arm of this comparison reads /proc/meminfo, which exists only
+        # on Linux. On the macOS runner that branch had nothing to read, returned
+        # `unavailable`, and the assertion "Darwin and Linux report alike" silently
+        # degraded into "this host is not a mac". Canning the file makes the test
+        # measure the code on every OS the leg runs on.
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text(
+            "MemTotal:        16777216 kB\n"
+            "MemFree:          1048576 kB\n"
+            "MemAvailable:     8388608 kB\n"
+            "Buffers:           524288 kB\n"
+            "Cached:           4194304 kB\n",
+            encoding="ascii",
+        )
+        monkeypatch.setattr(resources, "_LINUX_MEMINFO", str(meminfo))
         canned = {
             "vm_stat": (
                 "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n"
