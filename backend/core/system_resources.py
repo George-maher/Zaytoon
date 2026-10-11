@@ -45,10 +45,18 @@ def _cpu_ticks() -> Optional[Tuple[int, int]]:
                 ("dwHighDateTime", ctypes.c_uint32),
             ]
 
-        idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
-        ok = ctypes.windll.kernel32.GetSystemTimes(
-            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
-        )
+        try:
+            idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
+            ok = ctypes.windll.kernel32.GetSystemTimes(
+                ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+            )
+        except (AttributeError, OSError, ValueError):
+            # `ctypes.windll` is missing on hosts that still answer
+            # platform.system() == "Windows" — Wine, a ctypes built without the
+            # extension. The Linux and Darwin branches already answer `None`
+            # when their counters are unreadable; raising here instead turns a
+            # missing figure into a 500 on /system, which renders this panel.
+            return None
         if not ok:
             return None
         # Kernel time *includes* idle time on Windows.
@@ -205,7 +213,14 @@ def _memory() -> Dict[str, Any]:
 
         status = MEMORYSTATUSEX()
         status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        try:
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        except (AttributeError, OSError, ValueError):
+            return {
+                "status": "unavailable",
+                "reason": "ctypes.windll is not available on this Windows-shaped host",
+            }
+        if not ok:
             return {"status": "unavailable", "reason": "GlobalMemoryStatusEx failed"}
         total = int(status.ullTotalPhys)
         avail = int(status.ullAvailPhys)

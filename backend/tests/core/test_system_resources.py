@@ -95,3 +95,26 @@ def test_network_is_an_explicit_state():
 
     assert network["status"] == "unavailable"
     assert network["reason"]
+
+
+def test_a_windows_that_lacks_windll_reports_states_instead_of_raising(monkeypatch):
+    """The branch chosen by `platform.system()` must be as defensive as its siblings.
+
+    `ctypes.windll` exists on Windows and nowhere else, so the Windows branch was
+    the one place where a probe could raise. That is not a hypothetical that only
+    a mask can reach: Wine and a ctypes built without the extension both answer
+    "Windows", and `sample()` feeds `/system`, whose panel renders a *state* — a
+    traceback there costs the whole status card, not one number.
+    """
+    import ctypes
+
+    monkeypatch.setattr(system_resources.platform, "system", lambda: "Windows")
+    monkeypatch.delattr(ctypes, "windll", raising=False)
+    snapshot = system_resources.sample("/")
+
+    assert snapshot["cpu"]["status"] in ("sampling", "unavailable"), snapshot["cpu"]
+    assert snapshot["memory"]["status"] == "unavailable", snapshot["memory"]
+    assert snapshot["memory"]["reason"], "unavailable without a reason"
+    for name in ("cpu", "memory", "disk", "network"):
+        block = snapshot[name]
+        assert block["status"] in ("ok", "sampling", "unavailable"), (name, block)

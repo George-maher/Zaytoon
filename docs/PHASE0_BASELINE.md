@@ -1250,3 +1250,44 @@ clean `HOME` with no `.env` and no `backend/data` in a fresh clone (2641 passed)
 `80dd3be`). The `Desktop shell` job and both remaining `Run tests` legs need the tail of
 the log; nothing here can produce it, so those are reported as open rather than patched on
 a guess.
+
+### 17.7 The Windows mask, and what the CI reds are not
+
+The macOS leg was found with a `platform.system() → "Darwin"` mask. Repeating it for
+Windows (`-p winmask`, three lines that also set `machine`/`processor`, never
+`sys.platform`, which the stdlib needs to stay itself) took the suite from 2641
+green to **11 failures**, and nine of them were one real defect:
+
+`core/system_resources.py` chooses its CPU and memory backends from
+`platform.system()`, and only the Windows branch was unguarded — it called
+`ctypes.windll.kernel32.GetSystemTimes` / `GlobalMemoryStatusEx` directly, while the
+Linux and Darwin branches answer `None` / an `unavailable` block when their counters
+cannot be read. Every caller of `sample()` — `/system`, and therefore the status
+panel — assumed the stated contract that a probe reports a state instead of raising.
+On a host that says "Windows" but has no `windll` (Wine, a `ctypes` built without the
+extension) the panel became a traceback. Both branches now degrade the same way their
+siblings do, and `test_a_windows_that_lacks_windll_reports_states_instead_of_raising`
+pins it by pretending to be Windows on Linux.
+
+The two remaining mask failures are `tests/test_security_sandbox.py`
+`TestWindowsCmdToolInjection::test_benign_commands_still_work` and
+`TestPathContainment::test_different_drive_rejected`. Both are marked
+`skipif(platform.system() != "Windows")`, so the mask *unlocks* them on a Linux box
+and they then demand `cmd.exe` and drive letters. That is the mask lying, not a
+defect; they are left as they are. **The mask cannot stand in for a Windows runner**,
+so this does not explain the `windows-latest` leg — it only removed one class of
+host-dependence from it.
+
+The `Event loop is closed` annotation on the ubuntu leg was chased to a dead end on
+purpose: with the thread-exception warning promoted to an error
+(`-W error::pytest.PytestUnhandledThreadExceptionWarning`) the full suite is **2644
+passed, exit 0, no warning at all** here, so it is a post-session shutdown race this
+environment cannot reproduce — and it was never the red (that was `verify_final.py`).
+No change was made to hide noise I cannot see.
+
+The two frontend-image defects reported in §17 are fixed rather than documented:
+`frontend/certs/` and `frontend/scripts/generate-certs.sh` now exist (the `COPY` had
+no target, so the image could not build at all), the HTTP→HTTPS redirect follows a
+build-time `HTTPS_PORT` that compose sets to the published port, and the healthcheck
+stops failing on its own self-signed certificate. See `DEPLOYMENT.md`; the image has
+**not** been built here, because there is no Docker in this sandbox.

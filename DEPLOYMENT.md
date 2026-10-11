@@ -20,31 +20,48 @@ and `model-cache` → `/root/.cache/huggingface` (Whisper weights, if STT is use
 inside the container). Both are named, so `docker compose down` keeps them and
 `down -v` destroys them.
 
-### ⚠ Known defects in the frontend image — verify before deploying
+### The frontend image: what the certificate step actually needs
 
-Two independent problems, found by reading the tree on 2026-10-11. Neither is
-fixable honestly without someone running Docker, so they are written down rather
-than papered over:
+The image used to be undeployable in a way nobody noticed: `frontend/Dockerfile`
+contained `COPY certs/ /etc/nginx/certs/` with a comment pointing at
+`scripts/generate-certs.sh`, and **neither the directory nor the script existed in
+the repository** — so the build died at that `COPY`. The embedded nginx config also
+answered `http://localhost:3000` with `return 301 https://$host:8443$request_uri`,
+and 8443 is a port the host publishes nothing on (compose maps `3443:8443`), so
+even a successful build left you in a dead end. Both are fixed:
 
-1. **`frontend/Dockerfile` cannot build as committed.** It contains
-   `COPY certs/ /etc/nginx/certs/` and a comment pointing at
-   `scripts/generate-certs.sh`; **neither `frontend/certs/` nor that script
-   exists in the repository** (`git ls-files frontend` lists neither). The
-   build fails at that `COPY`.
-2. **The published ports do not match the redirect.** The embedded nginx config
-   answers on `8080` with `return 301 https://$host:8443$request_uri;`, while
-   compose publishes `3443:8443`. A browser opening the documented
-   `http://localhost:3000` is therefore redirected to `localhost:8443` — a port
-   nothing publishes. Publishing `8443:8443` (or redirecting to the published
-   port) is the smaller fix.
+```sh
+sh frontend/scripts/generate-certs.sh   # writes frontend/certs/localhost.{crt,key}
+docker compose up --build frontend
+```
 
-Consequence: **the supported way to run Zaytoon today is the local app**
-(`install.sh` / `start.bat`, or `python main.py` + `npm run dev`), and the
-`backend` container on its own. If you need the containerised UI, serve
-`frontend/dist/` behind your own TLS-terminating proxy — the React app talks to
-the API on relative paths (`/chat`, `/ws`), so any proxy that forwards the API
-prefixes works, and the WebSocket needs `Upgrade`/`Connection` headers passed
-through.
+- `frontend/certs/` is tracked with a `.gitignore` that keeps the directory and
+  excludes every key, so the `COPY` always has a target and no key material is
+  committed. The compose service bind-mounts the same directory read-only, so
+  replacing the pair needs no rebuild.
+- The redirect target is now a build argument (`ARG HTTPS_PORT`), and
+  `docker-compose.yml` passes `3443` — the published port. The container still
+  listens on 8443 internally; only the address handed to the browser follows the
+  mapping. If you republish the port, pass the new number in `args:`.
+- The `HEALTHCHECK` passes `--no-check-certificate`. The certificate is the
+  self-signed pair from the script, so verifying it against a CA that will never
+  exist marked every working container `unhealthy`. Trust is the browser's job
+  here, and the browser warns — which is the correct outcome for a key generated
+  by a script on your own machine.
+
+**What is not verified:** there is no Docker in the environment these changes were
+made in, so the image has not been built. The pieces that could be checked
+mechanically were: the emitted nginx config (the heredoc + `sed` reproduced in a
+plain shell — `$host`/`$request_uri` survive and the port substitutes), the
+compose YAML, `sh -n`, and `generate-certs.sh` run against a real `openssl`
+(self-signed pair verified with `openssl verify`, key checked with
+`openssl rsa -check`, SAN asserted for both the default name and a custom one).
+
+Until someone builds it, the supported way to run Zaytoon is still the local app
+(`install.sh` / `start.bat`, or `python main.py` + `npm run dev`). The React app
+talks to the API on relative paths (`/chat`, `/ws`), so serving `frontend/dist/`
+behind your own TLS-terminating proxy also works — the proxy needs `Upgrade` and
+`Connection` headers passed through for the WebSocket.
 
 ## Process manager
 
