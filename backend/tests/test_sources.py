@@ -258,3 +258,96 @@ class TestEngineIntegration:
         assert result.stopped_reason == "max_iterations"
         assert "**Sources**" in result.text
         assert len(result.sources) == 1
+
+
+class _Recorder:
+    """A duck-typed bus: the engine only calls the frames it wants to send."""
+
+    def __init__(self):
+        self.frames = []
+
+    def __getattr__(self, name):
+        async def _emit(*args, **kwargs):
+            self.frames.append((name, args, kwargs))
+
+        return _emit
+
+
+class TestTransportFrames:
+    async def test_a_stamped_turn_emits_one_sources_frame(self):
+        from agents.events import AgentEventType, EventBus
+
+        bus = EventBus()
+        seen = []
+
+        async def sub(event):
+            seen.append(event)
+
+        bus.subscribe(sub)
+        eng, _ = self_engine = _engine_with_bus(
+            ['{"action": "fetch_url", "params": {"url": "https://x.test/a"}}',
+             "The version is 0.28 [1]."],
+            _Fake("fetch_url", ToolResult(True, "EXTERNAL", data={"url": "https://x.test/a", "status": 200})),
+            bus,
+        )
+        result = await eng.run("what version?", bus=bus)
+        frames = [e for e in seen if e.type is AgentEventType.SOURCES]
+        assert len(frames) == 1
+        payload = frames[0].data["sources"]
+        assert payload[0]["n"] == 1 and payload[0]["url"] == "https://x.test/a"
+        assert payload[0]["kind"] == "page"
+        assert result.sources == payload
+
+    async def test_a_turn_that_read_nothing_sends_no_frame(self):
+        from agents.events import AgentEventType, EventBus
+
+        bus = EventBus()
+        seen = []
+        async def sub(event):
+            seen.append(event)
+
+        bus.subscribe(sub)
+        eng, _ = _engine_with_bus(
+            ['{"action": "get_time", "params": {}}', "It is late."],
+            _Fake("get_time", ToolResult(True, "06:00")),
+            bus,
+        )
+        await eng.run("what time?", bus=bus)
+        assert not [e for e in seen if e.type is AgentEventType.SOURCES]
+
+    async def test_the_wire_mapping_carries_the_list_and_caps_it(self):
+        """The websocket branch is six lines, so it is tested as six lines."""
+        from agents.events import AgentEvent, AgentEventType
+        from api.websocket import _ProgressRelay
+
+        sent = []
+
+        class Cm:
+            async def send(self, ws, payload):
+                sent.append(payload)
+
+        relay = _ProgressRelay(object(), Cm(), "r1", "trace-9")
+        event = AgentEvent(
+            AgentEventType.SOURCES,
+            {"sources": [{"n": i, "url": f"https://x/{i}"} for i in range(1, 20)]},
+        )
+        await relay(event)
+
+        assert sent[0]["type"] == "sources"
+        assert len(sent[0]["sources"]) == 12, "the cap is the point of the frame"
+        assert sent[0]["trace_id"] == "trace-9"
+
+
+def _engine_with_bus(replies, tool, bus):
+    from agents.engine import AgentEngine
+
+    registry = ToolRegistry()
+    registry.register(tool)
+    eng = AgentEngine(llm=None, registry=registry, metrics=None)
+    queue = list(replies)
+
+    async def _ask(messages, *a, **k):
+        return queue.pop(0) if queue else "All done."
+
+    eng._ask = _ask  # noqa: SLF001
+    return eng, []

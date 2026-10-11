@@ -598,6 +598,7 @@ class _ProgressRelay:
     tool_started        ``tool_started``    {name, label}
     tool_progress       ``tool_progress``   {name, message}
     tool_finished       ``tool_finished``   {name, success, summary}
+    sources               ``sources``         {sources: [{n, url, kind, …}]}, capped
     response_chunk      handled by the existing ``token`` stream
     error               ``error``           {content}
     completed           ``status: done``
@@ -666,6 +667,21 @@ class _ProgressRelay:
                     "success": bool(data.get("success")),
                     "summary": str(data.get("summary", ""))[:200],
                 }),
+            )
+
+        elif kind is AgentEventType.SOURCES:
+            # Structured so a client that wants a citation panel does not have to
+            # parse the prose back apart — the same list is already appended to
+            # the text, which is what older clients (and the desktop view) show.
+            # An unknown `type` is ignored by a client that predates it.
+            await self._cm.send(
+                self._ws,
+                add_trace(
+                    {
+                        "type": "sources",
+                        "sources": list(data.get("sources") or [])[:12],
+                    }
+                ),
             )
 
         elif kind is AgentEventType.RESPONSE_CHUNK:

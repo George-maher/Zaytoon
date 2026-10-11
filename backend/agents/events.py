@@ -51,6 +51,10 @@ class AgentEventType(str, Enum):
     TOOL_FINISHED = "tool_finished"
     #: **User-facing prose.** The only event that becomes visible text.
     RESPONSE_CHUNK = "response_chunk"
+    #: What this turn actually read, numbered as the answer cites it. Sent after
+    #: the prose so a client that wants a structured list (a panel, a citation
+    #: popover) has one without parsing the text back apart.
+    SOURCES = "sources"
     #: A risky action is waiting on a human.
     CONFIRMATION_REQUIRED = "confirmation_required"
     #: Something failed.
@@ -180,6 +184,11 @@ class EventBus:
         """User-facing prose. The only event that becomes visible text."""
         if text:
             await self.emit(AgentEventType.RESPONSE_CHUNK, content=text, **data)
+
+    async def sources(self, items: Optional[List[Dict[str, Any]]], **data: Any) -> None:
+        """The turn's source list. Empty means "nothing was read", so: no frame."""
+        if items:
+            await self.emit(AgentEventType.SOURCES, sources=list(items), **data)
 
     async def error(self, message: str, **data: Any) -> None:
         await self.emit(AgentEventType.ERROR, content=message, **data)

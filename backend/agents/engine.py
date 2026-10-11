@@ -606,6 +606,11 @@ Rules:
   or any fact about this machine must come from the tool, not from you.
   If the user asks what time or date it is, call the time tool first.
 - If a tool was refused or denied, say so plainly; do not pretend otherwise.
+- For a factual question the tools cannot answer: search, then OPEN the page
+  before quoting a number, date, version or name from it — a search snippet is a
+  lead, not a source. Two or three different queries beat one re-run. Cite as
+  [n] using the numbered list you are shown, and start anything you cannot place
+  on it with "Unverified:". Never invent a citation.
 """
 
 SYSTEM_AR = """\
@@ -627,6 +632,10 @@ SYSTEM_AR = """\
 قواعد:
 - متخترعش اسم أداة ولا بارامتر. استخدم الموجود في القائمة بس.
 - متقولش إنك عملت حاجة إلا لو النتيجة بتأكد.
+- في سؤال معرفي الأدوات مش بتجاوبه: دور، وبعدين **افتح الصفحة** قبل ما تقتبس
+  رقم أو تاريخ أو إصدار أو اسم — مقتطف البحث دليل مش مصدر. اتنين أو تلات عمليات
+  بحث بصيغ مختلفة أحسن من واحدة متكررة. اذكر المصدر كـ [n] من القائمة اللي
+  اتعرضت عليك، وأي حاجة مش فيها اكتب قبلها "غير موثّق:". ومتاخترعش مصدر.
 - متعرّفش من عندك حاجة الأدوات تقدر تقولها: الوقت والتاريخ وأي حقيقة عن
   الجهاز لازم تيجي من الأداة مش منك. لو المستخدم سأل الوقت، نادِ أداة الوقت
   الأول ومتقولش وقتك أنت.
@@ -1172,6 +1181,10 @@ class AgentEngine:
                 answer, notes = ledger.stamp(answer, language)
                 errors.extend(notes)
                 await bus.response_chunk(answer, response_id=response_id)
+                await bus.sources(
+                    [source.to_dict() for source in ledger.items],
+                    response_id=response_id,
+                )
                 await bus.completed(reason="answered", iterations=iteration)
                 return LoopResult(
                     text=answer,
@@ -1277,6 +1290,10 @@ class AgentEngine:
         answer, notes = ledger.stamp(answer, language)
         errors.extend(notes)
         await bus.response_chunk(answer, response_id=response_id)
+        await bus.sources(
+            [source.to_dict() for source in ledger.items],
+            response_id=response_id,
+        )
         await bus.completed(reason="max_iterations", iterations=self.max_iterations)
         return LoopResult(
             text=answer,
