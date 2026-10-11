@@ -123,7 +123,7 @@ health and request/response metrics.
 ## Development
 
 ```bash
-cd backend && python -m pytest tests/ -q      # 2,300+ tests, ~95 s
+cd backend && python -m pytest tests/ -q      # 2,600+ tests, ~100 s, no network needed
 cd backend && python scripts/verify_final.py  # live smoke check
 cd desktop && python scripts/build_exe.py     # PyInstaller onefile build
 ```
