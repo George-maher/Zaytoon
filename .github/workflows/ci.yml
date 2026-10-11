@@ -203,8 +203,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libportaudio2
 
       - name: Run desktop shell tests
-        # Same annotator as the backend leg; this job is Windows-only, which is
-        # exactly the host whose failures have been unreadable.
+        # Same annotator as the backend leg. Three legs on purpose: the failures
+        # that used to be unreadable were the Windows-only ones, and the answers
+        # to "does it work on Linux and Mac too" were previously untestable.
         env:
           PYTHONPATH: ${{ github.workspace }}/.github
         run: python -m pytest tests/ -q -p ci_annotate

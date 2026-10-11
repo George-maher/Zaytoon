@@ -1184,33 +1184,59 @@ desktop/
   asserted by `tests/test_bridge.py::TestSecurity`. Destructive actions are *not*
   on the bridge; they travel through the backend's gated tool layer and its
   confirmation flow, which is unchanged.
+- **Paths and URLs leaving the bridge are policed** (`desktop/app/paths.py`):
+  `open_path` and `reveal_in_os` end in `os.startfile` / `open` / `xdg-open`, which
+  *execute* a file the OS calls a program, so a path is accepted only when it
+  resolves (symlinks followed first) inside a granted root — the backend's own
+  workspace, plus the desktop state dir — and only when it is not something the
+  shell would run (`.exe`/`.bat`/`.lnk`/… on Windows, the execute bit or
+  `.desktop` on Linux/macOS). `open_url` accepts `http`/`https` only. Refusals log
+  a reason and return `False`; the bool across the bridge never reveals whether a
+  file exists. `ZAYTOON_OPEN_ROOTS` widens the grant deliberately. Pinned by
+  `desktop/tests/test_bridge_paths.py`, which also pins the workspace-name mirror
+  against `backend/config.py`. **Anything new that hands a path to the OS must go
+  through `path_policy.classify()`.**
 - **The React side of the bridge** is `frontend/src/lib/desktop.js`: a wrapper
   that resolves `window.pywebview.api` once and degrades to no-ops in a plain
   browser, so the same bundle runs as web or desktop. `App.jsx` uses it for OS
   reminders notifications.
-- **Backend lifecycle** (`app/backend.py`, unchanged): probes `127.0.0.1:8000`
+- **Backend lifecycle** (`app/backend.py`): probes `127.0.0.1:8000`
   with a bare `socket.connect_ex`. If nothing answers it spawns
   `ZAYTOON_BACKEND_{PYTHON,MAIN,CWD}` resolved in three tiers — explicit
   override → `backend/.venv` → the running interpreter — with `shell=False`,
   `PYTHONUNBUFFERED=1` and `CREATE_NO_WINDOW`. It polls for up to
-  `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout.
+  `ZAYTOON_BACKEND_TIMEOUT` (30s) and **rolls the child back** on timeout. On
+  close it signals the child's whole *process group* — politely first
+  (`SIGTERM` / `taskkill /T`, `/F` only if the group ignores the polite one) —
+  because uvicorn reloads into a child that is ours to clean up but not ours to
+  own; `killpg` runs only when the child is the group leader, and the whole path is
+  bounded so a wedged `wait()` can never hang window close (`desktop/tests/test_desktop_lifecycle.py`).
 - **The safety property that matters:** `BackendProcess.shutdown()` returns
   immediately unless `self._spawned_by_us` is true, and `ensure_running()`
   *releases* its handle if a foreign process took the port. A backend the user
   started by hand is never killed. Covered by
   `TestBackendNeverTouchesAForeignProcess`.
 - **Single instance:** `app/instance.py` claims a named Windows mutex
-  (`Local\Zaytoon.Desktop.Shell.Instance`) before the window exists; a second
-  launch prints a message and exits. The kernel releases the mutex if the
-  owning process dies, so a crash cannot leave a stale lock.
+  (`Local\Zaytoon.Desktop.Shell.Instance`) before the window exists; on
+  Linux/macOS it holds an `flock` on a sibling lock file for the same guarantee —
+  released by the kernel if the owning process dies, so a crash cannot leave a
+  stale lock. A second launch prints a message and exits.
 - **Startup sequence:** parse args → single-instance claim → `WebViewHost.run()`
   → `backend.ensure_running()` → resolve URL (production file vs dev server) →
   create window with `js_api=bridge` → start health-check thread →
   `webview.start()`. On window close: save window state → stop health check →
-  `backend.shutdown()` (only if we spawned it).
-- **Health check:** a daemon thread probes the backend every 5s (0.1s under
-  pytest) and dispatches a `backend-health` CustomEvent into the page, so the
-  React UI can show link status without polling itself.
+  `backend.shutdown()` (only if we spawned it). `run()` is single-shot and its
+  teardown is `try/finally`, so **a failure anywhere — including `import webview`
+  itself, which fails on a Linux box with no WebKit/GTK — still stops the backend**
+  instead of orphaning it in a window that never opened.
+- **Health check:** a daemon thread probes the backend every
+  `ZAYTOON_HEALTH_INTERVAL` seconds (default 5) and records the result on
+  `WebViewHost.backend_up`, which `diagnose()` reports. It deliberately does
+  **not** call `evaluate_js`/`load_html` any more: the page's own
+  `useWebSocket.js` already owns liveness and reconnection, there was no
+  consumer for a `backend-health` event, and touching the WebView from a thread
+  pywebview did not create is unsafe on GTK/Cocoa (WebView2 happens to tolerate
+  it). Cross-thread DOM pushes must go through pywebview's own events.
 - **The asset-server port is pinned, and the backend allowlists it.** In
   production pywebview serves `frontend/dist` itself from a *random* port, and
   a random origin is not one the backend's CORS allowlist recognises — the

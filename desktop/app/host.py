@@ -35,11 +35,11 @@ DEFAULT_WINDOW_HEIGHT = 800
 DEFAULT_WINDOW_MIN_WIDTH = 800
 DEFAULT_WINDOW_MIN_HEIGHT = 600
 
-#: How often to check backend health, in seconds
+#: Default seconds between backend health samples. `DesktopConfig
+#: .health_check_interval_s` (ZAYTOON_HEALTH_INTERVAL) overrides it; the host used
+#: to halve the interval by checking whether `pytest` was in `sys.modules`, which
+#: made production code branch on the identity of its own interpreter.
 HEALTH_CHECK_INTERVAL = 5.0
-
-#: How often to check backend health during tests, in seconds
-HEALTH_CHECK_INTERVAL_TEST = 0.1
 
 #: Ports the desktop's own asset server may bind in production mode.
 #:
@@ -150,7 +150,11 @@ class WebViewHost:
         self.bridge = NativeBridge(config, self.backend)
         self.window = None
         self._shutting_down = False
+        self._started = False
         self._health_check_thread: threading.Thread | None = None
+        #: The last sampled backend state. A bool assignment, so reading it from
+        #: the UI thread needs no lock.
+        self.backend_up: bool = False
         self._window_state = self._load_window_state()
 
     # ------------------------------------------------------------------
@@ -158,7 +162,16 @@ class WebViewHost:
     # ------------------------------------------------------------------
 
     def run(self) -> int:
-        """Start the host. Blocks until the window is closed."""
+        """Start the host. Blocks until the window is closed.
+
+        Re-entry is refused rather than tolerated: a second call would attach a
+        second set of window handlers and start a second health thread on the same
+        host, and `closed` would then fire each handler twice.
+        """
+        if self._started:
+            raise RuntimeError("WebViewHost.run() is single-shot; construct a new host to retry")
+        self._started = True
+
         if not webview2_runtime_present():
             message = (
                 "The WebView2 runtime is not installed, so the Zaytoon window "
@@ -170,60 +183,84 @@ class WebViewHost:
             print(message, file=sys.stderr)
             return 1
 
-        import webview
+        # From the `import webview` to the end of the window loop, everything is inside a
+        # try/finally. An `import webview` that fails (no GTK/WebKit on the box),
+        # a `create_window` that fails (no display, or a Wayland/X11 mismatch), or
+        # a `webview.start()` that raises used to leave the backend we had *just*
+        # started running with nothing owning it — and with the single-instance
+        # guard released by `main()`, so the next launch attached to that orphan
+        # and reported nothing about how the previous one died.
+        try:
+            # The import is inside the guard on purpose: on a Linux box without
+            # GTK/WebKit this is the failure that actually happens, and a test of
+            # the guard below caught the first version orphaning the backend here.
+            import webview
 
-        # Start backend before showing the window
-        status = self.backend.ensure_running()
-        if not status.running:
-            logger.warning("backend not running: %s", status.hint)
+            # Start backend before showing the window
+            status = self.backend.ensure_running()
+            if not status.running:
+                logger.warning("backend not running: %s", status.hint)
 
-        # Determine URL (dev mode or production)
-        url = self._resolve_url()
+            # Determine URL (dev mode or production)
+            url = self._resolve_url()
 
-        # Create the window
-        self.window = webview.create_window(
-            title="Zaytoon",
-            url=url,
-            js_api=self.bridge,
-            width=self._window_state.get("width", DEFAULT_WINDOW_WIDTH),
-            height=self._window_state.get("height", DEFAULT_WINDOW_HEIGHT),
-            min_size=(
-                self._window_state.get("min_width", DEFAULT_WINDOW_MIN_WIDTH),
-                self._window_state.get("min_height", DEFAULT_WINDOW_MIN_HEIGHT),
-            ),
-        )
-
-        # Give the bridge a reference to the window
-        self.bridge.set_window(self.window)
-
-        # Set up event handlers
-        self.window.events.closed += self._on_closed
-        self.window.events.loaded += self._on_loaded
-        self.window.events.minimized += self._on_minimized
-        self.window.events.maximized += self._on_maximized
-        self.window.events.restored += self._on_restored
-
-        # Start health check thread
-        self._start_health_check()
-
-        # Start the webview event loop. In production pywebview serves the
-        # dist itself; give it a CORS-allowlisted port (see
-        # DESKTOP_PORT_RANGE) so REST calls from the page origin work.
-        logger.info("starting webview with url=%s", url)
-        http_port = pick_asset_server_port()
-        if http_port is None:
-            logger.warning(
-                "no free desktop asset port in %s — the page will load from a "
-                "random origin and REST calls will be blocked by CORS "
-                "(WebSocket is unaffected)",
-                list(DESKTOP_PORT_RANGE),
+            # Create the window
+            self.window = webview.create_window(
+                title="Zaytoon",
+                url=url,
+                js_api=self.bridge,
+                width=self._window_state.get("width", DEFAULT_WINDOW_WIDTH),
+                height=self._window_state.get("height", DEFAULT_WINDOW_HEIGHT),
+                min_size=(
+                    self._window_state.get("min_width", DEFAULT_WINDOW_MIN_WIDTH),
+                    self._window_state.get("min_height", DEFAULT_WINDOW_MIN_HEIGHT),
+                ),
             )
-            webview.start()
-        else:
-            logger.info("desktop asset server port=%s", http_port)
-            webview.start(http_port=http_port)
 
-        return 0
+            # Give the bridge a reference to the window
+            self.bridge.set_window(self.window)
+
+            # Set up event handlers
+            self.window.events.closed += self._on_closed
+            self.window.events.loaded += self._on_loaded
+            self.window.events.minimized += self._on_minimized
+            self.window.events.maximized += self._on_maximized
+            self.window.events.restored += self._on_restored
+
+            # Start health check thread
+            self._start_health_check()
+
+            # Start the webview event loop. In production pywebview serves the
+            # dist itself; give it a CORS-allowlisted port (see
+            # DESKTOP_PORT_RANGE) so REST calls from the page origin work.
+            logger.info("starting webview with url=%s", url)
+            http_port = pick_asset_server_port()
+            if http_port is None:
+                logger.warning(
+                    "no free desktop asset port in %s — the page will load from a "
+                    "random origin and REST calls will be blocked by CORS "
+                    "(WebSocket is unaffected)",
+                    list(DESKTOP_PORT_RANGE),
+                )
+                webview.start()
+            else:
+                logger.info("desktop asset server port=%s", http_port)
+                webview.start(http_port=http_port)
+
+            return 0
+        finally:
+            self._teardown()
+
+    def _teardown(self) -> None:
+        """Stop the health thread and the backend — once, whatever the reason."""
+        self._shutting_down = True
+        thread, self._health_check_thread = self._health_check_thread, None
+        if thread is not None and thread is not threading.current_thread():
+            # The loop sleeps in slices and checks the flag, so this returns
+            # promptly. An unbounded join here would hang shutdown on a wedged
+            # UI call, which is the failure this refactor is about avoiding.
+            thread.join(timeout=2.0)
+        self.backend.shutdown()
 
     def _resolve_url(self) -> str:
         """Determine the URL to load (dev mode or production)."""
@@ -248,9 +285,10 @@ class WebViewHost:
 
     def _on_closed(self) -> None:
         """Handle window close."""
-        self._shutting_down = True
         self._save_window_state()
-        self.backend.shutdown()
+        # `_teardown` is idempotent, and `run()`'s finally will call it again on
+        # the way out: the close handler is not the only path that ends a session.
+        self._teardown()
         logger.info("window closed, shutting down")
 
     def _on_loaded(self) -> None:
@@ -274,11 +312,22 @@ class WebViewHost:
     # ------------------------------------------------------------------
 
     def _get_state_file(self) -> Path:
-        """Get the path to the window state file."""
-        config_dir = Path(
-            os.environ.get("ZAYTOON_HOME", self.config.repo_root / "Config")
-        )
-        return config_dir / "window_state.json"
+        """The window state file: `ZAYTOON_HOME` now, else the resolved state dir.
+
+        `ZAYTOON_HOME` is read at call time, not baked into the config, because
+        `DesktopConfig` is built before the entry point applies its own overrides
+        and the shell's tests point it at a temp dir per case.
+
+        The fallback used to be `<repo>/Config` unconditionally, which is a silent
+        failure in an installed application: `Program Files` is not writable by a
+        standard user, `write_text` raised, the exception went into a warning log,
+        and the window simply stopped remembering its size. `default_state_dir()`
+        keeps `<repo>/Config` while it *is* writable — an upgrade must not move a
+        user's saved geometry — and otherwise falls back to the per-OS location.
+        """
+        override = os.environ.get("ZAYTOON_HOME")
+        directory = Path(override).expanduser() if override else Path(self.config.state_dir)
+        return directory / "window_state.json"
 
     def _geometry(self, name: str, fallback):
         """Read one window property, tolerating a window that is going away.
@@ -342,19 +391,32 @@ class WebViewHost:
         self._health_check_thread.start()
 
     def _health_check_loop(self) -> None:
-        """Periodically check backend health and notify the UI."""
-        interval = HEALTH_CHECK_INTERVAL_TEST if "pytest" in sys.modules else HEALTH_CHECK_INTERVAL
+        """Sample backend health for the host's own diagnostics.
+
+        Two problems with the previous version. It called `window.evaluate_js`
+        from this thread — pywebview marshals nothing, so a UI call from a foreign
+        thread on the GTK (Linux) or Cocoa (macOS) backend is a crash or a hang
+        waiting to happen, and it survived on Windows only because WebView2
+        tolerates it. And the event it dispatched, `backend-health`, has no
+        listener anywhere in the frontend: the page learned nothing, while the React
+        app already polls `/health` for its disconnected state. The sample stays
+        (it is what `diagnose()` and the log show); the cross-thread JS push goes.
+
+        The sleep is sliced so shutdown is observed within about half a second
+        instead of up to a whole interval after the window is already gone.
+        """
+        interval = max(0.5, float(self.config.health_check_interval_s))
         while not self._shutting_down:
             try:
-                up = backend_is_up(self.config.host, self.config.port)
-                if self.window is not None:
-                    self.window.evaluate_js(
-                        f"window.dispatchEvent(new CustomEvent('backend-health', "
-                        f"{{detail: {{running: {str(up).lower()}}}}}))"
-                    )
-            except Exception as exc:
+                self.backend_up = backend_is_up(self.config.host, self.config.port)
+                if not self.backend_up:
+                    logger.debug("health sample: backend down at %s", self.config.backend_addr)
+            except Exception as exc:  # noqa: BLE001 - a probe must not kill the loop
                 logger.debug("health check failed: %s", exc)
-            time.sleep(interval)
+            waited = 0.0
+            while not self._shutting_down and waited < interval:
+                time.sleep(min(0.5, interval - waited))
+                waited += 0.5
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -374,4 +436,6 @@ class WebViewHost:
             "backend": self.backend.status().as_dict(),
             "window_state": self._window_state,
             "url": self._resolve_url(),
+            "backend_up": self.backend_up,
+            "state_file": str(self._get_state_file()),
         }
