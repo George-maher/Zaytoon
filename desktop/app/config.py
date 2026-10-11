@@ -83,6 +83,11 @@ def _is_writable(directory: Path) -> bool:
         if parent == target:
             return False
         target = parent
+    if not target.is_dir():
+        # Something else already owns the name — a plain file at `<repo>/Config`
+        # passes an `os.access(W_OK)` test and then cannot contain a file. A
+        # directory that *exists* is only usable if we can write into it.
+        return False
     return os.access(target, os.W_OK)
 
 

@@ -139,6 +139,15 @@ class TestTreeOwnership:
             child.kill()
             child.wait(timeout=10)
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason=(
+            "the POSIX signal contract: Windows cannot trap SIGTERM, and "
+            "TerminateProcess is immediate, so there is no escalation to observe. "
+            "The Windows branch is asserted by "
+            "test_the_windows_branch_signals_the_tree, which runs everywhere."
+        ),
+    )
     def test_shutdown_is_bounded_and_never_raises(self, monkeypatch):
         """A SIGTERM-trapping child used to surface `TimeoutExpired` in `_on_closed`."""
         monkeypatch.setattr(backend_mod, "SHUTDOWN_GRACE_S", 0.3)
@@ -158,6 +167,70 @@ class TestTreeOwnership:
         while _alive(child.pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _alive(child.pid), "a child that traps SIGTERM must still be killed"
+
+    def test_the_windows_branch_signals_the_tree(self, monkeypatch):
+        """`taskkill /T` on the polite step, `/F` only as escalation.
+
+        Asserted from any platform by swapping the module's `subprocess` for a
+        recorder: the *decision* — tree vs single child, polite vs force — is the
+        thing that orphans backends when it is wrong, and a runner without a window
+        can still check the argv. Reaching this code through a real signal is not
+        possible on Linux, and pretending otherwise would be a fake GUI test.
+        """
+        recorded: list = []
+        calls_kwargs: list = []
+
+        def fake_run(argv, **kwargs):
+            recorded.append(list(argv))
+            calls_kwargs.append(kwargs)
+            return types.SimpleNamespace(returncode=0)
+
+        fake_subprocess = types.SimpleNamespace(
+            run=fake_run,
+            DEVNULL=-3,
+            SubprocessError=Exception,
+            Popen=subprocess.Popen,
+        )
+        monkeypatch.setattr(backend_mod, "subprocess", fake_subprocess)
+        monkeypatch.setattr(
+            backend_mod, "os", types.SimpleNamespace(name="nt", sep="\\", linesep="\r\n")
+        )
+        proc = backend_mod.BackendProcess(_StubConfig())
+        child = types.SimpleNamespace(pid=4242)
+        assert proc._signal_tree(child, force=False) is True
+        assert recorded[0][:2] == ["taskkill", "/PID"] and "/T" in recorded[0]
+        assert "/F" not in recorded[0], "the polite step must not force-kill"
+        # The window that would otherwise flash on a desktop, and the bound that
+        # keeps a hung `taskkill` from hanging window close with it.
+        assert calls_kwargs[0]["timeout"], "the kill call must be bounded"
+        assert proc._signal_tree(child, force=True) is True
+        assert "/F" in recorded[1], "escalation has to reach the whole tree"
+
+    def test_shutdown_swallows_any_failure_the_platform_throws(self, monkeypatch):
+        """`shutdown()` is a `finally` and a window-close handler: it may not raise.
+
+        The first version caught `(OSError, SubprocessError)`, and a `TypeError` from
+        a `subprocess` object that did not match what the test thought it was — the
+        exact shape of a real test artifact on the Windows leg — escaped it and
+        turned a cleanup into a crash. Anything is a reason to give up signalling,
+        not a reason to propagate.
+        """
+        def explode(*a, **k):
+            raise RuntimeError("not an OS error at all")
+
+        monkeypatch.setattr(
+            backend_mod,
+            "subprocess",
+            types.SimpleNamespace(
+                run=explode, DEVNULL=-3, SubprocessError=Exception, Popen=subprocess.Popen
+            ),
+        )
+        proc = backend_mod.BackendProcess(_StubConfig())
+        proc._child = types.SimpleNamespace(
+            pid=4242, poll=lambda: None, terminate=explode, kill=explode, wait=explode
+        )
+        proc._spawned_by_us = True
+        proc.shutdown()  # must return quietly
 
     def test_shutdown_is_idempotent(self):
         proc = _ScriptedBackend("import time; time.sleep(5)")
@@ -326,21 +399,44 @@ class TestStateLocation:
         monkeypatch.setattr(cfg_mod, "default_repo_root", lambda: tmp_path)
         assert default_state_dir() == tmp_path / "Config"
 
-    def test_an_unwritable_repo_falls_back_to_the_platform_directory(self, monkeypatch, tmp_path):
+    def test_an_unusable_repo_falls_back_to_the_platform_directory(self, monkeypatch, tmp_path):
+        """`<repo>/Config` is only the answer when it can *contain* a file.
+
+        The mechanism is "something else owns the name", not "chmod says no": on
+        Windows the file mode bits are advisory and the runner owns the tree, so a
+        `chmod(0o500)` rehearsal of a Program-Files install succeeded on that leg
+        and the test failed for a reason that had nothing to do with the product.
+        A plain file where the directory should be is unwritable on all three
+        platforms in the same way a real read-only install is.
+        """
+        import app.config as cfg_mod
+
+        install = tmp_path / "Program Files" / "Zaytoon"
+        install.mkdir(parents=True)
+        (install / "Config").write_text("not a directory", encoding="utf-8")
+        monkeypatch.delenv("ZAYTOON_HOME", raising=False)
+        monkeypatch.setattr(cfg_mod, "default_repo_root", lambda: install)
+        monkeypatch.setattr(
+            cfg_mod, "sys", types.SimpleNamespace(platform="win32"), raising=False
+        )
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+        assert default_state_dir() == tmp_path / "appdata" / "Zaytoon"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes are advisory on Windows")
+    def test_a_read_only_repo_falls_back_too(self, monkeypatch, tmp_path):
         import app.config as cfg_mod
 
         locked = tmp_path / "Program Files" / "Zaytoon"
         locked.mkdir(parents=True)
-        locked.chmod(0o500)  # r-x: a standard user cannot create Config inside it
+        locked.chmod(0o500)  # r-x: nothing can be created inside it
         try:
             monkeypatch.delenv("ZAYTOON_HOME", raising=False)
             monkeypatch.setattr(cfg_mod, "default_repo_root", lambda: locked)
             monkeypatch.setattr(
-                cfg_mod, "sys", types.SimpleNamespace(platform="win32"), raising=False
+                cfg_mod, "sys", types.SimpleNamespace(platform="linux"), raising=False
             )
-            monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
-            chosen = default_state_dir()
-            assert chosen == tmp_path / "appdata" / "Zaytoon", chosen
+            monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+            assert default_state_dir() == tmp_path / "state" / "zaytoon"
         finally:
             locked.chmod(0o700)
 

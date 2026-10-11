@@ -53,9 +53,12 @@ class TestContainment:
 
     def test_a_path_outside_every_root_is_refused(self, roots):
         cfg, _, _ = roots
-        allowed, reason = path_policy.classify("/etc/hostname", cfg)
+        # `sys.executable`, not `/etc/something`: the case is *containment*, so the
+        # file has to exist, and on Windows and macOS `/etc/hostname` does not —
+        # there it would be refused for the wrong reason and hide the real rule.
+        allowed, reason = path_policy.classify(sys.executable, cfg)
         assert not allowed
-        assert "outside every granted root" in reason
+        assert "outside every granted root" in reason, reason
         assert "ZAYTOON_OPEN_ROOTS" in reason, "the refusal must name the way to widen it"
 
     def test_dotdot_traversal_is_refused(self, roots):
@@ -189,7 +192,8 @@ class TestBridgeConsultsThePolicy:
         return bridge_mod.NativeBridge(cfg, backend=None)
 
     def test_open_path_refuses_and_touches_nothing(self, roots, monkeypatch):
-        cfg, _, _ = roots
+        cfg, workspace, _ = roots
+        outside = sys.executable
         calls: list = []
         monkeypatch.setattr(
             bridge_mod.subprocess, "Popen", lambda *a, **k: calls.append(a)
@@ -197,7 +201,7 @@ class TestBridgeConsultsThePolicy:
         monkeypatch.setattr(
             os, "startfile", lambda *a, **k: calls.append(a), raising=False
         )
-        assert self._bridge(cfg).open_path("/etc/hostname") is False
+        assert self._bridge(cfg).open_path(outside) is False
         assert calls == [], "a refused path must never reach the OS at all"
 
     def test_open_path_opens_the_resolved_target_once(self, roots, monkeypatch):
@@ -216,9 +220,23 @@ class TestBridgeConsultsThePolicy:
             "Popen",
             lambda argv, **k: calls.append(list(argv)) or types.SimpleNamespace(pid=0),
         )
+        startfile: list = []
+        monkeypatch.setattr(
+            os, "startfile", lambda path, *a, **k: startfile.append(path), raising=False
+        )
         assert self._bridge(cfg).open_path(str(link)) is True
-        if os.name != "nt":
-            assert calls == [["xdg-open", str(doc.resolve())]], calls
+        if os.name == "nt":
+            # Windows does not go through `Popen` at all: `os.startfile` is the API,
+            # which is why this case needs its own spy rather than an argv list.
+            assert startfile == [str(doc.resolve())], (startfile, calls)
+            assert calls == []
+        else:
+            # macOS resolves a "document" with `open`, Linux with `xdg-open` —
+            # asserting the literal Linux argv everywhere is how this test was
+            # written wrong and failed on the macos leg.
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            assert calls == [[opener, str(doc.resolve())]], calls
+            assert startfile == []
 
     def test_reveal_in_os_refuses_outside_the_roots(self, roots, monkeypatch):
         cfg, _, _ = roots

@@ -264,7 +264,14 @@ class BackendProcess:
                 return False
             os.killpg(os.getpgid(child.pid), signal.SIGKILL if force else signal.SIGTERM)
             return True
-        except (OSError, subprocess.SubprocessError):
+        except Exception:  # noqa: BLE001 - deliberately broad
+            # `shutdown()` is called from a window-close handler and from a
+            # `finally`, and its contract is "never raise": a teardown that throws
+            # takes the caller's cleanup with it and leaves the backend running.
+            # OSError and SubprocessError cover the expected cases; anything else
+            # (a stubbed `subprocess` in a test, an unsupported flag, a fake child)
+            # is still a reason to give up on signalling, not a reason to propagate.
+            logger.debug("tree signalling failed", exc_info=True)
             return False
 
     def shutdown(self) -> None:
@@ -280,10 +287,10 @@ class BackendProcess:
             self._spawned_by_us = False
             return
         self._spawned_by_us = False
-        if child.poll() is not None:
-            return
-        logger.info("stopping backend pid=%s (and its tree)", child.pid)
         try:
+            if child.poll() is not None:
+                return
+            logger.info("stopping backend pid=%s (and its tree)", child.pid)
             if not self._signal_tree(child, force=False):
                 child.terminate()  # the group was unavailable: at least take the child
             try:
@@ -300,7 +307,14 @@ class BackendProcess:
                         child.pid,
                         KILL_WAIT_S,
                     )
-        except OSError as exc:  # pragma: no cover - process already gone
+        except Exception as exc:  # noqa: BLE001 - deliberately broad
+            # "Exception-free by contract" has to mean every step, not every step
+            # we predicted: `poll`/`terminate`/`kill` raise `OSError` when the
+            # process is already gone (the expected case) and anything else when the
+            # handle itself is unusual, and this runs inside a `finally` and inside
+            # the window-close handler, where a raise replaces cleanup with a
+            # traceback. A regression test on the Windows leg found the fallback
+            # path unguarded.
             logger.warning("error stopping backend: %s", exc)
 
     def __enter__(self) -> "BackendProcess":
