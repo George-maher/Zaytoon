@@ -101,6 +101,18 @@ MAX_CALLS_PER_TURN = 24
 #: assuming a launcher or a writer is idempotent because its name looked read-only
 #: — is launching the app twice.
 #:
+#: Why the list is written out instead of computed from the registry's tiers, even
+#: though every name in it is a registered, tier-``safe`` tool: **safe-tier is
+#: necessary and not sufficient.** ``screenshot`` is ``safe`` and writes a PNG on
+#: every call; ``process_logs`` is ``safe`` only because reading a log is, while
+#: ``open_app`` is ``safe``-tier on some configurations and obviously not
+#: repeatable. Deriving the set from tiers would re-admit exactly the tools this
+#: list exists to keep out. So the derivation runs the other way, as a check:
+#: :func:`repeat_safe_violations` asks the registry about every name here, and a
+#: test requires the answer to be empty. That keeps the list honest as tools are
+#: renamed, retiered or removed — the drift a hand-written list is afraid of —
+#: without letting the tier decide idempotence for it.
+#:
 #: Polling is why these need to be exempt: `process_logs` after `process_start`
 #: legitimately returns different text a second later, and refusing that would
 #: break the one loop that works today.
@@ -124,6 +136,50 @@ REPEAT_SAFE_TOOLS = frozenset({
     "git_diff",
     "git_branch_list",
 })
+
+def repeat_safe_violations(registry: Any) -> List[str]:
+    """Every way :data:`REPEAT_SAFE_TOOLS` has drifted from the registry.
+
+    Three failures, in order of how they are noticed in practice:
+
+    * **not registered** — the name is dead config. Harmless to the user and
+      fatal to a review, because a reader has to know that a tool that no longer
+      exists is not "exempted" from anything.
+    * **not tier-safe** — a tool that needs confirmation for its plain,
+      argument-free call must not be silently re-run twice by a loop that
+      decided it was a read.
+    * **registered under an alias but not as a canonical name** — the exemption
+      matches on the name the model used, so an alias-only entry would let the
+      canonical call through anyway.
+
+    Returns human-readable strings rather than raising: the caller is a test or a
+    startup log, and neither wants an exception on an ordinary mismatch.
+    """
+    problems: List[str] = []
+    if registry is None:
+        return problems
+    names = set(registry.list())
+    for tool in registry.tools():
+        names.update({tool.name(), *tool.aliases()})
+    for name in sorted(REPEAT_SAFE_TOOLS):
+        if name not in names:
+            problems.append(f"{name}: no such registered tool (the exemption is dead config)")
+            continue
+        canonical = registry.canonical(name) or name
+        if canonical != name:
+            problems.append(
+                f"{name}: an alias, not the canonical tool name — the canonical call"
+                f" ({canonical}) is not exempted by it"
+            )
+        try:
+            tier = registry.assess(name, {}).permission
+        except Exception:  # noqa: BLE001 - a check that throws is a check nobody runs
+            problems.append(f"{name}: the registry could not assess it")
+            continue
+        if tier != "safe":
+            problems.append(f"{name}: an argument-free call is tier {tier!r}, not 'safe'")
+    return problems
+
 
 #: A reply that says the work succeeded while steps of that work failed. The
 #: claim is not deleted — it may well be true about the parts that ran — but it

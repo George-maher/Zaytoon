@@ -622,6 +622,18 @@ class Config:
     #: readable through a model-supplied URL. Link-local stays refused whatever
     #: this says, because 169.254.169.254 is cloud credentials, not a LAN device.
     FETCH_ALLOW_PRIVATE: bool = _env_bool("FETCH_ALLOW_PRIVATE", False)
+    #: Whether `open_url` may hand the browser a private/loopback address.
+    #:
+    #: Default **true**, unlike the fetch knob, and the asymmetry is the reason
+    #: both exist: `fetch_url` reads the bytes itself, so a LAN address is a
+    #: server-side request the *service* makes on someone else's behalf.
+    #: `open_url` hands a URL to the user's own browser, where their own
+    #: privileges and cookies apply — and "open my router page" is a normal
+    #: thing to ask a desktop assistant for. The classes that are never a
+    #: legitimate target for either (link-local metadata, unspecified,
+    #: multicast) are refused by `tools/netguard.py` regardless of this flag,
+    #: and the scheme policy (http/https only) is shared with it.
+    OPEN_URL_ALLOW_PRIVATE: bool = _env_bool("OPEN_URL_ALLOW_PRIVATE", True)
 
     #: Refuse to load a skill tool that needs a permission its manifest did not
     #: ask for, instead of reporting the mismatch and loading it. Off by default:

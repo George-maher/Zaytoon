@@ -116,11 +116,26 @@ class MemoryAgent:
     async def _migrate(self, db):
         try:
             await db.execute("SELECT session_id FROM context_summary LIMIT 1")
-        except Exception:
+        except Exception:  # noqa: BLE001 - this read *is* the "column missing" test
             try:
-                await db.execute("ALTER TABLE context_summary ADD COLUMN session_id TEXT DEFAULT 'default'")
-            except Exception:
-                pass
+                await db.execute(
+                    "ALTER TABLE context_summary ADD COLUMN session_id TEXT DEFAULT 'default'"
+                )
+            except Exception as exc:  # noqa: BLE001 - re-run of a done migration
+                # The failing `SELECT` above is the expected path and stays quiet.
+                # The failing `ALTER` does not: it left `context_summary` without
+                # the column every later query assumes, so the turn blew up
+                # somewhere far away with nothing pointing back to the migration
+                # that never ran. Same guard-and-report shape as the reminder
+                # columns below, because "a re-run is a no-op" and "we could not
+                # migrate" are different events that used to log identically (that
+                # is to say: not at all).
+                if "duplicate column" not in str(exc).lower():
+                    safe_error(
+                        exc,
+                        operation="migrate.context_summary.session_id",
+                        component="MemoryAgent",
+                    )
 
         # Delivered-or-not has to be countable *in the row*: `notify_attempts` on
         # the data class was recomputed from zero on every tick and never

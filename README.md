@@ -61,7 +61,7 @@ root/
 │   ├── voice/      # STT (whisper) + TTS (edge-tts) + language routing
 │   ├── scheduler/  # Time parser + reminder manager
 │   ├── tools/      # OS toolkit (cmd, file, system) + safety sandbox
-│   └── tests/      # 2,300+ pytest tests (contract-level, not implementation)
+│   └── tests/      # 2,600+ pytest tests (contract-level, not implementation)
 ├── frontend/       # React + Vite web client
 └── desktop/        # pywebview desktop host — wraps the React UI, spawns the backend
 ```

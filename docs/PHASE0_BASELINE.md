@@ -1097,3 +1097,123 @@ that *someone else's Mac* answers whether `vm_stat`/`sysctl`/`open` behave as as
 The `osascript` mute/volume paths are argv-level only; the desktop shells for macOS/Linux are not
 covered by any leg (`desktop` job is pinned to `windows-latest`); Windows SendKeys behaviour is
 argued from the documented key codes, not from a Windows run — the sandbox has none.
+
+---
+
+## 17. Phase 9 — the backlog closed, and an audit of the whole tree (2026-10-11)
+
+Five items were carried as "known divergences" because none of them broke a test. That is
+what they had in common: each was the half of a contract no test was standing on. All five are
+now either fixed or documented as what they are, and a full-project sweep was run at the same
+time (results at the end of this section, because the audit is the more useful half).
+
+| Item | State | What it was, concretely |
+| --- | --- | --- |
+| `sources` not in the `/chat` payload | **fixed** | the same turn had two levels of accountability: the WebSocket could say "these 2 pages, fetched at 05:49Z", REST could not ask at all |
+| `open_url` not delegating to `netguard` | **fixed** (+ one real gap found on the way) | two copies of an address policy, one of them missing RFC 6598 |
+| `REPEAT_SAFE_TOOLS` untied to the registry | **fixed as a check, not a derivation** | a rename/re-tier would have made it silently wrong in either direction |
+| `SettingsPanel` ignoring `llm.probe` | **fixed** | "API key: present" in green while `/health` next door said `unreachable` |
+| per-session `MemoryAgent.close()` | **verified, no defect** | the design shares one `MemoryAgent`; a per-session close would have closed SQLite under every other session — now pinned so nobody "fixes" it |
+
+**Also fixed, unprompted, because it was in the path of the audit:**
+`MemoryAgent._migrate`'s inner `except Exception: pass` around
+`ALTER TABLE context_summary ADD COLUMN session_id` swallowed a failed migration; every later
+query then assumed a column that was not there and failed somewhere far away. It now uses the
+same guard-and-report idiom as the reminder columns next to it (`duplicate column` stays quiet,
+anything else logs `op=migrate.context_summary.session_id`).
+
+### The `/chat` fix, in full
+
+`AgentService.dispatch` returns a **string**, and every transport gets its events from the
+agent bus. Rather than widen that signature for one field, `run_turn` subscribes a
+`_source_recorder` to the same bus the dispatch is given — the identical shape as the existing
+`_tool_recorder`, and detached in the same `finally`. `TurnResult.sources` and
+`TurnResult.to_dict()` carry it out, `POST /chat` returns it on **both** branches.
+
+Two properties were tested rather than assumed, because both are easy to get wrong in exactly
+this pattern: the recorders must be detached after *every* turn (a leftover would attribute
+one turn's sources to the next, and grow by one subscriber per message), and detaching them
+must not `unsubscribe_all()` — the session's `_ProgressRelay` lives on the same bus, and
+clearing it would make every turn after the first go silent. The test counts subscribers on a
+bus that had one of its own before the turn started, twice in a row.
+
+Live proof on the running service (no model, so this was a fast-path turn):
+
+```
+POST /chat {"message": "hi there"} → 200
+  keys: ['intent', 'lang', 'reply', 'sources', 'speak', 'text']   sources: []
+```
+
+### Whole-tree audit — what was swept and what it found
+
+Method: mechanical greps for the escape hatches that matter, plus reading the result rather
+than trusting the count.
+
+| Question | Evidence | Verdict |
+| --- | --- | --- |
+| Does anything hand user input to a shell? | no `shell=True`, no `os.system`, no `eval`/`exec` outside `ast.literal_eval` in the call-argument parser; every subprocess is `create_subprocess_exec` with a fixed argv | clean |
+| Do broad handlers hide failures? | 20 handlers whose body is only `pass`: 14 in `desktop/app/app.py` (the *unlaunched* Tk shell, each annotated `# pragma: no cover - <why>`), 5 annotated-defensive in backend, **1 real** — the `memory_agent` migration above | 1 fixed, rest justified |
+| Are skipped tests a hiding place? | 5 `skipif`/`xfail` markers in `backend/tests`, each with a stated reason (platform-scoped assertions, opt-in live network) | clean |
+| Is there drift in the TODO sense? | `grep -rn "TODO\|FIXME\|XXX\|HACK"` across backend/frontend/desktop → **0** | clean |
+| Do the root docs tell the truth? | `DEPLOYMENT.md`, `QUICK_START.md`, `SETUP_INSTRUCTIONS.md`, `DETAILED_DOCS.md` and root `requirements.txt` were **0 bytes**. An empty `requirements.txt` is the worst variant: `pip install -r requirements.txt` *succeeds* and installs nothing | **fixed**: root `requirements.txt` is now `-r backend/requirements.txt`, and the four documents were written — each one only pointing at files, never re-stating a fact that can rot |
+| Is the container path sound? | `frontend/Dockerfile` does `COPY certs/ /etc/nginx/certs/` and cites `scripts/generate-certs.sh`; `git ls-files frontend` contains **neither** → the image cannot build. Independently, nginx `return 301 https://$host:8443` while compose publishes `3443:8443` → `http://localhost:3000` redirects to a port nothing publishes | **reported, not blind-fixed** — no Docker in this sandbox, so any change would have been an unverifiable claim. Both are written up in `DEPLOYMENT.md` under "Known defects in the frontend image" with the smaller fix named |
+
+The last row is the one to argue with. It was tempting to add the missing `generate-certs.sh`
+and a `certs/.gitkeep` to make the build *pass*: that would convert a loud build failure into a
+container that starts, fails to find its certificate, and crash-loops — strictly worse, and
+unverifiable from here. An audit earns its keep by reporting the state of things, so this one
+does, with the commands a reader can run.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/test_p9_convergence.py tests/core/test_p9_sources.py` | **25 passed** in 1.19 s (19 + 6), offline |
+| `pytest tests/test_tool_registry.py` (web tools rewritten) | 14 passed in the WebTools class, incl. the new refusal-parity cases |
+| full backend suite | **2641 passed, 5 skipped, 0 failed** in 99.3 s |
+| frontend | **613 vitest passed** (37 files; +6), `npm run build` ✓ 476 kB / 138 kB gzip |
+| E2E, live against this box | **5 passed, 4 skipped, 0 failed** (unchanged from P8; the skips name the missing model and what was still verified) |
+| Frontend mutation controls | ignore the probe → 3 red; force tone `ok` → 2 red; drop the latency → 1 red |
+
+**Still open after P9** (each with its own reason, not by omission): the frontend container
+defects above; `R5`/`R6` (deferred by decision); README's "2,300+ pytest tests" is a stale
+floor rather than a lie; the desktop shell's silent handlers stay unguarded because that suite
+cannot run in this sandbox.
+
+---
+
+## 18. Review route for P0 → P9 (how to read the whole diff in one sitting)
+
+The branch is 10 commits on top of `a01c7c9`: **90 files, +11,011 / −311** before P9, and the
+great majority of the additions are *tests*. That ratio is the argument for reviewing this
+series at all — each phase's evidence is executable, so a reviewer can disagree with a
+decision by running something instead of reading prose.
+
+```bash
+git fetch origin arena/fdb0f5cf-zaytoon
+git log --oneline a01c7c9..origin/arena/fdb0f5cf-zaytoon     # one commit per phase
+git diff --stat a01c7c9..origin/arena/fdb0f5cf-zaytoon       # where the weight is
+git diff a01c7c9..origin/arena/fdb0f5cf-zaytoon -- backend/tools/netguard.py   # one file at a time
+```
+
+Suggested order, shortest route first:
+
+| # | Read | Why it is worth your attention |
+| --- | --- | --- |
+| 1 | `AGENTS.md` diff | the rules changed: fetch tier, sources frame, skill floors, OS contract, `/chat` payload. Everything else should be checkable against these |
+| 2 | `backend/tools/netguard.py`, `backend/tools/fetch.py` | the only genuinely new security surface in the series. Review question: is "one policy, two entry points" actually true, or did a second copy survive? |
+| 3 | `backend/tools/system.py` (volume) | the shipped bug: relative key-presses sold as an absolute set, mute key copied into both arms. Review question: is the climb-then-descent reasoning sound on a real Windows box? |
+| 4 | `backend/core/system_resources.py`, `backend/tools/applications.py` | the macOS branches, faked here and only *really* tested by the new `macos-latest` CI leg |
+| 5 | `backend/skills/*` + `backend/tests/core/test_shipped_skills.py` | passivity enforced by an import/attribute allow-list. Review question: what does the AST guard not see? |
+| 6 | `backend/agents/sources.py`, `agents/engine.py` diff, `api/websocket.py` | claim stamping and the `sources` frame; the engine diff is the one to read as a whole because the bounds interact |
+| 7 | `backend/scripts/e2e_scenarios.py` | what "verified live" meant, and the two OS-blind expectations it had |
+| 8 | `docs/*`, root `README`/`.env.example`, `desktop/*` | documentation truthfulness; the four 0-byte root docs |
+
+**What a reviewer should refuse to accept**, and what the series therefore pins: a green test
+suite whose security assertions were skipped by platform, an assertion that passes when the
+feature is deleted (every phase here lists its mutation controls for exactly this), a "works
+on my machine" claim about a platform the sandbox cannot run, and a swallowed exception.
+
+Three things are knowingly unverified by anyone in this chain: `macos-latest` CI (never
+executed), the Windows SendKeys semantics (argued from documented key codes + OS clamping),
+and the frontend container (cannot build as committed — see §17).

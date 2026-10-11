@@ -122,7 +122,8 @@ tools/
 ├── applications.py  # open_app, close_app, resolve_windows_app
 ├── system.py        # get_time, system_info, calculator, get_volume, screenshot
 ├── web.py           # search_web, open_url
-├── netguard.py      # URL + address policy: http(s) only, no internal addresses
+├── netguard.py      # URL + address policy for BOTH web tools: http(s) only,
+#                    #   no internal addresses (see "one policy, two entry points")
 ├── fetch.py         # fetch_url: one bounded, guarded, labelled read of a page
 ├── git.py           # status, log, diff, branch_list | add, commit, checkout, push
 ├── coding.py        # create_project, run_npm, run_tests
@@ -436,6 +437,26 @@ certificate at once, so this is mitigated, not eliminated). Tests: `tests/test_f
 including an opt-in live pair (`ZAYTOON_LIVE_NET=1`) that fetches a real page and asserts the
 local Ollama port is unreachable through the tool.
 
+**`open_url` runs the same policy, in its own words.** It used to keep its own scheme
+checks, which is how two copies of an address policy drift: `fetch_url` refused
+`169.254.169.254` while `open_url` would have opened it, and the page that *tells* the
+model to "open this link for me" is fetched content. So `tools/web.py` calls
+`netguard.parse_public_url` and hands the browser its **rebuilt** URL — host lower-cased,
+default port dropped, so the authority that was judged is byte-for-byte the authority that
+is contacted (the path is deliberately left alone: `..` resolution belongs to the browser,
+and a security component rewriting paths is how you open something nobody asked for).
+Refusals read "not *openable*" via `verb`/`action` kwargs, which exist so a message is
+understandable, never to change a decision. `OPEN_URL_ALLOW_PRIVATE` defaults to **true**
+where `FETCH_ALLOW_PRIVATE` defaults to false — `open_url` hands a URL to the user's own
+browser at the user's own privileges ("open my router page"), while `fetch_url` makes the
+request as the service. What does **not** change: rebinding is mitigated for `fetch_url`
+(name resolved and re-checked before connecting) and *not* mitigated for `open_url`,
+because the browser resolves it later. Found while writing this and fixed in the same
+place: Python's `ipaddress` does not count `100.64.0.0/10` (RFC 6598, carrier-grade NAT)
+as private, and that block is where some clouds serve instance metadata (Aliyun answers at
+`100.100.100.200`) — it is now governed by the same flag as the private ranges, which
+closes it for `fetch_url` by default without breaking a Tailscale user's NAS.
+
 **Two invariants are enforced structurally, and both are tested:**
 
 1. **The gate is never looser than the tier.** Every return path from
@@ -488,6 +509,16 @@ are the modifier syntax — escaping them would break `ctrl+c`).
   not wire it back into a request path.
 - Bilingual notices (`en` / `ar`) for decline, timeout, and no-channel cases.
 - Manual check: `python scripts/smoke_confirmation.py deny`.
+- **`POST /chat` is the same turn, minus the stream.** Its payload is
+  `{reply, text, lang, intent, speak, sources}`, and `sources` is the same list the
+  `sources` WebSocket frame carries (`n`, `kind`, `url`, `host`, `title`, `retrieved_at`) —
+  captured in `Orchestrator.run_turn` by subscribing to the agent bus the dispatch is given
+  (`_source_recorder`), the same trick the tool recorder uses. Widening
+  `AgentService.dispatch`'s return type for one field would have been a breaking change to
+  every caller for no gain. Empty means *no page or snippet was read this turn*, which is a
+  fact about the turn, not a missing value — so the key is present on the error path too, and
+  a client never has to guess which shape it got. `TurnResult.to_dict()` carries it for the
+  task-record views.
 
 ## Anti-hallucination / deliberation prompts
 
@@ -922,7 +953,12 @@ earlier result attached), never as silence, because silence is what makes a mode
 itself. An identical `(name, canonical params)` call that already **succeeded** this turn is
 refused unless the tool is in `REPEAT_SAFE_TOOLS` — a **deny-by-default allow-list**, so any
 unknown or future tool is assumed to have effects (`open_app` is tier `safe`, so nothing else
-would stop a second launch). A final answer that claims success (`Done`, `successfully`, `تم`)
+would stop a second launch). The list is written out and then *checked*, not derived from
+tiers: safe-tier is necessary and not sufficient (`screenshot` is `safe` and writes a PNG per
+call). `repeat_safe_violations(registry)` reports every drift — a name that is no longer a
+registered tool (dead config), a name whose argument-free call is not tier-safe, and a name
+listed as an alias rather than the canonical tool — and a test requires it to return
+`[]` against `build_default_registry()`. A final answer that claims success (`Done`, `successfully`, `تم`)
 while steps failed gets the unfinished steps appended to it, in the user's language: qualified,
 never deleted. Tests: `tests/test_agent_bounds.py`; removing any of the three guards reddens it.
 

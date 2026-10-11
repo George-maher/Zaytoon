@@ -750,7 +750,11 @@ async def chat_endpoint(data: dict):
     )
 
     if result.error:
-        return {"error": result.error, "speak": False}
+        # `sources` here for the same reason it is on the success path: a client
+        # should never have to know which branch it is parsing. An error turn that
+        # did read pages reports them, because "it failed, and here is what it had
+        # already read" is more useful than either half alone.
+        return {"error": result.error, "speak": False, "sources": list(result.sources)}
 
     reply = result.reply or ""
     if reply:
@@ -762,6 +766,12 @@ async def chat_endpoint(data: dict):
         "lang": lang,
         "intent": result.intent,
         "speak": bool(reply),
+        # The same list the `sources` WebSocket frame carries. Additive: a client
+        # that ignores it is no worse off, and one that shows it can answer
+        # "where did this come from?" without the model's say-so. An empty list
+        # means no page or snippet backed this turn — not that the answer is
+        # unverified *and* silent.
+        "sources": list(result.sources),
     }
 
 

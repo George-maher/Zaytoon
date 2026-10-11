@@ -293,6 +293,14 @@ function SettingsPanel({ open, onClose, language = "en" }) {
       ? health.metrics.tools
       : null;
   const rejected = Array.isArray(llm.rejected_models) ? llm.rejected_models : [];
+  // The probe is a *measured* answer, `configured` is a paperwork answer, and
+  // this panel used to show only the paperwork: API key "present", tone green,
+  // while `/health` next door reported `unreachable` — so the number the user
+  // came here to read (is my model up?) was the one row that could not say.
+  // Missing entirely on an older backend, which is `unknown`, never `ok`.
+  const probe = llm.probe && typeof llm.probe === "object" ? llm.probe : null;
+  const probeState = probe ? probe.state || "unknown" : "unknown";
+  const missingModels = probe && Array.isArray(probe.missing_models) ? probe.missing_models : [];
   const voice = health?.voice || {};
   const safety = health?.safety || {};
   const dirty = draft.trim() && draft.trim() !== workspace?.root;
@@ -602,6 +610,48 @@ function SettingsPanel({ open, onClose, language = "en" }) {
               value={llm.primary_model || "—"}
               title={llm.primary_model}
             />
+            <Row
+              label={ar ? "متاح الآن" : "Reachable now"}
+              value={
+                probeState === "reachable"
+                  ? `YES${typeof probe?.latency_ms === "number" ? ` · ${probe.latency_ms} ms` : ""}${
+                      probe?.cached ? (ar ? " · مخزّن" : " · cached") : ""
+                    }`
+                  : probeState === "never_probed"
+                  ? ar
+                    ? "لم يُقَس بعد"
+                    : "not measured yet"
+                  : probeState === "unknown"
+                  ? ar
+                    ? "غير معروف"
+                    : "unknown"
+                  : (probe?.error || "unreachable").toString().slice(0, 90)
+              }
+              tone={
+                probeState === "reachable"
+                  ? "ok"
+                  : probeState === "never_probed" || probeState === "unknown"
+                  ? "default"
+                  : "error"
+              }
+              title={
+                probe?.checked_at
+                  ? `${ar ? "آخر قياس" : "last measured"}: ${probe.checked_at}`
+                  : undefined
+              }
+            />
+            {missingModels.length > 0 && (
+              <Row
+                label={ar ? "نماذج ناقصة" : "Models missing"}
+                value={missingModels.join(", ")}
+                title={
+                  ar
+                    ? "المزود يعمل لكن هذه النماذج غير مسحوبة — اسحبها من لوحة النماذج"
+                    : "the endpoint answers, these models are not pulled"
+                }
+                tone="error"
+              />
+            )}
             <Row
               label={ar ? "الاستدلال" : "Reasoning"}
               value={llm.reasoning_model || "—"}

@@ -96,12 +96,26 @@ class Target(NamedTuple):
     addresses: List[str] = []
 
 
-def parse_public_url(raw: str, *, allow_private: bool = False) -> Target:
+def parse_public_url(
+    raw: str,
+    *,
+    allow_private: bool = False,
+    verb: str = "fetchable",
+    action: str = "fetched",
+) -> Target:
     """Validate syntax, scheme and (for a literal IP) address class. No DNS.
 
     Raises :class:`~tools.sandbox.SecurityError`, which the tool registry reports as
     a *blocked* result rather than a retryable failure: a policy refusal must not
     look like a typo the model can fix by rephrasing.
+
+    ``verb``/``action`` are the only thing a refusal says differently per tool.
+    Both ``fetch_url`` and ``open_url`` must run *one* address policy or they
+    drift — the day one of them quietly accepts a link-local address is the day a
+    page the model read becomes a metadata endpoint it read — and "not fetchable"
+    in a browser-opening refusal would send the user to the wrong tool to fix it.
+    A caller adds no capability by rephrasing: the two words only appear in
+    messages, never in a decision.
     """
     candidate = (raw or "").strip()
     if not candidate:
@@ -122,7 +136,7 @@ def parse_public_url(raw: str, *, allow_private: bool = False) -> Target:
 
     if parsed.scheme.lower() not in ALLOWED_SCHEMES:
         raise SecurityError(
-            f"only {' and '.join(ALLOWED_SCHEMES)} URLs may be fetched "
+            f"only {' and '.join(ALLOWED_SCHEMES)} URLs may be {action} "
             f"(got {parsed.scheme or 'no scheme'!r})"
         )
     host = (parsed.hostname or "").strip().rstrip(".").lower()
@@ -134,7 +148,7 @@ def parse_public_url(raw: str, *, allow_private: bool = False) -> Target:
             "smuggling vector; put them in the request you mean to make)"
         )
     if host.strip("[]") in _LOCAL_NAMES and not allow_private:
-        raise SecurityError(f"{host} is this machine, and that is not fetchable")
+        raise SecurityError(f"{host} is this machine, and that is not {verb}")
 
     target_port = port or (443 if parsed.scheme.lower() == "https" else 80)
     literal = _ip_of(host)
@@ -143,16 +157,35 @@ def parse_public_url(raw: str, *, allow_private: bool = False) -> Target:
         # before the socket is opened is a cheaper "no".
         reason = _address_refusal(literal, allow_private=allow_private)
         if reason:
-            raise SecurityError(f"{host} is not fetchable ({reason})")
+            raise SecurityError(f"{host} is not {verb} ({reason})")
 
     return Target(url=_rebuild(parsed, host, target_port), host=host, port=target_port)
+
+
+#: RFC 6598 shared address space. Python's `is_private` does **not** include it,
+#: which is the whole reason this constant exists: 100.64.0.0/10 is where carrier
+#: NAT lives, where a home VPN (Tailscale's default pool) reaches a NAS — and
+#: where some clouds serve instance metadata (Aliyun answers at
+#: 100.100.100.200). Refusing it outright would break the VPN user to defend a
+#: hypothetical, so it is governed by the same flag as the private ranges:
+#: refused by default for `fetch_url`, allowed when the operator says "my own
+#: network is fine".
+SHARED_SPACE = (ipaddress.ip_network("100.64.0.0/10"),)
+
+
+def _in_shared_space(address) -> bool:
+    try:
+        return any(address in network for network in SHARED_SPACE)
+    except TypeError:  # pragma: no cover - a v6 address vs a v4 network
+        return False
 
 
 def _address_refusal(ip: str, *, allow_private: bool) -> Optional[str]:
     """Why this address may not be fetched, or ``None`` when it may.
 
-    Always-on refusals are the classes no caller wants reached; ``is_private`` is
-    the part ``FETCH_ALLOW_PRIVATE`` governs.
+    Always-on refusals are the classes no caller wants reached; the ranges
+    ``FETCH_ALLOW_PRIVATE`` governs are ``is_private`` plus RFC 6598 shared
+    address space (see :data:`SHARED_SPACE`).
     """
     try:
         address = ipaddress.ip_address(ip)
@@ -178,8 +211,10 @@ def _address_refusal(ip: str, *, allow_private: bool) -> Optional[str]:
         if verdict:
             return f"address class {label}"
 
-    if address.is_private and not allow_private:
-        return "private address range; set FETCH_ALLOW_PRIVATE to allow your own LAN"
+    if (address.is_private or _in_shared_space(address)) and not allow_private:
+        return (
+            "private address range; set FETCH_ALLOW_PRIVATE to allow your own LAN"
+        )
     return None
 
 
