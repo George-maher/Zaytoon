@@ -390,6 +390,11 @@ class TestComputerAppAvailability:
 
         monkeypatch.setattr(apps.shutil, "which", lambda *a, **k: None)
         monkeypatch.setattr(apps, "_find_start_menu_shortcut", lambda *a, **k: None)
+        # Three inputs decide `found` on a Mac (PATH, Start Menu, .app bundle), and
+        # this test is about the answer when *nothing* is observed. Without this
+        # patch the assertion means "Spotify is not installed on the CI runner",
+        # which is a fact about the runner rather than about Zaytoon.
+        monkeypatch.setattr(apps, "_mac_bundle", lambda *a, **k: None)
 
         detail = apps.resolve_app_detail("spotify")
         assert detail["target"].startswith("spotify:")  # still launchable
