@@ -1264,6 +1264,21 @@ desktop/
   "no floor"), and only `unregister` removes one. Anything *showing* a tier —
   `describe()`, `by_tier()`, `effective_tier()` — reads the registry, never the
   object, so a lying tool cannot advertise itself as harmless.
+- **Shipped security skills (P7.5).** `skills/` at the repository root holds three
+  read-only skills — `log-review`, `dependency-review`, `file-audit` — installed by
+  `python backend/scripts/install_shipped_skills.py` (explicit, offline, and **not enabled**
+  afterwards: an enabled skill injects instructions into every turn, so that is a decision).
+  They are passive **by construction, not by promise**: `tests/core/test_shipped_skills.py`
+  parses each shipped module and fails on any import outside
+  `{json, hashlib, os, re, typing, tools.*}`, any call to `os.remove`/`os.chmod`/
+  `shutil.*`/`subprocess`/`socket`/…, any `open()` in a write mode, and any `eval`/`exec`.
+  They also declare `permissions: ["filesystem.read"]` and the P6 gap check runs against
+  them, so a tool that later grows a need the manifest did not ask for fails the build.
+  Their tools still get the `confirm` floor — being shipped by us is not an exemption,
+  because an exemption list is where a floor leaks. Certificates are reported as
+  "PEM certificate (not decoded…)" rather than clean: `cryptography` is not a dependency,
+  `openssl` would mean running a program, and a skipped check printed as a pass is how an
+  audit tool lies.
 - **Skill policy gaps (P6).** `core.permissions.gaps_for(tool_name,
   tool_declared, manifest_declared)` compares what a tool needs with what its
   `skill.json` asked for, minus what the `confirm` floor grants anyway

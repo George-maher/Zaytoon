@@ -961,3 +961,54 @@ was written before it was true and then made true by running it.
 **Roadmap after P7:** P7.5 passive security skills (logs, configs, lockfiles, hashes and
 certificates — no scanners, per the 2026-10-11 decision, and enforced by giving the skills no
 active tool to hold), then P8 (OS matrix, `scripts/e2e_scenarios.py`, final diff review).
+
+
+---
+
+## 15. P7.5 result — passive security skills, checked rather than promised (2026-10-11)
+
+**Decision implemented:** *"passive only, regardless of authorization"* — no scanners, no
+active tools, whatever the authorization story. Delivered as three skills under `skills/`:
+
+| Skill | Tool(s) | Reports |
+| --- | --- | --- |
+| `log-review` | `security_scan_logs` | auth failures, crash signatures, injection shapes, and leaked secret *shapes* (AWS key, JWT, private-key block, bearer token, password in URL) with `file:line`, masked (`AKIA…MPLE`) |
+| `dependency-review` | `security_review_dependencies` | unpinned requirements, `git+`/`github:` sources, plain-`http://` registries, missing integrity hashes, npm `postinstall`-style hooks, `go mod replace` |
+| `file-audit` | `security_hash_files`, `security_inspect_paths` | digests vs an expected value; mode, world-writable, setuid/setgid, executable bit, symlinks that leave the workspace, binary container sniff |
+
+**How passivity is enforced.** `backend/tests/core/test_shipped_skills.py` parses every
+shipped tool module and fails on: an import outside a ten-name allow-list; a call to any of
+`os.remove/unlink/rename/replace/chmod/chown/symlink/system/popen/kill/fork/exec*/truncate`,
+`shutil.*`, or anything from `subprocess`/`socket`/`http`/`urllib`/`requests`/`httpx`/
+`webbrowser`/`pty`/`ctypes`/`ssl`; any `open()` whose mode contains `w`, `a`, `x` or `+`; any
+`eval`/`exec`/`compile`/`__import__`. Plus the properties that rot quietly: every manifest
+declares exactly `filesystem.read`, every skill installs **disabled**, the P6 gap check finds
+nothing undeclared, `load_skill_tools` reports no errors and no policy gaps against the real
+files, and the `confirm` floor still applies to their tools.
+
+**Deliberate limits, printed rather than hidden.** No advisory database (that needs the
+network, so `npm audit` is not what this is — the offline questions are still where most of
+the real signal is). No certificate decoding: `cryptography` is not a dependency and shelling
+out to `openssl` means whatever is on PATH decides; the tool says *"PEM certificate (not
+decoded…)"* so a skipped check can never be read as a clean one, and there is a test with
+that assertion in its failure message. And a flag is a question: `world-writable` is normal on
+a temp directory and alarming on an SSH key, so the summary never claims compromise.
+
+**One bug the tests earned:** the audit tools resolved a relative path for the containment
+check and then read the *original string* — so `payload.bin` was checked against the workspace
+and opened from the process cwd. The fix resolves once and uses the resolved path for
+`stat`/`open`, keeping the user's spelling for display (`_resolve`'s docstring). A tool whose
+check and its action address different files is the exact class of mistake this phase was
+about.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/core/test_shipped_skills.py` | **23 passed** (structural + functional, offline) |
+| Installer, end to end in a temp data dir | 3 installed, `enabled=False`; discovery clean; nothing loaded while disabled; enabling 2 loads 3 tools with **no errors, no policy gaps**; `effective_tier == confirm` |
+| full backend suite | **2562 → 2585 passed, 5 skipped, 0 failed** (97 s) |
+
+**Files:** `skills/{log-review,dependency-review,file-audit}/` (9 files: `skill.json`,
+`instructions.md`, `README.md`, `tools/*.py`), `backend/scripts/install_shipped_skills.py`,
+`backend/tests/core/test_shipped_skills.py`, `AGENTS.md`, this section.
