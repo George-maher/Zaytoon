@@ -1217,3 +1217,36 @@ on my machine" claim about a platform the sandbox cannot run, and a swallowed ex
 Three things are knowingly unverified by anyone in this chain: `macos-latest` CI (never
 executed), the Windows SendKeys semantics (argued from documented key codes + OS clamping),
 and the frontend container (cannot build as committed — see §17).
+
+### 17.6 CI triage, from step conclusions rather than logs
+
+Job logs are not retrievable from this environment (the log endpoint redirects off-host),
+so the diagnosis came from `actions/runs/<id>/jobs`, which reports **which step** failed:
+
+| leg | failing step | |
+| --- | --- | --- |
+| `ubuntu-latest` | `Live smoke check` — `scripts/verify_final.py` | **fixed** |
+| `macos-latest` | `Run tests` | log needed |
+| `windows-latest` | `Run tests` | log needed |
+| `Desktop shell` | — | log needed |
+
+The `ubuntu` cause reproduced here in a fresh clone with a clean `HOME` and no `.env`:
+`verify_final.py` called `get_llm_client().build_chain("fast")` at module level, and
+`build_chain` raises `LLMError` when the provider has no credentials. So the script died
+inside section 1 with a traceback — **and the other 55 checks (voice routing, tool gating,
+the command sandbox, path containment) never ran**, on any machine without an OpenRouter
+key. Both symptoms are fixed: the four provider-dependent checks now `SKIP` with the
+reason, everything else runs, and `tests/test_verify_final_script.py` pins both halves —
+that the script finishes green on a keyless machine, and that pointing
+`OPENROUTER_FALLBACK_MODEL` at the auto-router through the environment still exits non-zero
+(so a skip is not a way to pass).
+
+What was ruled out for the remaining legs, each by measurement rather than argument: a
+dependency drift (a fresh venv from `requirements-dev.txt` alone: 2641 passed), CI's own
+environment variables (`CI=true GITHUB_ACTIONS=true RUNNER_OS=Linux`: 2641 passed), a
+clean `HOME` with no `.env` and no `backend/data` in a fresh clone (2641 passed), a
+`filterwarnings = error` escalation (pytest.ini has none), and `sys.platform`-keyed logic
+(a `platform.system()` mask turned one macOS-only failure green, and it is the fix in
+`80dd3be`). The `Desktop shell` job and both remaining `Run tests` legs need the tail of
+the log; nothing here can produce it, so those are reported as open rather than patched on
+a guess.
