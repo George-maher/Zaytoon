@@ -30,6 +30,7 @@ HIDDEN_IMPORTS = [
     "app.config",
     "app.host",
     "app.instance",
+    "app.paths",
     "app.protocol",
     "webview",
 ]
@@ -59,7 +60,7 @@ def check_prerequisites() -> list[str]:
     return problems
 
 
-def build(clean: bool = False, console: bool = False) -> int:
+def build(clean: bool = False, console: bool = False, onedir: bool = False) -> int:
     problems = check_prerequisites()
     if problems:
         print("Cannot build:")
@@ -77,7 +78,11 @@ def build(clean: bool = False, console: bool = False) -> int:
         "-m",
         "PyInstaller",
         "--noconfirm",
-        "--onefile",
+        # `--onefile` is the default because it is one artifact to hand someone,
+        # and it costs an extraction step on every launch (the backend import
+        # alone is measured at ~2.5 s in docs/DESKTOP_AUDIT.md). `--onedir` trades
+        # a folder for a faster start and is what a real install should ship.
+        "--onedir" if onedir else "--onefile",
         "--name",
         "Zaytoon",
         "--distpath",
@@ -100,7 +105,8 @@ def build(clean: bool = False, console: bool = False) -> int:
     if result.returncode != 0:
         return result.returncode
 
-    exe = DIST / ("Zaytoon.exe" if sys.platform == "win32" else "Zaytoon")
+    name = "Zaytoon.exe" if sys.platform == "win32" else "Zaytoon"
+    exe = DIST / name if not onedir else DIST / "Zaytoon" / name
     print()
     if exe.exists():
         size_mb = exe.stat().st_size / (1024 * 1024)
@@ -122,8 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build the Zaytoon desktop executable")
     parser.add_argument("--clean", action="store_true", help="remove dist/ and build/ first")
     parser.add_argument("--console", action="store_true", help="keep a console window (debugging)")
+    parser.add_argument(
+        "--onedir",
+        action="store_true",
+        help="build a folder instead of a single file: starts faster, ships as a directory",
+    )
     args = parser.parse_args(argv)
-    return build(clean=args.clean, console=args.console)
+    return build(clean=args.clean, console=args.console, onedir=args.onedir)
 
 
 if __name__ == "__main__":
