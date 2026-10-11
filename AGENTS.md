@@ -926,6 +926,18 @@ would stop a second launch). A final answer that claims success (`Done`, `succes
 while steps failed gets the unfinished steps appended to it, in the user's language: qualified,
 never deleted. Tests: `tests/test_agent_bounds.py`; removing any of the three guards reddens it.
 
+**Sources are stamped, not policed** (`agents/sources.py`). The ledger records only what a
+tool actually returned: `fetch_url` becomes a *read page*, `search_web` results become
+*snippet-only* entries, same URL = one number, and reading a page that was only seen as a
+snippet upgrades the entry instead of minting a second citation. The numbered list is shown to
+the model in the tool-results message (so `[1]` means the same thing on both sides) and the
+final answer gains a `**Sources**` block plus a method line ("1 search query, 1 page read in
+full, 2 snippets not opened", timestamps UTC). The one enforceable rule is the falsifiable one:
+`[7]` with two sources is called out in the answer and recorded in `LoopResult.errors` — style
+and "should this have had a citation" are left alone. Nothing is deleted from the model's text;
+the appendix is appended, as with P5's claim check. A turn with no sources gets no noise.
+`LoopResult.sources` carries the list for callers (`api`/websocket UI surfacing is P7.3).
+
 Three properties of the dispatch path are load-bearing, and each has a test in
 `tests/test_fast_path.py`:
 

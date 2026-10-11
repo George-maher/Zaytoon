@@ -872,6 +872,10 @@ class LoopResult:
     failed_calls: List[str] = field(default_factory=list)
     stopped_reason: str = "answered"
     errors: List[str] = field(default_factory=list)
+    #: What this turn actually read, numbered the way the answer cites it
+    #: (`agents/sources.py`). Empty for a fast-path or provider-less turn, which
+    #: is the honest value: nothing was read.
+    sources: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def used_tools(self) -> bool:
@@ -995,6 +999,12 @@ class AgentEngine:
         executed: Dict[str, str] = {}
         #: Calls dispatched so far this turn, for the per-turn budget.
         dispatched = 0
+        #: Numbered record of every page and result this turn touched, so the
+        #: answer can be stamped with citations instead of standing on the model's
+        #: confidence alone.
+        from agents.sources import SourceLedger
+
+        ledger = SourceLedger()
         #: One correction is allowed for a malformed reply. More than one and a
         #: confused model just burns the budget.
         nagged = False
@@ -1121,6 +1131,7 @@ class AgentEngine:
                             tool_calls=tool_names,
                             failed_calls=failed,
                             stopped_reason="no_tool_taken",
+                            sources=[s.to_dict() for s in ledger.items],
                             errors=errors,
                         )
                     nag = _TOOL_EXPECTED_NAG if tool_nags == 0 else _TOOL_NAG_FINAL
@@ -1158,6 +1169,8 @@ class AgentEngine:
                     )
                     await bus.error(answer)
                 answer = self._verify_claims(answer, failed, language, errors)
+                answer, notes = ledger.stamp(answer, language)
+                errors.extend(notes)
                 await bus.response_chunk(answer, response_id=response_id)
                 await bus.completed(reason="answered", iterations=iteration)
                 return LoopResult(
@@ -1167,6 +1180,7 @@ class AgentEngine:
                     failed_calls=failed,
                     stopped_reason="answered",
                     errors=errors,
+                    sources=[source.to_dict() for source in ledger.items],
                 )
 
             # Bounds first, and *before* the plan is published: a plan of ten
@@ -1215,6 +1229,10 @@ class AgentEngine:
                 if not outcome.get("success"):
                     errors.append(f"{call.name}: {outcome.get('error') or 'failed'}")
                 observations.append(render_observation(call, outcome))
+                # Sources are recorded from the outcome, not from the model's
+                # prose: a URL the model mentions is a claim, a URL this turn read
+                # is evidence.
+                ledger.ingest(call.name, call.params or {}, outcome)
                 # `tool_calls` is every tool dispatched, so the UI can show the
                 # full activity trail; `failed_calls` is what did not work, so a
                 # caller can tell "nothing happened" from "it tried and failed".
@@ -1233,11 +1251,13 @@ class AgentEngine:
                     executed[self._effect_key(call)] = observations[-1]
 
             last_prose = prose
+            block = ledger.prompt_block(language)
             messages.append({
                 "role": "user",
                 "content": (
                     "Tool results:\n"
                     + "\n".join(observations)
+                    + (f"\n\n{block}" if block else "")
                     + "\n\nContinue with the next step, or reply with a final "
                     "summary in prose if the work is done."
                 ),
@@ -1252,6 +1272,10 @@ class AgentEngine:
             force_prose=True,
         )
         answer = final or last_prose or "I ran out of steps before finishing that."
+        # Stamped here too: a turn that ran out of steps is the one where an
+        # unsupported "summary" is most likely, and most likely to be believed.
+        answer, notes = ledger.stamp(answer, language)
+        errors.extend(notes)
         await bus.response_chunk(answer, response_id=response_id)
         await bus.completed(reason="max_iterations", iterations=self.max_iterations)
         return LoopResult(
@@ -1261,6 +1285,7 @@ class AgentEngine:
             failed_calls=failed,
             stopped_reason="max_iterations",
             errors=errors,
+            sources=[source.to_dict() for source in ledger.items],
         )
 
     # ------------------------------------------------------------------

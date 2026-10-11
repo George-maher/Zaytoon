@@ -871,3 +871,59 @@ certificate against the hostname, so this is mitigated (short connect timeout, G
 capped body, no execution, refusals reported) rather than eliminated. `FETCH_ALLOW_PRIVATE=false`
 closes the combination that matters — a hostile name resolving to a local service — by
 refusing the local service outright.
+
+
+---
+
+## 13. P7.2 result — the source ledger: stamping instead of refusing (2026-10-11)
+
+**Files:** `backend/agents/sources.py` (new, ~300 lines with the reasoning),
+`backend/agents/engine.py` (five touch points: `LoopResult.sources`, ledger creation,
+`ingest` per outcome, `prompt_block` in the tool-results message, `stamp` on both the
+answered and the budget-exhausted path), `backend/tests/test_sources.py` (19 tests),
+`AGENTS.md`.
+
+**The decision it implements.** Claims carry `[n]`, a retrieved-at time, and a stated method;
+whatever cannot be stamped is labelled unverified rather than removed. That is a different
+posture from P5's claim check but the same mechanism — **append the truth, never edit the
+model's sentences** — and it is why `stamp()` returns `(text, notes)` instead of rewriting.
+
+**What the ledger refuses to do:**
+
+* **Take the model's word for a source.** Entries are built from `ToolResult.data` of
+  `fetch_url` / `search_web` only. A URL the answer mentions is a claim; a URL the turn read
+  is evidence. `test_a_failed_or_unrelated_tool_contributes_nothing` pins it.
+* **Treat a snippet as a page.** Two kinds, and the citing rule the model is shown says
+  dates/versions/numbers must come from a *read* page. `test_the_answer_gains_sources_and_method`
+  renders "1 page(s) read in full, 2 snippet(s) not opened" — the honesty is the feature.
+* **Mint a second number for the same document.** Dedupe by normalised URL (trailing slash
+  folded); re-reading an already-seen result *upgrades* it in place and refreshes the stamp.
+  Without this, a search→open sequence produces two citations for one document and the
+  appendix lies about how much was read.
+* **Become a way to fail a turn.** `ingest` swallows nothing silently but raises nothing:
+  an unexpected tool shape means "no citation available", which is the right outcome anyway.
+* **Show 30 links where the user's question should be.** The prompt list caps at
+  `MAX_LISTED_SOURCES = 12` and says "(…N more result(s) not listed)" rather than truncating
+  quietly.
+
+**The one rule that is actually checkable:** `[n]` outside `1..count` — the model inventing
+provenance — is called out in the answer and recorded in `LoopResult.errors`. Bracket style,
+placement and "this claim should have had a source" are not mechanically decidable, so they
+are not pretended to. A markdown link (`[text](url)`) is not a citation, and `test_markdown_links_are_not_citations`
+keeps the regex from making it one.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/test_sources.py` | **19 passed** in 0.1 s |
+| A dedupe removed / B snippet counted as read / C fake citations unchecked | 3 red, 3 red, 3 red |
+| D engine stops ingesting / E prompt block not shown | 2 red, 1 red |
+| full backend suite | **2540 → 2559 passed, 5 skipped, 0 failed** (99 s) |
+
+**Not done yet, on purpose:** the sources block is in the answer *text*, so both the web chat
+and the desktop view render it as markdown; `LoopResult.sources` is not yet surfaced on the
+REST/WS payloads, and there is no Sources panel in the dock. That is P7.3 (UI), together with
+the multi-query research loop's prompt guidance for the ledger. `SettingsPanel` still ignores
+`llm.probe`; R5/R6 deferred; the intermittent 1-warning unraisable in full-suite runs is
+carried forward as a known flake (0–2 warnings across runs, no test depends on it).
