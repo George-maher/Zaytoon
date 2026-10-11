@@ -22,12 +22,23 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
-        # Windows is the primary target and the OS tools are Windows-specific,
-        # but the product ships `install.sh`, a Linux Docker image and a pywebview
-        # WebKit host, so POSIX is supported and must not regress silently. The
-        # platform-dependent assertions are scoped in the tests themselves
-        # (skipif), not by skipping a whole OS here.
-        os: [windows-latest, ubuntu-latest]
+        # All three are product targets (decision 2, 2026-10-10): Windows is the
+        # primary one, and the product ships `install.sh`, a Linux Docker image
+        # and a pywebview WebKit host. Each leg therefore has to run, not be
+        # skipped into greenness. The platform-dependent assertions are scoped in
+        # the tests themselves (skipif), not by dropping an OS here.
+        #
+        # What macOS does and does not prove: it runs the same suite, so the
+        # `Darwin` branches of `core/system_resources.py` (vm_stat/sysctl) and
+        # `tools/applications.py` (.app bundle resolution) execute against real
+        # `vm_stat`, real `sysctl` and a real `/Applications`. It cannot prove the
+        # *desktop* shell works, because the pywebview/Cocoa host is not
+        # installed on the runner — the desktop suite is excluded on that leg, and
+        # `tools/system.py`'s `osascript` volume path stays asserted only at argv
+        # level, since a runner has no audio device to set. The `desktop` job below
+        # is pinned to windows-latest, so no leg here says anything about the
+        # macOS/Linux desktop shells.
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4

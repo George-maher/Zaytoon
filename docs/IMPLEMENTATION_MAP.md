@@ -309,15 +309,20 @@ product doesn't reach it:
   `install.ps1 -Check` and `install.sh --check` both pass (all deps) ·
   security suite green (`test_security_sandbox`, `test_workspace_and_injection`,
   bridge `TestSecurity`, `TestSkillToolsAreGated`).
-- **`backend/scripts/e2e_scenarios.py`** — seven scripted acceptance scenarios
+- **`backend/scripts/e2e_scenarios.py`** — nine scripted acceptance scenarios
+  (seven original + OS capability parity + citation discipline; P8)
   against the *real* WebSocket with the real local Ollama provider:
   bilingual assistant turn · safe tool turn · confirmation gate (approve
   creates / decline leaves nothing on disk) · reminder round-trip (created,
   listed, deleted) · diagnostics shapes · containment + audit escapes ·
-  policy guards. Final result: **7 passed, 0 skipped, 0 failed**. SKIPs are
-  reserved for honest provider-unavailable markers (429, "model not
-  installed", "ollama serve", …), so a broken flow can never hide behind a
-  skip. `run_turn` waits for the terminal `done` frame after the prose
+  policy guards · OS capability parity · citation discipline. Its first live run
+  finished **7 passed, 0 skipped, 0 failed**; after P8, the same script on the
+  same machine with no model running reports **5 passed, 4 skipped, 0 failed** —
+  each skip naming the missing dependency *and* what was still verified (the
+  transport, the refusal shapes, the registry gate). A SKIP always names an
+  unavailable dependency (429, "model not installed", "ollama serve", a refused
+  action with no fallback); an assertion the environment cannot satisfy is fixed
+  per-OS instead of dropped. `run_turn` waits for the terminal `done` frame after the prose
   (the transport owns `done`, *after* TTS drain — breaking on `message`
   read as "no done status").
 - **Four real defects the live run caught that no unit test covered:**

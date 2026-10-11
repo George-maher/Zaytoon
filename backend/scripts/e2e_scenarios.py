@@ -22,7 +22,13 @@ for conversational turns, REST for everything inspectable:
      ``error``, and the tool turns above are attributable in ``GET /audit``;
   7. policy guards — free-only pools, no ``openrouter/free``, the tool
      catalogue is self-describing, the sandbox still refuses chaining, and
-     the native bridge still has no eval/exec/shell.
+     the native bridge still has no eval/exec/shell;
+  8. OS capability parity — the same answers on Windows, macOS and Linux, or a
+     stated reason. Runs against *this* machine's OS, so it is the check a CI
+     leg cannot replace: a resource that is unreadable must say so, and the
+     volume tool must refuse where it cannot read back;
+  9. citation discipline — a turn that cites ``[n]`` must carry a Sources
+     appendix with that ``n``, and the WS ``sources`` frame must agree with it.
 
 Outcomes are **PASS / FAIL / SKIP**. SKIP is reserved for conditions the
 product already reports honestly: a turn that ends with the controlled
@@ -82,10 +88,19 @@ def record(name: str, status: str, detail: str = "") -> None:
 
 
 def classify_error(turn: "Turn") -> tuple[str, str]:
-    """A controlled provider error is a SKIP; anything else is a FAIL."""
-    text = (turn.error or "").lower()
+    """A controlled provider error is a SKIP; anything else is a FAIL.
+
+    Both places are read because the product reports an exhausted or stopped
+    provider two ways: an ``error`` frame, or — the P1 decision — a normal
+    ``message`` carrying the controlled notice ("all available free AI models
+    are temporarily unavailable…"). Classifying only the frame made every
+    provider-dependent scenario FAIL on a machine with no Ollama running, which
+    is an environment condition the script is meant to tolerate.
+    """
+    text = ((turn.error or "") + " " + (turn.final or "")).lower()
     if any(marker in text for marker in _UNAVAILABLE):
-        return "SKIP", f"provider unavailable: {turn.error[:120]}"
+        detail = (turn.error or turn.final).strip()
+        return "SKIP", f"provider unavailable: {detail[:120]}"
     return "FAIL", turn.error[:200] or "no final message"
 
 
@@ -100,6 +115,8 @@ class Turn:
         self.confirmations: list[dict] = []
         self.confirmation_results: list[dict] = []
         self.messages: list[str] = []
+        self.sources: list[dict] = []
+        self.frames: list[str] = []
         self.error: str = ""
 
     @property
@@ -108,6 +125,7 @@ class Turn:
 
     def note(self, frame: dict) -> None:
         kind = frame.get("type")
+        self.frames.append(kind or "?")
         if kind == "token":
             self.tokens.append(frame.get("content", ""))
         elif kind == "status":
@@ -120,6 +138,8 @@ class Turn:
             self.confirmations.append(frame)
         elif kind == "confirmation_result":
             self.confirmation_results.append(frame)
+        elif kind == "sources":
+            self.sources.append(frame)
         elif kind == "message":
             self.messages.append(frame.get("content", ""))
         elif kind == "error":
@@ -196,19 +216,26 @@ async def scenario_1(client: httpx.AsyncClient) -> None:
         return record("1. bilingual assistant turn", status, detail)
 
     arabic_chars = sum(1 for ch in turn.final if "\u0600" <= ch <= "\u06FF")
+    # Whether a model actually answered decides only the *language* assertion.
+    # The transport half — one message frame, a terminal `done`, no tool-call
+    # markup in prose — is checked even under a stopped daemon, so a SKIP here
+    # still means "the socket worked, the Arabic could not be judged", never
+    # "the whole scenario quietly did not run".
+    blocked = classify_error(turn)[0] == "SKIP"
     problems = []
     if len(turn.messages) != 1:
         problems.append(f"{len(turn.messages)} message frames (want 1)")
     if "done" not in turn.statuses:
         problems.append("no `done` status")
-    if arabic_chars < 10:
+    if not blocked and arabic_chars < 10:
         problems.append(f"reply is not Arabic ({arabic_chars} Arabic chars)")
     if _looks_like_tool_json(turn.final):
         problems.append("tool-call markup leaked into prose")
     record(
         "1. bilingual assistant turn",
-        "FAIL" if problems else "PASS",
-        "; ".join(problems),
+        "FAIL" if problems else ("SKIP" if blocked else "PASS"),
+        ("; ".join(problems) or f"{arabic_chars} Arabic chars")
+        + (" — transport verified; the Arabic needs a live model" if blocked else ""),
     )
 
 
@@ -260,12 +287,23 @@ async def scenario_3(client: httpx.AsyncClient) -> None:
         "Create a folder named e2e_gate_no in my workspace", approve=False
     )
 
+    # A turn that never reached the model cannot exercise the gate over the
+    # socket — but that must not become "the gate is untested today", so the
+    # registry half below runs instead, and a leak there is a FAIL.
+    if classify_error(approved)[0] == "SKIP":
+        status, detail = await _gate_without_model(client)
+        if status == "FAIL":
+            return record("3. confirmation gate", "FAIL", f"{detail} (model turn unavailable)")
+        why = (approved.error or approved.final).strip()[:100] or "no reply"
+        return record(
+            "3. confirmation gate",
+            status,
+            f"{detail}; the WS half needs a model ({why})",
+        )
+
     problems = []
     if not approved.confirmations:
         problems.append("approval was never requested")
-    if approved.error or not approved.messages:
-        status, detail = classify_error(approved)
-        return record("3. confirmation gate", status, f"approve turn: {detail}")
     if not await _folder_exists(client, yes):
         problems.append("approved folder was not created")
 
@@ -287,6 +325,37 @@ async def scenario_3(client: httpx.AsyncClient) -> None:
         )
     await _cleanup_folder(client, yes)
     await _cleanup_folder(client, no)
+
+
+async def _gate_without_model(client: httpx.AsyncClient) -> tuple[str, str]:
+    """The two halves of the gate that do not need a model to be honest.
+
+    ``POST /command/run`` goes through the same registry as a WebSocket tool
+    turn and has no approval channel of its own, so: a confirmation-required
+    command must be **denied** with nothing written, and a chained command must
+    be **blocked** outright. Both are checked by looking at the filesystem
+    afterwards — a denial that still ran the command is the failure this exists
+    to catch, and no prose-level assertion would see it.
+    """
+    marker = "e2e_gate_probe.txt"
+    await client.post("/files/delete", json={"path": marker})
+    response = await client.post("/command/run", json={"command": f"touch {marker}"})
+    if response.status_code != 200:
+        return "FAIL", f"/command/run {response.status_code}"
+    body = response.json()
+    if body.get("success"):
+        return "FAIL", "a confirmation-required command executed with no approval channel"
+    if await _folder_exists(client, marker):
+        return "FAIL", f"denied command still created {marker}"
+
+    chained = await client.post("/command/run", json={"command": "echo hi & hostname"})
+    chained_body = chained.json() if chained.status_code == 200 else {}
+    if chained_body.get("success") or not (
+        chained_body.get("blocked") or "confirm" in json.dumps(chained_body).lower()
+    ):
+        return "FAIL", f"shell chaining not refused: {json.dumps(chained_body)[:120]}"
+
+    return "SKIP", "registry gate holds (denied + refused, nothing on disk)"
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +451,18 @@ async def scenario_5(client: httpx.AsyncClient) -> None:
 async def scenario_6(client: httpx.AsyncClient, prior_tools: list[str]) -> None:
     problems = []
 
-    for escape in ("../e2e_escape.txt", "C:\\Windows\\e2e_escape.txt"):
+    # "Outside the workspace" is a statement about this OS. On Windows
+    # `C:\Windows\x` and `\\server\x` are escapes; on Linux and macOS those are
+    # legal *file names* — a workspace file literally called `C:\Windows\x` — and
+    # refusing them would be the tool inventing a rule. So the probes are chosen
+    # per platform, and the POSIX ones include the shapes that do escape here.
+    import platform as _platform
+
+    if _platform.system() == "Windows":
+        escapes = ["../e2e_escape.txt", "C:\\Windows\\e2e_escape.txt", "\\\\host\\share\\x.txt"]
+    else:
+        escapes = ["../e2e_escape.txt", "/etc/passwd", "~/e2e_escape.txt"]
+    for escape in escapes:
         response = await client.post(
             "/files/write", json={"path": escape, "content": "x"}
         )
@@ -475,6 +555,164 @@ async def scenario_7(client: httpx.AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Scenario 8 — OS capability parity (this machine, not a CI runner)
+# ---------------------------------------------------------------------------
+async def scenario_8(client: httpx.AsyncClient) -> None:
+    """Windows/macOS/Linux must either agree or explain themselves.
+
+    Two halves, deliberately: the routes report what the running OS could
+    actually measure, and the tool module is imported and asked what it would
+    do here. Neither needs a model, a network, or a second operating system —
+    and neither is a substitute for the CI macOS leg, which is the only place
+    `vm_stat`, `sysctl` and `osascript` get told the truth about.
+    """
+    problems = []
+
+    system = await client.get("/system")
+    if system.status_code != 200:
+        problems.append(f"/system {system.status_code}")
+    else:
+        resources = system.json().get("resources") or {}
+        for name in ("cpu", "memory", "disk"):
+            block = resources.get(name) or {}
+            state = block.get("status")
+            if state not in {"ok", "sampling", "unavailable"}:
+                problems.append(f"{name}.status={state!r}")
+                continue
+            if state != "ok" and not block.get("reason"):
+                problems.append(f"{name} is {state} without saying why")
+            if state == "ok":
+                percent = block.get("percent")
+                if not isinstance(percent, (int, float)) or not 0 <= percent <= 100:
+                    problems.append(f"{name}.percent={percent!r} while claiming ok")
+                total, used = block.get("total_bytes"), block.get("used_bytes")
+                if total is not None and not (0 < (used or 0) <= total):
+                    problems.append(f"{name} used={used} total={total}")
+
+    # The launcher's resolver: one answer for the panel and one for the tool is
+    # the divergence this endpoint exists to prevent, on every OS.
+    apps = await client.get("/computer/apps", params={"resolve": "true"})
+    if apps.status_code != 200:
+        problems.append(f"/computer/apps {apps.status_code}")
+    else:
+        body = apps.json()
+        if body.get("resolved"):
+            for app in body.get("apps") or []:
+                if not isinstance(app.get("installed"), bool) or "via" not in app:
+                    problems.append("a resolved app row lacks installed/via")
+                    break
+        elif not body.get("resolve_error"):
+            problems.append("unresolved without a reason")
+
+    # The volume tool, asked on this machine. Imported rather than HTTP-called:
+    # there is no REST route for it, and inventing one to test a refusal would
+    # be a new attack surface for the sake of a script.
+    import platform as _platform
+
+    from tools import system as system_tools
+
+    os_name = _platform.system()
+    backend = system_tools._volume_backend()
+    expected = {"Windows": "windows", "Darwin": "macos"}.get(os_name)
+    if expected is not None and backend != expected:
+        problems.append(f"{os_name} picked volume backend {backend!r}, not {expected!r}")
+    if os_name == "Linux" and backend not in {"pulse", "alsa", ""}:
+        problems.append(f"Linux volume backend {backend!r} is not a known dialect")
+    if system_tools.volume_argv("windows", mute=True) is not None:
+        problems.append("Windows mute came back as a command instead of a refusal")
+    if system_tools.volume_argv("alsa", level="42; rm -rf /") is not None:
+        problems.append("a non-numeric level reached the argv")
+    if system_tools.volume_argv("pulse", level=None, mute=None) is not None:
+        problems.append("an empty request built a command")
+    script = system_tools._volume_script(42, None) or ""
+    if "175, 100)" not in script or "174, 58)" not in script:
+        problems.append("Windows level is not a climb-then-descent (100 - level)")
+    if not backend:
+        refusal = await _volume_refusal_on_this_os()
+        if refusal:
+            problems.append(refusal)
+
+    record(
+        "8. OS capability parity",
+        "FAIL" if problems else "PASS",
+        "; ".join(problems) or f"{os_name}: resources declared, volume={backend or 'unavailable'}",
+    )
+
+
+async def _volume_refusal_on_this_os() -> str:
+    """With no backend on this box, asking to set the level must refuse in words."""
+    from tools import system as system_tools
+
+    result = await system_tools.GetVolume().execute(level=20)
+    if result.success:
+        return "a volume write reported success with no backend present"
+    missing = [w for w in ("Windows", "macOS", "pactl", "amixer") if w not in (result.error or "")]
+    return f"refusal names no way out (missing {missing})" if len(missing) == 4 else ""
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9 — citation discipline over the real transport
+# ---------------------------------------------------------------------------
+async def scenario_9(client: httpx.AsyncClient) -> None:
+    turn = await run_turn(
+        "Search the web: what is the current stable Python version, and when "
+        "was it released? Cite each fact."
+    )
+    if turn.error or not turn.messages:
+        status, detail = classify_error(turn)
+        return record("9. citation discipline", status, detail)
+
+    import re
+
+    final = turn.final
+    cited = sorted({int(n) for n in re.findall(r"\[(\d{1,3})\]", final)})
+    frame = next((f for f in turn.sources if isinstance(f, dict)), None)
+    # `sources` frames are per-turn; run_turn stores the whole frame, so the
+    # ledger it carried is under "sources".
+    listed = (frame or {}).get("sources") or []
+    problems = []
+
+    if cited and not listed:
+        problems.append(f"the answer cites {cited} with no sources frame")
+    if len(listed) > 12:
+        problems.append(f"{len(listed)} sources in one frame; the cap is 12")
+    for item in listed:
+        if not str(item.get("url", "")).startswith(("http://", "https://")):
+            problems.append(f"source without a URL: {item}")
+            break
+        # `n` and `retrieved_at` are the two fields that carry the promise: a
+        # number to cite and a time to date it by. Either missing is a silent
+        # downgrade of the whole scheme, so it fails here rather than in review.
+        if not item.get("n") or not item.get("retrieved_at"):
+            problems.append(f"source without n/retrieved_at: {item}")
+            break
+    if frame is not None and not frame.get("trace_id"):
+        problems.append("sources frame without a trace_id")
+    if listed:
+        if cited and max(cited) > len(listed) and "nverified" not in final:
+            problems.append(f"citation [{max(cited)}] exceeds {len(listed)} sources, unlabelled")
+        if "Sources" not in final and "المصادر" not in final:
+            problems.append("no Sources appendix under a sourced answer")
+        if "Method:" not in final:
+            problems.append("no stated method line")
+
+    if problems:
+        record("9. citation discipline", "FAIL", "; ".join(problems))
+    elif not listed:
+        # A turn that took no web search legitimately has no sources; claiming a
+        # defect here would only make the script depend on a model's mood.
+        record(
+            "9. citation discipline", "PASS",
+            "no web turn taken (nothing to cite) — frames: " + ",".join(dict.fromkeys(turn.frames)),
+        )
+    else:
+        record(
+            "9. citation discipline", "PASS",
+            f"{len(listed)} source(s), citations {cited or 'none'}",
+        )
+
+
+# ---------------------------------------------------------------------------
 async def main() -> int:
     async with httpx.AsyncClient(base_url=BASE, timeout=30) as client:
         try:
@@ -487,7 +725,7 @@ async def main() -> int:
             return 1
 
         print("=" * 68)
-        print("SEVEN ACCEPTANCE SCENARIOS (live)")
+        print("NINE ACCEPTANCE SCENARIOS (live)")
         print("=" * 68)
 
         await scenario_1(client)
@@ -505,6 +743,8 @@ async def main() -> int:
             prior.append("create_folder")
         await scenario_6(client, prior)
         await scenario_7(client)
+        await scenario_8(client)
+        await scenario_9(client)
 
     failed = [r for r in RESULTS if r[1] == "FAIL"]
     skipped = [r for r in RESULTS if r[1] == "SKIP"]

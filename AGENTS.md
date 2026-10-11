@@ -1307,10 +1307,29 @@ desktop/
   keys and counters untouched). Every failing response across all failure
   classes is pinned as `{"error": str}` (never FastAPI's `{"detail": ...}`)
   by `TestErrorShapeIsUnified`.
-- **E2E verification (Ph9):** `backend/scripts/e2e_scenarios.py` drives seven
-  scripted acceptance scenarios over the real WebSocket (bilingual turn, safe
-  tool, confirmation approve/decline, reminder round-trip, diagnostics shapes,
-  containment + audit, policy guards) and finished **7/7**. It caught four
+- **OS parity contract (P8):** three systems, one contract — *the same answer, or
+  a stated reason*. Concretely: `tools/applications.py` resolves an app name via
+  Start-Menu shortcuts (Windows), a depth-one `.app` bundle scan of
+  `/Applications` (macOS, case- and space-insensitive) or `PATH` (Linux);
+  `core/system_resources.py` reads `GetGlobalMemoryStatusEx`, `/proc/meminfo`
+  + `/proc/stat`, and `vm_stat`/`sysctl -n kern.cp_time|hw.memsize|vm.page_size`
+  respectively, and every branch returns the **same keys** (`percent`,
+  `used_bytes`, `total_bytes`) so `GET /system` has one shape on every OS;
+  `tools/system.py` picks a volume backend by probing (`SendKeys` / `osascript`
+  / `pactl` / `amixer`) and refuses rather than approximating — `level` is
+  absolute (Windows: 100 up-keys then `100 - level` down-keys, because a raw
+  key-press count is a *relative* nudge), and mute is refused on Windows because
+  that key only toggles and nothing here can read the state back. Unavailable
+  counters report `status: unavailable` + `reason`; the first CPU sample is
+  `status: sampling`, never `0%`. `tests/test_posix_parity.py` pins all of it on
+  Linux by faking the platform and the command output; `macos-latest` in the CI
+  matrix is where the real `vm_stat`/`sysctl`/`open` behaviour gets answered.
+- **E2E verification (Ph9, nine scenarios since P8):**
+  `backend/scripts/e2e_scenarios.py` drives nine scripted acceptance scenarios
+  over the real WebSocket (bilingual turn, safe tool, confirmation
+  approve/decline, reminder round-trip, diagnostics shapes, containment + audit,
+  policy guards, **OS capability parity**, **citation discipline**) and finished
+  **7/7** in its original form. It caught four
   defects no unit test covered, each now pinned by a test: the WS
   `reminder_cmd` call site whose function was never written
   (`tests/test_websocket_reminders.py` drives the real handler), reminders
@@ -1323,6 +1342,17 @@ desktop/
   (`AgentEngine.gate_refused` exempts prose only after a real gate refusal;
   `test_a_decline_exempts_prose_from_the_tool_nag`). The runner waits for the
   terminal `done` frame, which the transport emits only after TTS drain.
+  Since P8 the runner is honest on a machine with **no model running**:
+  `classify_error()` reads both the `error` frame *and* the final message, because
+  the controlled unavailability notice is a normal `message` (P1 decision), so an
+  exhausted free tier SKIPs with what was still verified instead of FAILing. The
+  two platform-blind expectations were the other reason the script lied: a
+  `C:\Windows\…` write is only an escape on Windows (elsewhere it is a legal
+  filename *inside* the workspace, so `/etc/passwd`, `../` and `~/` are the POSIX
+  probes), and scenario 3 falls back to `_gate_without_model()`, which proves the
+  gate at the registry — a confirmation-required command denied with nothing on
+  disk, `echo hi & hostname` blocked — so "no model here today" never means "the
+  gate went untested".
 
 ## Notes
 
