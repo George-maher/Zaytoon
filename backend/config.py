@@ -603,6 +603,15 @@ class Config:
         "TOOL_ALWAYS_CONFIRM", "run_code,file_delete,registry_write"
     )
 
+    #: Refuse to load a skill tool that needs a permission its manifest did not
+    #: ask for, instead of reporting the mismatch and loading it. Off by default:
+    #: the report is the product behaviour (a skill author gets a precise warning),
+    #: and silently refusing a user's already-installed skill on a code change
+    #: would be its own kind of breakage. Turn it on where a skills directory is
+    #: fed by someone else — a shared folder, a team repo, a download.
+    #: See `core.permissions.gaps_for` for what counts as a gap.
+    SKILL_STRICT_PERMISSIONS: bool = _env_bool("SKILL_STRICT_PERMISSIONS", False)
+
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------

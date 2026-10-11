@@ -238,6 +238,17 @@ async def lifespan(app):
                 len(skill_report["tools"]),
                 ", ".join(skill_report["tools"]),
             )
+        # A startup that loaded nothing because every skill was broken has to be
+        # readable in one line, not reconstructed from per-module warnings.
+        if skill_report["errors"] or skill_report.get("policy"):
+            logger.warning(
+                "Skill tools incomplete: %d refusal(s), %d undeclared-permission "
+                "gap(s)%s",
+                len(skill_report["errors"]),
+                len(skill_report.get("policy", [])),
+                "" if config.SKILL_STRICT_PERMISSIONS
+                else " (SKILL_STRICT_PERMISSIONS=false: loaded anyway)",
+            )
     except Exception as e:
         safe_error(e, operation="startup.skill_tools", component="api.startup")
 

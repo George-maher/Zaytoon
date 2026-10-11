@@ -1220,10 +1220,29 @@ desktop/
   `build_tools()`; `core.skills.load_skill_tools()` loads them into the one
   live `ToolRegistry` at lifespan (so `/tools`, health, the agent catalogue and
   execution all see them). Contained realpath import, per-skill module
-  namespace, **permission floor: a skill cannot self-declare `safe`** (raised
-  to `confirm` at registration *and* enforced at the gate — see
-  `TestSkillToolsAreGated`), name collisions refused, failures reported never
-  fatal.
+  namespace, name collisions refused, failures reported never fatal.
+- **The skill permission floor (P6).** A skill cannot self-declare `safe`: the
+  loader raises the instance tier *and* passes `floor=PERMISSION_CONFIRM` to
+  `ToolRegistry.register`, which records it in `self._floors` and applies it in
+  `assess()` via `_apply_floor`. The second half is the one that matters —
+  `BaseTool.permission` is a mutable attribute on third-party code, so a tool that
+  assigns `self.permission = "safe"` (or `""`) inside `execute()` used to leave the
+  gate after its first approval. Floors are **sticky and monotone**: `register` can
+  only raise one, an unknown floor string is a `ValueError` (a typo must not mean
+  "no floor"), and only `unregister` removes one. Anything *showing* a tier —
+  `describe()`, `by_tier()`, `effective_tier()` — reads the registry, never the
+  object, so a lying tool cannot advertise itself as harmless.
+- **Skill policy gaps (P6).** `core.permissions.gaps_for(tool_name,
+  tool_declared, manifest_declared)` compares what a tool needs with what its
+  `skill.json` asked for, minus what the `confirm` floor grants anyway
+  (`SKILL_FLOOR_GRANTS`) — so a quiet hello tool reports nothing and a skill
+  shipping `git_reset_hard` without `git.destructive` reports exactly that.
+  Advisory by default (`report["policy"]` + a warning + one startup line);
+  `SKILL_STRICT_PERMISSIONS=true` turns a gap into a refusal to load that tool. An
+  unreadable manifest now refuses the skill's tools entirely: no manifest means no
+  approved policy. `Permission` is a `str` Enum whose `hash` is the member's, so
+  all comparisons go through `_names()` on `.value` — a raw set difference would
+  have reported every skill as a violator. Tests: `tests/core/test_skill_policy.py`.
 - **What the model changed (Ph6):** `BaseTool.mutates_files` + a per-turn
   recorder in the orchestrator → `task.tools_used` / `task.files_changed` and a
   `file.changed` event (failed/declined tools count as used but claim no file

@@ -154,6 +154,19 @@ class BaseTool(ABC):
             if value is None or (isinstance(value, str) and not value.strip()):
                 raise ToolValidationError(f"{self.name()}: '{field_name}' is required")
 
+    def permissions(self) -> List[str]:
+        """Named permissions this tool needs *beyond* its tier.
+
+        Declared, so a `safe`-tier tool that reaches the network can say so and
+        appear under "Make network requests" in the settings panel. It is an
+        *addition*: subtracting from what the tier already implies is refused —
+        :func:`core.permissions.required_for` unions the two and never lets the
+        declaration quiet the tier. A skill's manifest is checked against
+        exactly this plus the tier floor, so a tool that does more than the skill
+        asked for is visible rather than effective.
+        """
+        return []
+
     def risk_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """The parameters the risk assessor should judge.
 

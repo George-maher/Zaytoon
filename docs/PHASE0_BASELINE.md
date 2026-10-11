@@ -762,3 +762,52 @@ verified rather than assumed.
    `git diff --name-status FETCH_HEAD` before and `git status` after). One test run also hung
    for 600 s during that churn and never reproduced. **Rule for later phases: commit and push
    before starting work — untracked files here are not durable.**
+
+
+---
+
+## 11. P6 result — a skill's ceiling lives where the skill cannot reach (2026-10-11)
+
+**Shipped** (5 files, +244/−9, plus `backend/tests/core/test_skill_policy.py`, 21 tests):
+
+| File | Change |
+| --- | --- |
+| `tools/registry.py` | `register(..., floor=)` records a minimum tier in `_floors`; `assess()` applies it via `_apply_floor`; `effective_tier()` / `floor_for()`; `describe()`, `by_tier()` read the registry; floors are sticky and monotone, only `unregister` clears |
+| `core/skills/tool_loader.py` | passes `floor=PERMISSION_CONFIRM`, keeps `_raise_floor`, wraps the whole per-tool step so one hostile tool cannot break the never-fatal promise, computes and reports policy gaps, honours `SKILL_STRICT_PERMISSIONS`, refuses a skill whose manifest cannot be read |
+| `core/permissions.py` | `gaps_for()` + `SKILL_FLOOR_GRANTS` + `_names()` (str-Enum hashing trap) |
+| `tools/base.py` | `permissions()` hook the `core/permissions.py` docstring had already promised but nobody had written |
+| `config.py`, `.env.example`, `api/main.py` | `SKILL_STRICT_PERMISSIONS` (default `False`, documented in both files), one startup line summarising refusals and gaps |
+
+**The hole, stated precisely.** `_raise_floor` edited `tool.permission` at registration and nothing
+re-checked it. `assess()` reconciles the assessor's tables with the *live* attribute, so a skill
+tool that rewrote its own tier — the natural "ask once then stop nagging" implementation — escaped
+the gate on the next call. `""` escaped further: `if tool is None or not tool.permission` returned
+the assessor's verdict alone, floor and all. Both cases are now tests, and both were verified red
+by deleting the fix (M1: 4 failures, M3: 5).
+
+**Enforcement direction.** Nothing here grants a skill more than it had. The gap check can only
+*report* or *refuse*, and the manifest may be over-declarative without penalty. The loader still
+cannot know what arbitrary Python does; what it can know is what the tool admits and what its tier
+implies, and that is what is checked. `SKILL_STRICT_PERMISSIONS` defaults to off deliberately —
+silently disabling a skill the user installed is its own regression — with strict mode as the knob
+for a skills directory fed by someone else.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/core/test_skill_policy.py` | **21 passed** in 0.5 s |
+| M1 floor not applied in `assess` | 4 red |
+| M2 `effective_tier` reads the object again | 1 red |
+| M3 loader stops passing `floor=` | 5 red |
+| M4 gap computation disabled / M4b gap not reported | 3 red / 2 red |
+| M5 `_env_bool(…, "false")` (truthy string default) | 2 red |
+| pre-existing skills + registry + sandbox suites | **316 passed, 3 skipped** |
+| full backend suite | **2464 → 2485 passed, 3 skipped, 0 failed** (95 s) |
+| `.env.example` ↔ `config.py` key audit | 50 keys, 0 missing |
+
+**Two self-corrections worth keeping:** two of my first mutation controls were no-ops
+(`sorted([]) or sorted(…)` still evaluates the real call; an anchor that did not match), which
+would have "proved" the tests were vacuous. And three test stubs first failed for a legitimate
+reason the file now encodes: `BaseTool.description`/`execute` are abstract, so a skill stub that
+omits them never reaches the code under test. Both found by running, not by reading.
