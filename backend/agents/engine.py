@@ -81,6 +81,56 @@ DEFAULT_MAX_ITERATIONS = 8
 #: cannot blow the context window on the next request.
 MAX_OBSERVATION_CHARS = 4_000
 
+#: How many calls the model may dispatch in one reply. Without it, a small local
+#: model that falls into `{"action": "x"} {"action": "x"} ...` repetition gets to
+#: issue an unbounded number of actions from a single completion — and when those
+#: are confirm-tier, the user is asked to approve a hundred of them. The iteration
+#: cap bounds how many replies there are; nothing bounded what one reply could
+#: contain. Excess calls are *reported* to the model, not dropped silently, so it
+#: can continue next step if the work really needed them.
+MAX_CALLS_PER_ITERATION = 8
+
+#: How many calls one whole turn may dispatch. `8 x 8` is already more than any
+#: legitimate desktop request needs, and a turn that wants more is looping.
+MAX_CALLS_PER_TURN = 24
+
+#: Tools whose repeated execution is harmless, so a duplicate is not refused.
+#: This is a *deny-by-default* list on purpose: an unknown or newly added tool is
+#: treated as having effects, and the worst that does is one extra observation
+#: telling the model its earlier result still stands. The reverse mistake —
+#: assuming a launcher or a writer is idempotent because its name looked read-only
+#: — is launching the app twice.
+#:
+#: Polling is why these need to be exempt: `process_logs` after `process_start`
+#: legitimately returns different text a second later, and refusing that would
+#: break the one loop that works today.
+REPEAT_SAFE_TOOLS = frozenset({
+    "get_time",
+    "get_volume",
+    "system_info",
+    "calculator",
+    "file_read",
+    "search_files",
+    "search_web",
+    "process_list",
+    "process_logs",
+    "git_status",
+    "git_log",
+    "git_diff",
+    "git_branch_list",
+})
+
+#: A reply that says the work succeeded while steps of that work failed. The
+#: claim is not deleted — it may well be true about the parts that ran — but it
+#: is never delivered *alone*, because "Done!" from a model that ignored three
+#: FAILED observations is the most convincing kind of wrong answer.
+_SUCCESS_CLAIM = re.compile(
+    r"""(?:\b(?:done|finished|completed|created|saved|opened|installed|deleted|
+        moved|renamed|fixed|updated|written|launched|started|successfully)\b|
+        \u2705|\u2714|تم|خلص|اتنفذ|نجح|تمت)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
 #: The longest a single tool may run before the engine stops waiting. Tools
 #: have their own timeouts; this is the backstop for one that hangs.
 TOOL_TIMEOUT_S = 120
@@ -934,6 +984,12 @@ class AgentEngine:
         failed: List[str] = []
         errors: List[str] = []
         last_prose = ""
+        #: What has already run this turn: effect identity -> the observation the
+        #: model was shown. This is what lets a repeat of a successful action be
+        #: refused with its earlier result attached, instead of dispatched again.
+        executed: Dict[str, str] = {}
+        #: Calls dispatched so far this turn, for the per-turn budget.
+        dispatched = 0
         #: One correction is allowed for a malformed reply. More than one and a
         #: confused model just burns the budget.
         nagged = False
@@ -1096,6 +1152,7 @@ class AgentEngine:
                         "the model returned a placeholder instead of acting"
                     )
                     await bus.error(answer)
+                answer = self._verify_claims(answer, failed, language, errors)
                 await bus.response_chunk(answer, response_id=response_id)
                 await bus.completed(reason="answered", iterations=iteration)
                 return LoopResult(
@@ -1107,13 +1164,26 @@ class AgentEngine:
                     errors=errors,
                 )
 
+            # Bounds first, and *before* the plan is published: a plan of ten
+            # steps that becomes eight is a promise the turn does not keep.
+            calls, refusals = self._bound_calls(calls, executed, dispatched)
+            dispatched += len(calls)
+            if refusals:
+                errors.append(
+                    f"{len(refusals)} call(s) refused by the turn bounds"
+                )
+
             if iteration == 1 and len(calls) > 1:
                 # A multi-tool opening request is worth surfacing as a plan.
                 await bus.planning([tool_label(c.name, language) for c in calls])
 
             messages.append({"role": "assistant", "content": raw})
 
-            observations: List[str] = []
+            # Refusals join the observations, not a side channel: the model needs
+            # to see why a call did not run, in the same text it reads results
+            # from, or the only "feedback" it gets is silence and it repeats
+            # itself into the next iteration.
+            observations: List[str] = list(refusals)
             # Increment B: safe-tier calls in a batch run concurrently; every
             # confirm/dangerous call is a barrier that runs on its own, in the
             # order the model wrote it. Results are keyed by index and folded
@@ -1147,6 +1217,15 @@ class AgentEngine:
                     tool_names.append(call.name)
                     if not outcome.get("success"):
                         failed.append(call.name)
+                if (
+                    isinstance(outcome, dict)
+                    and outcome.get("success")
+                    and call.name not in REPEAT_SAFE_TOOLS
+                ):
+                    # Only successes are recorded as "done": a failed write must
+                    # stay retryable, or the guard would turn one error into a
+                    # permanently unfixable request.
+                    executed[self._effect_key(call)] = observations[-1]
 
             last_prose = prose
             messages.append({
@@ -1379,6 +1458,106 @@ class AgentEngine:
             failed_calls=[] if ok else [name],
             stopped_reason="fast_path",
         )
+
+    def _bound_calls(
+        self,
+        calls: List["ToolCall"],
+        executed: Dict[str, str],
+        dispatched: int,
+    ) -> Tuple[List["ToolCall"], List[str]]:
+        """Trim one reply's tool calls to the turn's bounds, with reasons.
+
+        Returns ``(to_run, refusals)``. A refusal is text for the *model*, in the
+        same channel as a tool observation — it is the only way the model can
+        change course rather than repeat itself.
+
+        Three separate bounds, in this order, because they catch different
+        failures: an accidental duplicate in one reply (a formatting slip), the
+        same effectful call repeated across replies (which would run it twice),
+        and sheer volume (which is either a loop or an attack on the approval
+        prompt).
+        """
+        kept: List["ToolCall"] = []
+        refusals: List[str] = []
+        seen_here: set = set()
+
+        for call in calls:
+            key = self._effect_key(call)
+            repeat_safe = call.name in REPEAT_SAFE_TOOLS
+
+            if key in seen_here and not repeat_safe:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: the identical call appeared "
+                    "twice in one reply. Running it twice is not what was asked."
+                )
+                continue
+            if not repeat_safe and key in executed:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: this exact action already ran "
+                    f"earlier in this turn and succeeded. Its result was: "
+                    f"{executed[key]}"
+                )
+                continue
+            if len(kept) >= MAX_CALLS_PER_ITERATION:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: a reply may dispatch at most "
+                    f"{MAX_CALLS_PER_ITERATION} calls. Send the rest in your next "
+                    "step if they are still needed."
+                )
+                continue
+            if dispatched + len(kept) >= MAX_CALLS_PER_TURN:
+                refusals.append(
+                    f"{call.describe()} → NOT RUN: this turn has used its whole "
+                    f"budget of {MAX_CALLS_PER_TURN} calls. Summarise what was "
+                    "accomplished instead of continuing."
+                )
+                continue
+            kept.append(call)
+            seen_here.add(key)
+        return kept, refusals
+
+    @staticmethod
+    def _effect_key(call: "ToolCall") -> str:
+        """Identity of a call for duplicate detection: name + canonical params.
+
+        JSON with sorted keys rather than `repr(params)`, because two dicts that
+        differ only in insertion order are the same request, and a model that
+        re-emits a call usually re-emits it in a different order.
+        """
+        try:
+            canonical = json.dumps(
+                call.params or {}, sort_keys=True, ensure_ascii=False, default=str
+            )
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            canonical = repr(sorted((call.params or {}).items()))
+        return f"{call.name}|{canonical}"
+
+    def _verify_claims(
+        self,
+        answer: str,
+        failed: List[str],
+        language: str,
+        errors: List[str],
+    ) -> str:
+        """Never let "Done!" stand unqualified over failed steps.
+
+        Appends rather than replaces: the parts that worked are real, and
+        deleting the model's sentence would hide them. The appended line says
+        which steps did not complete, in the user's language, because that is
+        the difference between a wrong answer and an incomplete one.
+        """
+        if not failed or not answer:
+            return answer
+        if not _SUCCESS_CLAIM.search(answer):
+            return answer
+        steps = ", ".join(dict.fromkeys(failed))
+        note = (
+            f"Note: {len(failed)} step(s) did not complete: {steps}."
+            if language != "ar"
+            else f"ملاحظة: {len(failed)} خطوة ما كملتش: {steps}."
+        )
+        errors.append(f"success claim with {len(failed)} failed step(s)")
+        return f"{answer}\n\n{note}"
 
     async def _run_one(
         self,
