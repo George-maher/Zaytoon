@@ -811,3 +811,63 @@ for a skills directory fed by someone else.
 would have "proved" the tests were vacuous. And three test stubs first failed for a legitimate
 reason the file now encodes: `BaseTool.description`/`execute` are abstract, so a skill stub that
 omits them never reaches the code under test. Both found by running, not by reading.
+
+
+---
+
+## 12. P7.1 result — `fetch_url`, and the address policy it cannot escape (2026-10-11)
+
+**User decisions behind this phase:** research may fetch and loop (plan → search → read →
+follow-up), `ddgs` stays the search provider with no new service required, claims are
+*stamped* rather than refused (`[n]`, retrieved-at, stated method, and an "unverified" label
+instead of deletion), and security skills are **passive by construction** — no port scans,
+no active tools, whatever the authorization story. P7.1 is the piece everything else leans on:
+the new network primitive, since that is the one with a security boundary inside it.
+
+**Files**
+
+| File | What it is |
+| --- | --- |
+| `backend/tools/netguard.py` (new) | URL and address policy: http(s)-only, no credentials in the URL, no whitespace, and **the address class of every resolved answer** refused before connecting — loopback, unspecified, link-local, reserved, multicast, and (unless `FETCH_ALLOW_PRIVATE`) private, with IPv4-mapped and 6to4 literals unwrapped and checked again |
+| `backend/tools/fetch.py` (new) | `fetch_url`: GET only, per-hop redirect revalidation inside a hop budget, `Content-Length` and streamed-byte caps, content-type allow-list, HTML reduced to text, and a framing header on the output |
+| `backend/config.py`, `backend/.env.example` | `FETCH_TIMEOUT_S`, `FETCH_MAX_BYTES`, `FETCH_MAX_CHARS`, `FETCH_MAX_REDIRECTS`, `FETCH_ALLOW_PRIVATE` (55 keys total, all present in `config.py`) |
+| `backend/tools/registry.py` | `fetch` joins `build_default_registry()` |
+| `backend/agents/engine.py` | `fetch_url` added to `REPEAT_SAFE_TOOLS` (P5's dedupe must not serve a truncated stale copy in place of a re-read) |
+| `AGENTS.md` | the tier table's `safe` row, the file tree, and a paragraph explaining why a dialog is the wrong guard here |
+
+**Three bugs found while writing it, all real:**
+
+1. `pypi.org:443/project/httpx` — a dot is legal in a scheme name, so RFC-grammar scheme
+   detection read `pypi.org` as the *scheme* and refused an ordinary URL. The fix
+   recognises `host:port[/…]` explicitly instead of switching to a `"://"` test, which
+   would have accepted `javascript:alert(1)`. A refused-URL test for `localhost:8080`
+   pins the other side.
+2. Spending the redirect budget fell through to rendering the last 302 — an empty body —
+   as a **successful** read, handing the model a blank page it could cite. It is now a
+   stated failure that names the last location.
+3. `ToolResult.fail(error, output="")` takes `output` second, not `data`: four call sites
+   were passing metadata dicts into `output`. Only visible by reading the constructor, so
+   failure metadata now goes through the explicit constructor.
+
+**Tier decision, recorded because it looks wrong at first glance:** `fetch_url` is `safe`.
+The protection is the address policy, not a prompt; a confirmation on every page read is
+clicked through within a day and then guards nothing. It is asserted in a test
+(`test_registered_in_the_default_registry_as_safe`) so a future "gate all network tools"
+sweep has to pass through here and decide on purpose.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/test_fetch_url.py` | **55 passed, 2 skipped** in 0.6 s, with `-W error::PytestUnraisableExceptionWarning -W error::RuntimeWarning` |
+| Live pair, opt-in (`ZAYTOON_LIVE_NET=1`) | **2 passed** — a real fetch of `pypi.org/simple/httpx/` (status 200, 54 373 bytes read, 600 kept, `retrieved_at` today, framing header present) and `http://127.0.0.1:11434/api/tags` refused as loopback **through the tool** |
+| Shorthand loopback forms | `127.1`, `0x7f000001`, `2130706433` all resolve via glibc to `127.0.0.1` and are refused **by resolved address**, with the resolved value in the message |
+| CI guards | free-only ok, local-first ok, `tests/test_packaging.py` 25 passed |
+| Full backend suite | **2540 passed, 5 skipped, 0 failed** (101 s) — 2485 → 2540 |
+
+**Residual, stated in the code:** DNS rebinding. There is a window between resolving and
+connecting, and httpx 0.28 offers no way to pin a validated IP while still verifying the
+certificate against the hostname, so this is mitigated (short connect timeout, GET only,
+capped body, no execution, refusals reported) rather than eliminated. `FETCH_ALLOW_PRIVATE=false`
+closes the combination that matters — a hostile name resolving to a local service — by
+refusing the local service outright.

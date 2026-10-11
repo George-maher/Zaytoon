@@ -114,6 +114,11 @@ REPEAT_SAFE_TOOLS = frozenset({
     "search_web",
     "process_list",
     "process_logs",
+    # A re-fetch costs one request and has no side effect, and refusing it would
+    # replace a possibly-changed page with the *truncated* text the model already
+    # saw — for research, stale-and-shorter is worse than repeated. The per-reply
+    # and per-turn caps bound how often that can happen.
+    "fetch_url",
     "git_status",
     "git_log",
     "git_diff",

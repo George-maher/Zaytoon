@@ -122,6 +122,8 @@ tools/
 ├── applications.py  # open_app, close_app, resolve_windows_app
 ├── system.py        # get_time, system_info, calculator, get_volume, screenshot
 ├── web.py           # search_web, open_url
+├── netguard.py      # URL + address policy: http(s) only, no internal addresses
+├── fetch.py         # fetch_url: one bounded, guarded, labelled read of a page
 ├── git.py           # status, log, diff, branch_list | add, commit, checkout, push
 ├── coding.py        # create_project, run_npm, run_tests
 ├── media.py         # play_media (media keys)
@@ -413,9 +415,26 @@ writes under `C:\Windows\System32`, killing `explorer.exe`, …), and a static
 
 | Tier | Meaning | Examples |
 |---|---|---|
-| `safe` | runs without asking | `get_time`, `system_info`, `file_read`, `search_web`, `open_app`, `git_status`/`git_log`/`git_diff` |
+| `safe` | runs without asking | `get_time`, `system_info`, `file_read`, `search_web`, `fetch_url`, `open_app`, `git_status`/`git_log`/`git_diff` |
 | `confirm` | always asks, whatever the arguments | `file_write`, `create_folder`, `run_npm`, `system_command` (any command), `type_text`, `key_press`, `git_commit` |
 | `dangerous` | asks, and is often refused outright | `file_delete`, `delete_folder`, `registry_write`, `run_code`, plus argument-dependent escalation (killing a system-critical process) |
+
+**`fetch_url` is `safe` because a dialog would be the wrong guard.** A tool that reads
+one URL on the model's word can be pointed at the machine itself — Ollama on
+`127.0.0.1:11434`, a router admin page, and on a cloud VM `169.254.169.254`, which hands
+out credentials. What refuses those is `tools/netguard.py`: http(s) only (with `host:443/path`
+recognised as a host rather than a scheme, and `javascript:`/`data:` still refused), no
+credentials in the URL, no whitespace, and **the address class of every resolved answer**
+checked before connecting — so `127.1`, `0x7f000001`, `2130706433`, `::ffff:127.0.0.1` and
+`127.0.0.1.nip.io` are all caught by what they resolve to, not by how they are spelled —
+re-applied to **every redirect hop**. `FETCH_ALLOW_PRIVATE` opens the LAN and *still* refuses
+link-local. A body is capped in bytes, rendered to text, and prefixed with a header saying it
+is untrusted data and not instructions, because the payload that matters in a fetched page is
+prose. Prompting per page instead would train the user to click through it. Known residual:
+DNS rebinding (see the module docstring — httpx cannot pin a validated IP and verify the
+certificate at once, so this is mitigated, not eliminated). Tests: `tests/test_fetch_url.py`,
+including an opt-in live pair (`ZAYTOON_LIVE_NET=1`) that fetches a real page and asserts the
+local Ollama port is unreachable through the tool.
 
 **Two invariants are enforced structurally, and both are tested:**
 

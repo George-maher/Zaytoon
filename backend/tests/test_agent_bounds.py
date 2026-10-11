@@ -243,6 +243,9 @@ class TestDuplicateSideEffects:
         """
         assert "open_app" not in engine_mod.REPEAT_SAFE_TOOLS
         assert "process_logs" in engine_mod.REPEAT_SAFE_TOOLS
+        # Pinned as a decision, not an accident: re-reading a page is allowed
+        # because a stale truncated copy is a worse answer than a second request.
+        assert "fetch_url" in engine_mod.REPEAT_SAFE_TOOLS
         assert engine_mod.REPEAT_SAFE_TOOLS.isdisjoint({"open_app", "screenshot"})
 
 

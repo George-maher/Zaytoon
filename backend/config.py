@@ -603,6 +603,26 @@ class Config:
         "TOOL_ALWAYS_CONFIRM", "run_code,file_delete,registry_write"
     )
 
+    # ------------------------------------------------------------------
+    # Web fetch (`fetch_url`) — the only place the assistant reads a remote
+    # body. Caps, not preferences: raising any of them widens what a fetched
+    # page can do to this machine, so they are stated here and tested.
+    # ------------------------------------------------------------------
+    #: Seconds before a fetch is abandoned (connection is capped at 6 of these).
+    FETCH_TIMEOUT_S: float = _env_float("FETCH_TIMEOUT_S", 12.0)
+    #: Bytes read from the wire. Beyond this the response is refused, not kept.
+    FETCH_MAX_BYTES: int = _env_int("FETCH_MAX_BYTES", 512_000)
+    #: Characters of extracted text handed on. `agents/engine.py` shows a tool
+    #: the first 4 000 characters of an observation either way.
+    FETCH_MAX_CHARS: int = _env_int("FETCH_MAX_CHARS", 4_000)
+    #: Redirect hops followed, each one re-checked against the address policy.
+    FETCH_MAX_REDIRECTS: int = _env_int("FETCH_MAX_REDIRECTS", 3)
+    #: Allow private/loopback addresses. Off: the machine's own services (Ollama
+    #: on 127.0.0.1, a router admin page, a database HTTP port) are then not
+    #: readable through a model-supplied URL. Link-local stays refused whatever
+    #: this says, because 169.254.169.254 is cloud credentials, not a LAN device.
+    FETCH_ALLOW_PRIVATE: bool = _env_bool("FETCH_ALLOW_PRIVATE", False)
+
     #: Refuse to load a skill tool that needs a permission its manifest did not
     #: ask for, instead of reporting the mismatch and loading it. Off by default:
     #: the report is the product behaviour (a skill author gets a precise warning),
