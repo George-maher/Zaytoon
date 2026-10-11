@@ -103,7 +103,19 @@ jobs:
         run: docker compose build backend
 
       - name: Run tests
-        run: python -m pytest tests/ -q --maxfail=1
+        # `-p ci_annotate` prints every failure as a `::error` workflow command,
+        # which lands in the check annotations — the one channel that survives
+        # when a job's log body is served from somewhere the reader cannot
+        # reach. It changed nothing about the run except its exit cost: `--maxfail`
+        # was 1 (abort on the first failure), and with the annotator in place a
+        # first-and-only failure names one test per run, so each red leg cost a
+        # full queue cycle to learn. 40 still aborts a broken leg early and
+        # reports every distinct breakage in one pass. `tests/test_ci_annotator.py`
+        # pins the plugin, including that it cannot be injected through an
+        # assertion message and that it changes no result.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github
+        run: python -m pytest tests/ -q --maxfail=40 -p ci_annotate
 
       - name: Live smoke check (free-only, voice routing, sandbox)
         run: python scripts/verify_final.py
@@ -172,7 +184,11 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run desktop shell tests
-        run: python -m pytest tests/ -q
+        # Same annotator as the backend leg; this job is Windows-only, which is
+        # exactly the host whose failures have been unreadable.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.github
+        run: python -m pytest tests/ -q -p ci_annotate
 
       # The PyInstaller build is deliberately not run here: it takes several
       # minutes and needs the GUI dependencies. `check_prerequisites()` is the

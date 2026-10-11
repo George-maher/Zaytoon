@@ -1291,3 +1291,29 @@ no target, so the image could not build at all), the HTTP→HTTPS redirect follo
 build-time `HTTPS_PORT` that compose sets to the published port, and the healthcheck
 stops failing on its own self-signed certificate. See `DEPLOYMENT.md`; the image has
 **not** been built here, because there is no Docker in this sandbox.
+
+### 17.8 Making the red legs readable (`.github/ci_annotate.py`)
+
+The three remaining reds were not diagnosable because a job's log body is served from a host
+this environment cannot reach, while its **check annotations** are readable through the Checks
+API — and a failing pytest step annotates nothing but `Process completed with exit code 1`. So
+CI was taught to speak through the channel that works: a pytest plugin prints every failure as
+a `::error file=…,line=…,title=…::<message>` workflow command, and the backend and desktop legs
+load it with `-p ci_annotate`.
+
+Two properties worth naming, because both were found the hard way:
+
+- The command is written **on a line of its own** (a leading newline). Under `pytest -q` the
+  reporter interleaves progress characters with output, and `F::error …` is invisible to the
+  runner's line-anchored matcher — the diagnostic would sit in the log, unread, exactly like the
+  traceback it replaces.
+- `--maxfail` went 1 → 40. With one failure per run, each red leg costs a full queue cycle to
+  learn a single test name; 40 still aborts a broken leg early and reports every distinct
+  breakage in one pass.
+
+`backend/tests/test_ci_annotator.py` (5 tests) pins the whole mechanism: a failing test annotated
+with file and line, a green run emitting only the host fingerprint `::notice`, a collection error
+annotated, the cap honoured at 40 — and that an assertion message containing
+`\n::error title=pwned::` produces exactly one command line, because `%`/CR/LF (and `,`/`:` inside
+parameters) are escaped. Model- and user-controlled text reaches these messages through
+assertions, so the plugin must not be an injection point into the build log.
