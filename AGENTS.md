@@ -896,8 +896,19 @@ generations means worse answers and a real chance of an OOM-killed daemon.
 `scripts/measure_fast_path.py` prints both measurements (fast path: 64 model calls
 → 0, p50 1813 ms → 8 ms against a simulated 900 ms provider).
 
-Three properties are load-bearing, and each has a test in
-`tests/test_agent_engine.py`:
+**A turn has a contract, not just an iteration cap** (`agents/engine.py`).
+`MAX_CALLS_PER_ITERATION` (8) bounds what one reply may dispatch and `MAX_CALLS_PER_TURN`
+(24) bounds the turn; refused calls come back to the model as *observations* (with the
+earlier result attached), never as silence, because silence is what makes a model repeat
+itself. An identical `(name, canonical params)` call that already **succeeded** this turn is
+refused unless the tool is in `REPEAT_SAFE_TOOLS` — a **deny-by-default allow-list**, so any
+unknown or future tool is assumed to have effects (`open_app` is tier `safe`, so nothing else
+would stop a second launch). A final answer that claims success (`Done`, `successfully`, `تم`)
+while steps failed gets the unfinished steps appended to it, in the user's language: qualified,
+never deleted. Tests: `tests/test_agent_bounds.py`; removing any of the three guards reddens it.
+
+Three properties of the dispatch path are load-bearing, and each has a test in
+`tests/test_fast_path.py`:
 
 - **Bounded.** `max_iterations` is a hard ceiling, and hitting it is a *reported*
   outcome (`stopped_reason == "max_iterations"`), not an error.

@@ -708,3 +708,57 @@ and 89 s.
 Agent-contract hardening: planning bounds, result verification, duplicate
 side-effect prevention — the reminder work in §8 fixed the scheduler's version of
 that; the engine's turn-level version is next.
+
+
+---
+
+## 10. P5 result — the turn contract (2026-10-11)
+
+**Shipped:** three things the loop asserted but did not enforce, all in
+`backend/agents/engine.py`, plus 18 tests in `backend/tests/test_agent_bounds.py`.
+
+| Gap found by reading `run()` | Fix |
+| --- | --- |
+| one reply could dispatch an unlimited number of calls | `MAX_CALLS_PER_ITERATION = 8`, `MAX_CALLS_PER_TURN = 24`; excess is *reported* to the model as an observation, never dropped |
+| a call that already succeeded could run again | `_bound_calls` refuses a repeat of the same `(name, canonical JSON params)` effect unless the tool is in `REPEAT_SAFE_TOOLS`; only successes are remembered, so a failed action stays retryable |
+| "Done ✅" shipped over three `FAILED` observations | `_verify_claims` appends "N step(s) did not complete: …" in the user's language when the prose claims success and `failed` is non-empty, and records it in `LoopResult.errors` |
+
+**Why the duplicate guard belongs here:** `open_app` is tier `safe`, so the approval gate
+never stops it. A model that re-emitted its own call would really launch the app twice —
+the same class of bug as the reminder reschedule in §8 (an action with two owners, a state
+change the model gets for free by asking again).
+
+**Deny-by-default must not be inverted.** `REPEAT_SAFE_TOOLS` lists tools *known* to be
+harmless to repeat (`get_time`, `process_logs`, `file_read`, the git readers). Everything
+else, including every tool added later, is treated as effectful. `test_the_repeat_safe_set_is_an_explicit_allow_list`
+pins that shape, because flipping it into a deny-list of "dangerous" names would hand every
+future tool the assumption that running it twice is fine.
+
+**Audited and left alone:** observation length is already capped (`MAX_OBSERVATION_CHARS`,
+4 000, with a truncation notice), and `max_iterations` is genuinely enforced with an honest
+`stopped_reason` that `chatml.format_transcript` renders as a visible notice. Both were
+verified rather than assumed.
+
+**Verification**
+
+| Check | Result |
+| --- | --- |
+| `pytest tests/test_agent_bounds.py` | **18 passed** in 0.4 s |
+| mutation control (remove per-reply bound / disable duplicate guard / disable claim verification) | **2 tests red each** — all three guards load-bearing |
+| full backend suite | **2446 → 2464 passed, 3 skipped, 0 failed** (101 s) |
+
+**Two operational lessons, recorded because neither was a code bug.**
+
+1. The new tests failed at first for an honest reason worth repeating: `"open spotify"` is
+   answered by the P4 fast path *before the loop runs*, so a bounds test posting it asserts
+   nothing about the loop. Fixed with the same documented isolation fixture
+   `tests/test_agent_engine.py` uses (and a fixture in the other direction already covers the
+   shortcut), not by loosening an assertion.
+2. **Mid-phase the sandbox was rebuilt from the base commit**: `backend/.venv` and
+   `frontend/node_modules` vanished, the local branch was rewound to `a01c7c9`, and 11
+   previously-committed new files were missing from the worktree. The pushed tip was the only
+   complete copy; recovery was `git fetch` → `git reset --mixed 8170b3d` → `git checkout --`
+   of the missing paths, leaving the uncommitted P5 work intact (verified with
+   `git diff --name-status FETCH_HEAD` before and `git status` after). One test run also hung
+   for 600 s during that churn and never reproduced. **Rule for later phases: commit and push
+   before starting work — untracked files here are not durable.**
