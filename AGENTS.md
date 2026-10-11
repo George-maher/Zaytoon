@@ -1069,6 +1069,7 @@ the `message` frame that has to land first.
 | `tool_started` | `{"type":"tool_started","name","label","response_id"}` | Server → Client |
 | `tool_progress` | `{"type":"tool_progress","name","message"}` | Server → Client |
 | `tool_finished` | `{"type":"tool_finished","name","success","summary"}` | Server → Client |
+| `sources` | `{"type":"sources","sources":[{"n","kind","url","host","title","retrieved_at"}]}` (≤12, after the prose) | Server → Client |
 | `error` | `{"type":"error","content":"..."}` | Server → Client |
 | `stt_result` | `{"type":"stt_result","language","voice","duration"}` | Server → Client |
 | `audio_start` | `{"type":"audio_start","language","voice","format":"mpeg"}` | Server → Client |

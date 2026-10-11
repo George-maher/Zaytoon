@@ -927,3 +927,37 @@ REST/WS payloads, and there is no Sources panel in the dock. That is P7.3 (UI), 
 the multi-query research loop's prompt guidance for the ledger. `SettingsPanel` still ignores
 `llm.probe`; R5/R6 deferred; the intermittent 1-warning unraisable in full-suite runs is
 carried forward as a known flake (0–2 warnings across runs, no test depends on it).
+
+
+---
+
+## 14. P7.3 + P7.4 result — sources on the wire, and when to go read something (2026-10-11)
+
+**P7.3 (transport).** `AgentEventType.SOURCES` + `EventBus.sources()`, emitted once after the
+final prose, mapping in `_ProgressRelay` to `{"type": "sources", "sources": [...]}`, capped at
+the same 12 the prompt block uses. **Nothing is gained by removing the text appendix** — the
+prose carries the sources so every client (web, desktop, voice) shows them; the frame exists so
+a client that wants a citation popover or panel does not parse prose back apart. A client that
+predates the frame ignores an unknown `type`, which is the whole reason this is additive rather
+than a protocol change.
+
+**P7.4 (prompt).** Both system prompts now state the research discipline: search, then **open
+the page** before quoting a number, date, version or name — a snippet is a lead, not a source;
+two or three differently-phrased queries beat one re-run; cite `[n]` from the numbered list the
+model is actually shown; anything it cannot place on it starts with `Unverified:`; never invent
+a citation. The ledger's own block repeats the citation rule per turn, so the one behaviour worth
+being strict about is said twice, while the rest of the answer stays the model's.
+
+**Verification:** +3 tests (`tests/test_sources.py`, 22 total) — frame payload equals
+`LoopResult.sources`; a tool-only turn emits no frame; the relay mapping is driven through the
+real `_ProgressRelay` and asserts the cap and `trace_id`. Full backend suite **2562 passed /
+5 skipped / 0 failed** (98 s). Frontend after the sandbox lost `node_modules`: `npm install`,
+vitest **607 passed / 37 files**, `npm run build` ok — and re-verified after restoring
+`frontend/package-lock.json`, which `npm install` had pruned 30 optional-platform entries from;
+that edit was incidental to a phase about agent events and was reverted (`52ef33d`).
+`AGENTS.md`'s WebSocket table gained its `sources` row; this section's claim about the frontend
+was written before it was true and then made true by running it.
+
+**Roadmap after P7:** P7.5 passive security skills (logs, configs, lockfiles, hashes and
+certificates — no scanners, per the 2026-10-11 decision, and enforced by giving the skills no
+active tool to hold), then P8 (OS matrix, `scripts/e2e_scenarios.py`, final diff review).
