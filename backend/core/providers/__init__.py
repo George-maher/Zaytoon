@@ -16,6 +16,7 @@ from core.providers.client import (
     DiscoveredModel,
     OpenAICompatibleClient,
     ProviderTransportError,
+    canonical_base_url,
 )
 from core.providers.router import (
     Candidate,
@@ -44,6 +45,7 @@ from core.providers.store import (
     get_tier_assignments,
     list_models,
     list_providers,
+    mark_verified,
     resolve_api_key,
     save_model,
     save_provider,
@@ -71,6 +73,7 @@ __all__ = [
     "VALID_KINDS",
     "VALID_TIERS",
     "assert_model_allowed",
+    "canonical_base_url",
     "capabilities_of",
     "default_provider",
     "delete_model",
@@ -82,6 +85,7 @@ __all__ = [
     "has_all",
     "list_models",
     "list_providers",
+    "mark_verified",
     "missing",
     "normalise",
     "plan",

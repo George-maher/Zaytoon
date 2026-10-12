@@ -241,6 +241,28 @@ _MIGRATIONS: List[str] = [
     ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER;
     ALTER TABLE tasks ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;
     """,
+
+    # -- 3: per-provider timeout, org identifier, verification, catalog ----
+    # Provider options the settings form can set without a code change:
+    #
+    # * ``timeout_s`` — a request timeout per provider (0/NULL = the client
+    #   default): a slow local daemon and a fast hosted API do not want one
+    #   number. §2A asks for it explicitly.
+    # * ``org_id`` — an OpenAI ``OpenAI-Organization`` header for endpoints
+    #   that bill or scope by organisation. Not a credential: it is returned
+    #   by ``GET /providers`` like every other non-secret field.
+    # * ``verified_at`` — when a connectivity test last *passed*. The UI must
+    #   never show a success it did not measure, and "verified 2 minutes ago"
+    #   is a measurement; a provider row without one is unverified.
+    # * ``models.metadata_json`` — catalog metadata that has no natural
+    #   column (pricing, supported_parameters): kept as JSON rather than
+    #   flattened into columns that would need another migration per vendor.
+    """
+    ALTER TABLE providers ADD COLUMN timeout_s REAL;
+    ALTER TABLE providers ADD COLUMN org_id TEXT;
+    ALTER TABLE providers ADD COLUMN verified_at TEXT;
+    ALTER TABLE models ADD COLUMN metadata_json TEXT;
+    """,
 ]
 
 

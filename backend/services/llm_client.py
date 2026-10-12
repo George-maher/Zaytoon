@@ -788,7 +788,9 @@ class LLMClient:
 
         api_key = await resolve_api_key(decision.provider_id)
         transport = OpenAICompatibleClient(
-            decision.base_url, api_key=api_key, timeout=self.timeout
+            decision.base_url, api_key=api_key,
+            timeout=decision.timeout_s or self.timeout,
+            org_id=decision.org_id,
         )
         try:
             for candidate in decision.usable:
@@ -909,7 +911,9 @@ class LLMClient:
 
         api_key = await resolve_api_key(decision.provider_id)
         transport = OpenAICompatibleClient(
-            decision.base_url, api_key=api_key, timeout=self.timeout
+            decision.base_url, api_key=api_key,
+            timeout=decision.timeout_s or self.timeout,
+            org_id=decision.org_id,
         )
         last_partial = ""
         try:

@@ -26,6 +26,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -41,6 +42,31 @@ DISCOVERY_TIMEOUT = 10.0
 #: stalled. A model that opens the stream and then thinks for three minutes is
 #: still working; one that never writes a byte is not.
 STREAM_IDLE_TIMEOUT = 90.0
+
+
+def canonical_base_url(url: str) -> str:
+    """The endpoint shaped the way this client will join it.
+
+    The client always appends ``/v1/...`` — the OpenAI convention lives in
+    the *path*, so ``base_url`` is an origin plus any real prefix, never its
+    own ``/v1``. Users paste what their provider documents
+    (``https://openrouter.ai/api/v1``), and un-canonicalised that requests
+    ``.../api/v1/v1/models`` and returns a 404 that reads like a broken
+    endpoint rather than a pasted URL.
+
+    Parsed, not string-sliced: ``http://v1`` is a *host* called ``v1``, and
+    stripping a trailing ``/v1`` off it would corrupt the authority.
+    """
+    clean = (url or "").strip().rstrip("/")
+    if not clean:
+        return clean
+    parts = urlsplit(clean)
+    path = parts.path.rstrip("/")
+    if path.lower().endswith("/v1"):
+        path = path[: -len("/v1")]
+    return urlunsplit(
+        (parts.scheme, parts.netloc, path, parts.query, parts.fragment)
+    )
 
 
 class ProviderTransportError(RuntimeError):
@@ -89,24 +115,30 @@ class OpenAICompatibleClient:
         timeout: float = DEFAULT_TIMEOUT,
         kind: str = "openai_compatible",
         transport: Optional[httpx.BaseTransport] = None,
+        org_id: Optional[str] = None,
     ) -> None:
         # ``transport`` is a test seam (httpx.MockTransport), the same shape
         # ``tools/fetch.py`` uses: adapter request/response behaviour must be
         # provable without a live endpoint or a network.
-        self.base_url = base_url.rstrip("/")
+        self.base_url = canonical_base_url(base_url)
         self.kind = kind
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
-            headers=self._headers(api_key),
+            headers=self._headers(api_key, org_id),
             transport=transport,
         )
 
     @staticmethod
-    def _headers(api_key: Optional[str]) -> Dict[str, str]:
+    def _headers(api_key: Optional[str], org_id: Optional[str] = None) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        if org_id:
+            # OpenAI's organisation header, for endpoints that bill or scope
+            # by org. An identifier, not a credential — but still supplied by
+            # the backend, never the frontend, so it travels only server-side.
+            headers["OpenAI-Organization"] = str(org_id)
         return headers
 
     # -- discovery --------------------------------------------------------
@@ -344,7 +376,10 @@ def _classify(status: int, body: bytes) -> ProviderTransportError:
     elif status == 401:
         hint = " (the endpoint rejected the API key)"
     elif status == 404:
-        hint = " (no such endpoint or model — check the base URL and model id)"
+        hint = (
+            " (no such endpoint or model — check the model id; Zaytoon adds "
+            "/v1 to the base URL itself)"
+        )
     return ProviderTransportError(
         f"HTTP {status}{hint}: {text or '(empty body)'}", status=status, retryable=retryable
     )

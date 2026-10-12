@@ -16,6 +16,7 @@ from core.providers import (
     has_all,
     list_models,
     list_providers,
+    mark_verified,
     missing,
     normalise,
     plan,
@@ -100,6 +101,42 @@ class TestProviderValidation:
     def test_an_over_long_name_is_refused(self):
         with pytest.raises(ProviderError, match="80 characters"):
             validate_provider("x" * 100, "ollama", "http://x", False)
+
+    def test_a_pasted_trailing_v1_is_canonicalised(self):
+        """The client appends /v1 itself; storing a pasted /v1 doubles it.
+
+        Measured: base ``…/api/v1`` + client path ``/v1/models`` joined to
+        ``…/api/v1/v1/models`` — a 404 that reads like a broken endpoint
+        rather than a pasted URL.
+        """
+        result = validate_provider(
+            "OpenRouter", "openrouter", "https://openrouter.ai/api/v1/", False
+        )
+        assert result["base_url"] == "https://openrouter.ai/api"
+
+        result = validate_provider(
+            "X", "openai_compatible", "https://api.example.com/v1", False
+        )
+        assert result["base_url"] == "https://api.example.com"
+
+    def test_a_host_named_v1_is_not_stripped(self):
+        """``http://v1`` is a host called v1, not a path."""
+        result = validate_provider("X", "ollama", "http://v1", False)
+        assert result["base_url"] == "http://v1"
+
+    def test_a_real_prefix_is_kept(self):
+        result = validate_provider(
+            "X", "openai_compatible", "http://gateway.local/ai", False
+        )
+        assert result["base_url"] == "http://gateway.local/ai"
+
+    def test_a_query_or_fragment_is_refused(self):
+        """httpx joins base paths by raw concatenation, so a query on the
+        base would be swallowed into the first appended segment."""
+        with pytest.raises(ProviderError, match="query string or fragment"):
+            validate_provider("X", "ollama", "http://x/v1?token=1", False)
+        with pytest.raises(ProviderError, match="query string or fragment"):
+            validate_provider("X", "ollama", "http://x/#frag", False)
 
 
 class TestFreeOnlyPolicy:
@@ -234,6 +271,41 @@ class TestProviderCrud:
 
     async def test_no_provider_is_none(self, temp_core_db, temp_secrets):
         assert await default_provider() is None
+
+    async def test_timeout_and_org_round_trip(self, temp_core_db, temp_secrets):
+        provider = await make_provider(
+            "Hosted", kind="openai_compatible", url="https://api.example.com",
+            timeout_s=30.5, org_id="org-abc",
+        )
+        assert provider["timeout_s"] == 30.5
+        assert provider["org_id"] == "org-abc"
+        # Unverified until a real test passes — never a default "connected".
+        assert provider["verified_at"] is None
+
+        reread = await get_provider(provider["id"])
+        assert reread["timeout_s"] == 30.5
+        assert reread["org_id"] == "org-abc"
+
+    async def test_a_bad_timeout_is_refused(self, temp_core_db, temp_secrets):
+        for bad in (0, -5, 700, "abc"):
+            with pytest.raises(ProviderError, match="timeout_s"):
+                await make_provider("T", url="http://x", timeout_s=bad)
+
+    async def test_an_empty_org_clears_the_value(self, temp_core_db, temp_secrets):
+        provider = await make_provider("O", url="http://x", org_id="org-keep")
+        cleared = await save_provider(
+            provider_id=provider["id"], name="O", kind="ollama",
+            base_url="http://x", org_id="  ",
+        )
+        assert cleared["org_id"] is None
+
+    async def test_mark_verified_records_a_pass_only(self, temp_core_db, temp_secrets):
+        provider = await make_provider("V", url="http://x")
+        assert provider["verified_at"] is None
+
+        stamp = await mark_verified(provider["id"])
+        reread = await get_provider(provider["id"])
+        assert reread["verified_at"] == stamp
 
 
 class TestModels:
@@ -430,6 +502,26 @@ class TestRouting:
         provider = await make_provider()
         await save_model(provider["id"], "m", capabilities=["chat"])
         json.dumps((await plan(required=["chat"])).to_dict())
+
+    async def test_the_plan_carries_the_provider_settings(self, temp_core_db, temp_secrets):
+        """timeout_s/org_id travel with the decision the router made.
+
+        The transport that answers the request must be configured from the
+        *same* row the router chose — a default the two disagree about is how
+        one provider gets contacted with another's settings.
+        """
+        provider = await make_provider(
+            "Hosted", kind="openai_compatible", url="https://api.example.com",
+            timeout_s=42.0, org_id="org-x",
+        )
+        await save_model(provider["id"], "m1", capabilities=["chat"])
+
+        decision = await plan(required=["chat"])
+
+        assert decision.provider_id == provider["id"]
+        assert decision.timeout_s == 42.0
+        assert decision.org_id == "org-x"
+        assert decision.to_dict()["timeout_s"] == 42.0
 
 
 class TestTierAssignments:

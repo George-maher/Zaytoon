@@ -21,6 +21,7 @@ from core.providers import (
     get_tier_assignments,
     list_models,
     list_providers,
+    mark_verified,
     plan,
     provider_health,
     refresh_models,
@@ -213,6 +214,8 @@ async def provider_create(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             api_key=data.get("api_key"),
             enabled=bool(data.get("enabled", True)),
             is_default=bool(data.get("is_default", False)),
+            timeout_s=data.get("timeout_s"),
+            org_id=data.get("org_id"),
         )
     except ProviderError as exc:
         raise HTTPException(422, str(exc)) from exc
@@ -238,10 +241,17 @@ async def provider_delete(provider_id: str) -> Dict[str, Any]:
 
 @providers_router.post("/providers/{provider_id}/test")
 async def provider_test(provider_id: str) -> Dict[str, Any]:
-    """Probe the endpoint. Reports reachability, latency and what it offers."""
+    """Probe the endpoint. Reports reachability, latency and what it offers.
+
+    A pass is *recorded* (``verified_at``): this is the only thing that may
+    move a provider from "unverified" to "verified", and the UI must never
+    show a success that no real test produced.
+    """
     result = await provider_health(provider_id)
     # A failed probe is a 200 with `connected: false`, not a 500: the endpoint
     # being down is the answer, and the UI needs the reason text, not a stack.
+    if result.get("connected") and result.get("provider_id"):
+        result["verified_at"] = await mark_verified(result["provider_id"])
     return result
 
 

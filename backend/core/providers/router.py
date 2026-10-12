@@ -98,6 +98,13 @@ class RoutingPlan:
     provider_name: Optional[str] = None
     model: Optional[str] = None
     base_url: Optional[str] = None
+    #: Per-provider request timeout and org header (NULL = client default /
+    #: none). They travel with the decision so the transport that answers this
+    # request is configured from the *same* row the router chose — a default
+    # the router and the client disagree about is how one provider ends up
+    # being contacted with another's settings.
+    timeout_s: Optional[float] = None
+    org_id: Optional[str] = None
     forced: bool = False
     #: How the model was chosen: ``tier`` (a pinned tier assignment),
     #: ``forced`` (per-request override) or ``priority`` (ordinary ordering).
@@ -115,6 +122,7 @@ class RoutingPlan:
             "provider_id": self.provider_id,
             "model": self.model,
             "base_url": self.base_url,
+            "timeout_s": self.timeout_s,
             "forced": self.forced,
             "source": self.source,
             "required_capabilities": list(self.required_capabilities),
@@ -194,6 +202,8 @@ async def plan(
     decision.provider_id = provider["id"]
     decision.provider_name = provider["name"]
     decision.base_url = provider["base_url"]
+    decision.timeout_s = provider.get("timeout_s")
+    decision.org_id = provider.get("org_id")
 
     # An override is the user's explicit instruction. It is honoured even if the
     # recorded capabilities do not match, and the plan says "forced" so the
@@ -330,7 +340,7 @@ async def refresh_models(provider_id: str) -> Dict[str, Any]:
     against every provider would be a request the user did not ask for, and a
     local daemon that is asleep would fail it every time.
     """
-    from core.providers.client import OpenAICompatibleClient
+    from core.providers.client import DEFAULT_TIMEOUT, OpenAICompatibleClient
     from core.providers.store import resolve_api_key
 
     provider = await get_provider(provider_id)
@@ -342,6 +352,8 @@ async def refresh_models(provider_id: str) -> Dict[str, Any]:
         provider["base_url"],
         api_key=key,
         kind=provider["kind"],
+        timeout=float(provider.get("timeout_s") or DEFAULT_TIMEOUT),
+        org_id=provider.get("org_id"),
     )
     try:
         discovered = await client.list_models()
@@ -392,7 +404,7 @@ async def _save_discovered(provider: Dict[str, Any], model, priority: int) -> bo
 
 async def provider_health(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Test an endpoint's reachability. What the "Test connection" button calls."""
-    from core.providers.client import OpenAICompatibleClient
+    from core.providers.client import DEFAULT_TIMEOUT, OpenAICompatibleClient
     from core.providers.store import resolve_api_key
 
     provider = await get_provider(provider_id) if provider_id else await default_provider()
@@ -400,7 +412,13 @@ async def provider_health(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return {"connected": False, "error": "No provider configured", "models": []}
 
     key = await resolve_api_key(provider["id"]) if provider["requires_key"] else None
-    client = OpenAICompatibleClient(provider["base_url"], api_key=key, kind=provider["kind"])
+    client = OpenAICompatibleClient(
+        provider["base_url"],
+        api_key=key,
+        kind=provider["kind"],
+        timeout=float(provider.get("timeout_s") or DEFAULT_TIMEOUT),
+        org_id=provider.get("org_id"),
+    )
     try:
         result = await client.health()
     finally:

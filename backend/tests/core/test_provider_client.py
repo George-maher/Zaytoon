@@ -236,3 +236,85 @@ async def test_stream_without_sink_yields_the_rendered_call():
     assert deltas and all("\n" in d or d.startswith('{"') for d in deltas)
     calls, _ = extract_tool_calls("".join(deltas))
     assert calls[0].name == "get_time"
+
+
+# ---------------------------------------------------------------------------
+# URL joining: what actually goes on the wire
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "base,expected",
+    [
+        # Origin forms — the client appends /v1 itself.
+        ("http://localhost:11434", "http://localhost:11434/v1/chat/completions"),
+        ("http://localhost:11434/", "http://localhost:11434/v1/chat/completions"),
+        # Pasted exactly as a provider documents it: /v1 is stripped once,
+        # not doubled. This is the measured defect (…/api/v1/v1/models → 404).
+        ("https://openrouter.ai/api/v1",
+         "https://openrouter.ai/api/v1/chat/completions"),
+        ("https://api.example.com/v1",
+         "https://api.example.com/v1/chat/completions"),
+        ("https://api.example.com/v1/",
+         "https://api.example.com/v1/chat/completions"),
+        # A real prefix that is not a version suffix stays intact.
+        ("https://host.example/prefix",
+         "https://host.example/prefix/v1/chat/completions"),
+        # A host *called* v1 is not a path.
+        ("http://v1", "http://v1/v1/chat/completions"),
+    ],
+)
+async def test_url_join_matrix(base, expected):
+    """The joined request URL is decided by canonicalisation, not by luck."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return chat_response({"content": "ok"})
+
+    client = OpenAICompatibleClient(base, transport=httpx.MockTransport(handler))
+    text = await client.complete(MESSAGES, model="m")
+
+    assert text == "ok"
+    assert seen["url"] == expected
+
+
+async def test_classify_404_explains_the_v1_convention():
+    """A 404 must say how the base URL is joined, not just that it failed."""
+    from core.providers.client import _classify
+
+    error = _classify(404, b"{}")
+    assert "/v1" in str(error)
+    assert "base URL" in str(error)
+
+
+# ---------------------------------------------------------------------------
+# Organization header (§2A: identifier "when applicable")
+# ---------------------------------------------------------------------------
+async def test_the_org_header_is_sent_when_configured():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["org"] = request.headers.get("openai-organization")
+        return chat_response({"content": "ok"})
+
+    client = OpenAICompatibleClient(
+        "https://api.example.com", org_id="org-42",
+        transport=httpx.MockTransport(handler),
+    )
+    await client.complete(MESSAGES, model="m")
+
+    assert seen["org"] == "org-42"
+
+
+async def test_no_org_header_by_default():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["org"] = request.headers.get("openai-organization")
+        return chat_response({"content": "ok"})
+
+    client = OpenAICompatibleClient(
+        "https://api.example.com", transport=httpx.MockTransport(handler),
+    )
+    await client.complete(MESSAGES, model="m")
+
+    assert seen["org"] is None

@@ -24,11 +24,13 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from common.reporting import safe_error
 from core import db
 from core.events import CoreEventType, bus
 from core.providers.capabilities import DEFAULT_CAPABILITIES, normalise
+from core.providers.client import canonical_base_url
 from core.secrets import delete_secret, get_secret, has_secret, set_secret
 
 logger = logging.getLogger("Zaytoon.Core.Providers.Store")
@@ -84,7 +86,7 @@ def validate_provider(
             f"'kind' must be one of: {', '.join(VALID_KINDS)} (got {kind!r})"
         )
 
-    url = (base_url or "").strip().rstrip("/")
+    url = canonical_base_url(base_url)
     if not url:
         raise ProviderError("'base_url' is required")
     if not url.startswith(("http://", "https://")):
@@ -93,8 +95,17 @@ def validate_provider(
         )
     # A key in the URL would end up in the database, in the log line for this
     # row, and in anything that echoes the endpoint back to a client.
-    if "@" in url.split("://", 1)[-1].split("/", 1)[0]:
+    parts = urlsplit(url)
+    if "@" in (parts.netloc or ""):
         raise ProviderError("'base_url' must not embed credentials; use 'api_key'")
+    # httpx joins a relative path onto the base by raw concatenation, so a
+    # query on the base would be swallowed into the first appended segment
+    # (``/v1/chat/completions``), and a fragment never reaches the wire at
+    # all. Neither belongs on an endpoint.
+    if parts.query or parts.fragment:
+        raise ProviderError(
+            "'base_url' must not contain a query string or fragment"
+        )
 
     return {"name": clean_name, "kind": clean_kind, "base_url": url, "requires_key": bool(requires_key)}
 
@@ -182,14 +193,33 @@ async def save_provider(
     api_key: Optional[str] = None,
     enabled: bool = True,
     is_default: bool = False,
+    timeout_s: Optional[float] = None,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create or update a provider.
 
     ``api_key`` is written to the secrets store and **never** returned. An empty
     string is ignored rather than clearing the key, because a client that does
     not have the value to hand should not be able to wipe it by omitting it.
+    ``timeout_s`` of ``None`` means "the client default"; an empty ``org_id``
+    clears the header (unlike the key — an org id is not a secret, and the
+    settings form needs to be able to remove it).
     """
     fields = validate_provider(name, kind, base_url, requires_key)
+
+    timeout = None
+    if timeout_s is not None and str(timeout_s).strip() != "":
+        try:
+            timeout = float(timeout_s)
+        except (TypeError, ValueError):
+            raise ProviderError("'timeout_s' must be a number of seconds")
+        if not 1.0 <= timeout <= 600.0:
+            raise ProviderError("'timeout_s' must be between 1 and 600 seconds")
+
+    org = (org_id or "").strip()
+    if len(org) > 120:
+        raise ProviderError("'org_id' must be 120 characters or fewer")
+
     pid = (provider_id or "").strip() or slugify(fields["name"])
     stamp = _now()
 
@@ -206,17 +236,19 @@ async def save_provider(
         """
         INSERT INTO providers
             (id, name, kind, base_url, requires_key, enabled, is_default,
-             created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+             timeout_s, org_id, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name, kind = excluded.kind,
             base_url = excluded.base_url, requires_key = excluded.requires_key,
             enabled = excluded.enabled, is_default = excluded.is_default,
+            timeout_s = excluded.timeout_s, org_id = excluded.org_id,
             updated_at = excluded.updated_at
         """,
         (
             pid, fields["name"], fields["kind"], fields["base_url"],
             int(fields["requires_key"]), int(bool(enabled)), int(bool(is_default)),
+            timeout, org or None,
             stamp, stamp,
         ),
     )
@@ -286,9 +318,23 @@ def _provider_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "has_api_key": has_secret(row.get("id") or ""),
         "enabled": bool(row.get("enabled")),
         "is_default": bool(row.get("is_default")),
+        "timeout_s": row.get("timeout_s"),
+        "org_id": row.get("org_id"),
+        # When a connectivity test last *passed* — NULL means unverified, and
+        # the UI must not present that as connected.
+        "verified_at": row.get("verified_at"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
+
+
+async def mark_verified(provider_id: str) -> Optional[str]:
+    """Record that a real connectivity test just passed for this provider."""
+    stamp = _now()
+    ok = await db.execute(
+        "UPDATE providers SET verified_at = ? WHERE id = ?", (stamp, provider_id)
+    )
+    return stamp if ok else None
 
 
 # ---------------------------------------------------------------------------
