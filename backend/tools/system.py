@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop
 

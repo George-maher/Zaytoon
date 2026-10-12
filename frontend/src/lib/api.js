@@ -541,12 +541,35 @@ export async function getSkill(name) {
   return data;
 }
 
-/** Create a skill. It lands **disabled** — writing one is not activating it. */
-export async function createSkill(name, { description = "", instructions = "" } = {}) {
+/**
+ * The permission vocabulary a skill manifest may declare.
+ *
+ * Served by the backend rather than hard-coded here: the manifest validator
+ * rejects an unknown name, so a second copy in the client is a list that drifts
+ * into offering the user a permission the backend will refuse.
+ */
+export async function getSkillPermissions() {
+  const res = await fetch(`${API_BASE}/skills/permissions`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { permissions: [], max_enabled: 0, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Create a skill. It lands **disabled** — writing one is not activating it.
+ *
+ * `permissions` is what the skill *declares* it wants; the backend validates it
+ * against the vocabulary above and refuses an unknown name. Declaring is not
+ * granting: enforcement stays in the tool registry's gate.
+ */
+export async function createSkill(
+  name,
+  { description = "", instructions = "", permissions = [], tags = [] } = {},
+) {
   const res = await fetch(`${API_BASE}/skills`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, instructions }),
+    body: JSON.stringify({ name, description, instructions, permissions, tags }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.error || `HTTP ${res.status}` };

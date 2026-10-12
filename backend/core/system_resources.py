@@ -25,7 +25,7 @@ import platform
 import sys
 import shutil
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 #: ``(monotonic_ts, total_ticks, busy_ticks)`` of the previous CPU reading.
 

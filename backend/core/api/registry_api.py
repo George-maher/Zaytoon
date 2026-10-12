@@ -61,6 +61,31 @@ async def skills_list() -> Dict[str, Any]:
     return await list_skills()
 
 
+@skills_router.get("/skills/permissions")
+async def skills_permissions() -> Dict[str, Any]:
+    """The permission vocabulary a skill manifest may declare.
+
+    Declared *before* ``/skills/{name}`` on purpose: FastAPI matches routes in
+    declaration order, so with the parameterised route first this path would be
+    read as a skill literally named "permissions" and answer 404.
+
+    The list is served from ``ALL_PERMISSIONS`` rather than restated in the
+    client, so the picker in the Skills page cannot drift from what the
+    manifest validator accepts — the drift failure mode being a user choosing
+    a permission the backend then rejects with a message about a name they
+    never typed.
+    """
+    from core.permissions import ALL_PERMISSIONS
+
+    return {
+        "permissions": [
+            {"name": permission.value, "label": permission.label}
+            for permission in sorted(ALL_PERMISSIONS, key=lambda p: p.value)
+        ],
+        "max_enabled": MAX_ENABLED,
+    }
+
+
 @skills_router.get("/skills/{name}")
 async def skill_get(name: str) -> Dict[str, Any]:
     detail = skill_detail(name)
@@ -93,6 +118,14 @@ async def skill_create(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             description=(data.get("description") or "").strip(),
             instructions=data.get("instructions"),
             enabled=bool(data.get("enabled", False)),
+            # These two were accepted by the client and dropped here, so a skill
+            # created asking for `filesystem.read` came back with
+            # `permissions: []` — the UI then reported "asks for: (nothing)"
+            # and the requirement that a skill's requested permissions be
+            # visible before it is enabled could not be met. `create` validates
+            # them against the known vocabulary, so a bad name is a 422.
+            permissions=data.get("permissions"),
+            tags=data.get("tags"),
         )
     except SkillExists as exc:
         raise HTTPException(409, str(exc)) from exc

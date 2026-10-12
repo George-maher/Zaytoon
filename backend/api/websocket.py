@@ -102,7 +102,17 @@ class ConnectionManager:
     async def _send(self, ws: WebSocket, data: dict):
         try:
             raw = json.dumps(data, default=str)
-            logger.warning(f"WS >> type={data.get('type','?')} len={len(raw)} trace={data.get('trace_id','-')}")
+            # One line per outbound frame, at DEBUG. This used to be
+            # `logger.warning`, which meant a streamed answer wrote a
+            # WARNING line per `audio_chunk` — hundreds per reply, on the
+            # path that has to stay responsive, while burying the warnings
+            # that are actually warnings. Per-frame tracing is a debugging
+            # aid; summary lines at the end of a turn carry the signal.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"WS >> type={data.get('type','?')} len={len(raw)} "
+                    f"trace={data.get('trace_id','-')}"
+                )
             await asyncio.wait_for(
                 ws.send_text(raw), timeout=5.0
             )
@@ -225,7 +235,11 @@ async def create_websocket_handler(
 
         while True:
             raw = await websocket.receive_text()
-            logger.warning(f"WS << len={len(raw)} first80={raw[:80]}")
+            if logger.isEnabledFor(logging.DEBUG):
+                # The payload preview is truncated to 80 chars, but for an
+                # `audio` frame those 80 chars are base64 of the user's
+                # own recording, at WARNING, on every utterance.
+                logger.debug(f"WS << len={len(raw)} first80={raw[:80]}")
             # One malformed frame must not end the session. This parses *inside*
             # the loop deliberately: the handler used to sit outside it, so a
             # single non-JSON line fell through to the outer ``except`` and
@@ -302,7 +316,10 @@ async def create_websocket_handler(
                 language = data.get("language", None)
                 # Manual voice mode (user pressed mic button) skips wake-word gate
                 is_manual_voice = data.get("isManualVoice", False)
-                logger.warning(f"Audio msg received: b64_len={len(audio_b64)} lang={language} manual={is_manual_voice}")
+                logger.debug(
+                    f"Audio msg received: b64_len={len(audio_b64)} "
+                    f"lang={language} manual={is_manual_voice}"
+                )
                 if not audio_b64:
                     continue
                 try:
@@ -321,7 +338,9 @@ async def create_websocket_handler(
                         })
                         continue
                     audio_bytes = base64.b64decode(audio_b64)
-                    logger.warning(f"Audio received: {len(audio_bytes)} bytes, b64_prefix={audio_b64[:12]}, hex_prefix={audio_bytes[:8].hex()}")
+                    # Length only: the prefixes are the user's audio, and
+                    # a log is not the place for it.
+                    logger.debug(f"Audio received: {len(audio_bytes)} bytes")
                     await connection_manager.send(websocket, {"type": "status", "content": "transcribing"})
                     transcription = stt.transcribe_detailed(
                         audio_bytes, language=language
@@ -331,8 +350,22 @@ async def create_websocket_handler(
                         await connection_manager.send(websocket, {"type": "status", "content": "listening"})
                         continue
                     # Whisper's verdict beats the client's hint, so voice
-                    # routing and the agent's language kwarg stay in sync.
-                    if transcription.detected and transcription.language:
+                    # routing and the agent's language kwarg stay in sync:
+                    # `language` was re-derived from the transcript inside
+                    # `transcribe_detailed`, so it is the language of the audio
+                    # whatever the client guessed.
+                    #
+                    # This frame is emitted unconditionally when a language is
+                    # known, and that is load-bearing. It used to be gated on
+                    # `transcription.detected`, which is False whenever the
+                    # caller supplied a hint — i.e. always, because the browser
+                    # client attaches its current `language` to every audio
+                    # frame (`useWebSocket.js`). `stt_result` is the only frame
+                    # that reaches `setLanguage()` on the client, and
+                    # `setLanguage` is what flips the whole app to RTL and the
+                    # TTS voice to Egyptian Arabic, so that gate made spoken
+                    # Arabic unable to switch the app to Arabic at all.
+                    if transcription.language:
                         language = transcription.language
                         await connection_manager.send(websocket, {
                             "type": "stt_result",

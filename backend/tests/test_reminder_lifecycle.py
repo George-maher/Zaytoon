@@ -286,13 +286,24 @@ class TestCrashRecovery:
 
         service = ReminderService(memory)
 
+        #: Records whether the background loop ever ran. The override below
+        #: replaced the loop but appended to a name that was never defined, so
+        #: the test would have raised `NameError: name 'slept' is not defined`
+        #: if `start()` ever *did* await the loop — reporting a bug as a broken
+        #: test rather than as "the loop ran when it should not have".
+        ticks: list[str] = []
+
         class _NoLoop(SchedulerManager):
             async def _check_loop(self):  # pragma: no cover - replaced
-                slept.append("loop")
+                ticks.append("loop")
 
         manager = _NoLoop(service, _Notify())
         await manager.start()
         await manager.stop()
+        assert ticks == [], (
+            "`start()` awaited the tick loop; startup recovery must complete "
+            "before the loop is allowed to claim rows"
+        )
         assert _rows(path, "WHERE status = 'pending'"), (
             "`start()` must recover rows claimed by the previous run, or "
             "restarting the app silently deletes the reminders it missed"

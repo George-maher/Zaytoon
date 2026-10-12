@@ -32,6 +32,11 @@ function SkillsView({ language = "en" }) {
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ name: "", description: "" });
+  //: The declared permissions. Fetched, never hard-coded: the manifest
+  //: validator rejects an unknown name, so a list duplicated in the client
+  //: inevitably offers something the backend will refuse.
+  const [permissionOptions, setPermissionOptions] = useState([]);
+  const [formPermissions, setFormPermissions] = useState([]);
 
   const enabledCount = useMemo(() => skills.filter((s) => s.enabled).length, [skills]);
 
@@ -51,6 +56,16 @@ function SkillsView({ language = "en" }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getSkillPermissions().then((result) => {
+      if (!cancelled && !result.error) setPermissionOptions(result.permissions || []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const toggle = useCallback(
     async (name, enabled) => {
@@ -78,17 +93,21 @@ function SkillsView({ language = "en" }) {
   const create = useCallback(
     async (event) => {
       event.preventDefault();
-      const result = await api.createSkill(form.name, { description: form.description });
+      const result = await api.createSkill(form.name, {
+        description: form.description,
+        permissions: formPermissions,
+      });
       if (result.error) {
         setError(result.error);
         return;
       }
       setError(null);
       setForm({ name: "", description: "" });
+      setFormPermissions([]);
       setCreating(false);
       await load();
     },
-    [form, load],
+    [form, formPermissions, load],
   );
 
   const inspect = useCallback(async (name) => {
@@ -208,6 +227,41 @@ function SkillsView({ language = "en" }) {
               onChange={(e) => setForm({ ...form, description: e.target.value })}
               placeholder="Laravel security review"
             />
+            {permissionOptions.length > 0 && (
+              <fieldset
+                style={{ border: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "var(--space-1)" }}
+              >
+                <legend className="hud-micro" style={{ padding: 0 }}>
+                  {ar ? "الأذونات المطلوبة" : "PERMISSIONS IT ASKS FOR"}
+                </legend>
+                <p className="hud-micro" style={{ color: "var(--hud-text-mute)", fontSize: "var(--font-xs)" }}>
+                  {ar
+                    ? "الإعلان ليس منحًا — يبقى التنفيذ خلف بوابة الأدوات."
+                    : "Declaring is not granting — enforcement stays in the tool gate."}
+                </p>
+                {permissionOptions.map((permission) => (
+                  <label
+                    key={permission.name}
+                    className="flex items-center"
+                    style={{ gap: "var(--space-2)", fontSize: "var(--font-xs)", color: "var(--hud-text-dim)" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={formPermissions.includes(permission.name)}
+                      onChange={(e) =>
+                        setFormPermissions((prev) =>
+                          e.target.checked
+                            ? [...prev, permission.name]
+                            : prev.filter((name) => name !== permission.name),
+                        )
+                      }
+                    />
+                    <span className="hud-mono" dir="ltr">{permission.name}</span>
+                    <span style={{ color: "var(--hud-text-mute)" }}>— {permission.label}</span>
+                  </label>
+                ))}
+              </fieldset>
+            )}
             <button
               type="submit"
               className="hud-micro"
