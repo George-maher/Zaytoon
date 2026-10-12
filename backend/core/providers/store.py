@@ -19,6 +19,7 @@ property of *Zaytoon's own* OpenRouter account, and it stays absolute.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -106,6 +107,35 @@ def validate_provider(
         raise ProviderError(
             "'base_url' must not contain a query string or fragment"
         )
+
+    # The link-local plane, not the local network. A *local* endpoint is the
+    # primary use case (localhost, 192.168.x.x, a NAS) and is allowed — but
+    # 169.254.169.254 and its family are the cloud instance metadata service,
+    # and a request pointed there comes back with the host's cloud credentials
+    # in the error body, which travels into the attempt record and the log.
+    # Checked as an *address class*, not a spelling: the IPv6 forms (including
+    # IPv4-mapped) reach the same service. Known residual: a hostname that
+    # *resolves* to the link-local plane is not caught here — save-time DNS
+    # would be slow, flaky, and re-checkable after the fact (TOCTOU).
+    host = (parts.hostname or "").lower().rstrip(".")
+    if host in ("metadata.google.internal", "metadata.goog"):
+        raise ProviderError(
+            "'base_url' must not target a cloud metadata service "
+            f"({host}); that is a machine's private plane, not an AI endpoint"
+        )
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        link_local = address.is_link_local
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            link_local = address.ipv4_mapped.is_link_local
+        if link_local:
+            raise ProviderError(
+                "'base_url' must not target the link-local metadata address "
+                f"({host}); that is a machine's private plane, not an AI endpoint"
+            )
 
     return {"name": clean_name, "kind": clean_kind, "base_url": url, "requires_key": bool(requires_key)}
 

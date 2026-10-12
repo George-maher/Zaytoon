@@ -138,6 +138,41 @@ class TestProviderValidation:
         with pytest.raises(ProviderError, match="query string or fragment"):
             validate_provider("X", "ollama", "http://x/#frag", False)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254",              # AWS/OpenStack metadata
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.171.1",                # Azure's IMDS address
+            "https://[fe80::1]",                   # IPv6 link-local
+            "https://[::ffff:169.254.169.254]",    # IPv4-mapped link-local
+            "http://metadata.google.internal",     # GCP's metadata hostname
+        ],
+    )
+    def test_the_cloud_metadata_plane_is_refused(self, url):
+        """A request pointed there returns host credentials in the error body.
+
+        The address class is what is refused, not a spelling — the IPv6 and
+        IPv4-mapped forms reach the same service.
+        """
+        with pytest.raises(ProviderError, match="metadata|link-local"):
+            validate_provider("X", "openai_compatible", url, False)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:11434",   # the primary use case: a local daemon
+            "http://127.0.0.1:1234",
+            "http://192.168.1.10:8080",  # a NAS running a local model
+            "http://10.0.0.5",
+            "https://openrouter.ai/api/v1",
+        ],
+    )
+    def test_private_and_public_endpoints_are_allowed(self, url):
+        """Local endpoints are the point of this product; only the metadata
+        plane is refused."""
+        assert validate_provider("X", "openai_compatible", url, False)["base_url"]
+
 
 class TestFreeOnlyPolicy:
     """The rule is a property of *Zaytoon's own* OpenRouter account, so it

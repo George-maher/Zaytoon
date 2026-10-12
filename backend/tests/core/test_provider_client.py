@@ -470,3 +470,36 @@ async def test_the_read_bound_is_the_tighter_of_provider_timeout_and_the_cap():
     async for _ in client2.stream(MESSAGES, model="m"):
         pass
     assert captured[-1]["read"] == 10
+
+
+# ---------------------------------------------------------------------------
+# The redirect pin: the authority judged at save time is the authority reached
+# ---------------------------------------------------------------------------
+async def test_a_redirect_is_not_followed():
+    """A 302 must not hand the request (and its key header) elsewhere.
+
+    ``follow_redirects`` is set False explicitly in the client so a future
+    httpx default change cannot silently start following them; this test is
+    the tripwire.
+    """
+    hits: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits.append(str(request.url))
+        if len(hits) == 1:
+            return httpx.Response(
+                302, headers={
+                    "location": "http://169.254.169.254/latest/meta-data/",
+                },
+            )
+        return chat_response({"content": "should never be reached"})
+
+    client = make_client(handler)
+    with pytest.raises(ProviderTransportError) as caught:
+        await client.complete(MESSAGES, model="m")
+
+    # The redirect target was never contacted: one request, one answer, and
+    # the answer (no JSON body) is reported rather than chased.
+    assert len(hits) == 1
+    assert "169.254" not in hits[0]
+    assert caught.value.kind == "malformed"

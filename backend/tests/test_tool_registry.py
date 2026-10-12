@@ -796,3 +796,24 @@ class TestExecuteMany:
 
     def test_empty_batch(self, registry):
         assert asyncio.run(registry.execute_many([])) == []
+
+
+def test_no_tool_can_write_the_provider_registry(registry):
+    """Provider configuration is reachable only through the settings API.
+
+    An endpoint is an SSRF decision: whoever can register one can point the
+    backend's HTTP client at a host of their choosing. That authority belongs
+    to the human, at the settings screen — never to a model selecting a tool.
+    There is deliberately no provider-administration tool; this test is the
+    tripwire if one is ever added.
+    """
+    import re
+
+    offending = [
+        tool.name for tool in registry.tools()
+        if re.search(r"provider", f"{tool.name} {tool.description}", re.I)
+    ]
+    assert offending == [], (
+        "these tools would let a model redirect the backend's traffic: "
+        f"{offending}"
+    )

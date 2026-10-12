@@ -150,6 +150,11 @@ class OpenAICompatibleClient:
             timeout=timeout,
             headers=self._headers(api_key, org_id),
             transport=transport,
+            # Explicit, not httpx's default-by-luck: a registered endpoint
+            # must answer for the authority that was judged at save time.
+            # Following a redirect would hand the request — including the
+            # Authorization header — to an address nobody approved.
+            follow_redirects=False,
         )
 
     @staticmethod
