@@ -11,7 +11,7 @@
 | `5510497` | Confirmation-gate fix, scope-enforced security layer, Security Workspace, three test-only defects | 2792 backend / 627 frontend / 366 desktop |
 | `3e60fd6` `8bb6325` | Dev proxy for `/security`; report corrections | 627 frontend |
 | `985cc88` `4475d05` | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
-| `b8e1464` | The VM REST surface and the Virtual Machines screen — see §5f, §7 fourth batch | 2919 backend / 641 frontend / 366 desktop |
+| `3c23eca` | The VM REST surface and the Virtual Machines screen — see §5f, §7 fourth batch | 2919 backend / 641 frontend / 366 desktop |
 
 `main` has not been touched; nothing was merged. Two items from the first
 revision are corrected here (§8 web search, §11 test changes) and the voice
