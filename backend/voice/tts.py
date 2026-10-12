@@ -32,6 +32,14 @@ class TextToSpeech:
     def __init__(self):
         self._available = False
         self._available_voices: set = set()
+        # Why the most recent stream produced no audio (None before any attempt
+        # and after any success). `stream_synthesize` swallows its own errors so
+        # one dead sentence can never eat a reply that already streamed as text;
+        # this attribute is the only trace that reaches the transport, which
+        # reads it to decide whether a silent speaker deserves one honest
+        # notice. Only the exception's class name is kept — the detail belongs
+        # in the redacted log line `safe_error` already wrote, never on the wire.
+        self.last_stream_error: Optional[str] = None
         self._check_available()
         self._cache = _TTS_CACHE
 
@@ -194,8 +202,10 @@ class TextToSpeech:
 
         if not (text or "").strip():
             return
+        self.last_stream_error = None
         if not self._available:
             logger.error("TTS unavailable: edge-tts not installed")
+            self.last_stream_error = "edge-tts is not installed"
             return
 
         if voice:
@@ -228,6 +238,7 @@ class TextToSpeech:
             raise
         except Exception as e:
             safe_error(e, operation="tts.stream", component="voice.tts")
+            self.last_stream_error = type(e).__name__
 
     async def synthesize_ssml(
         self,

@@ -781,6 +781,67 @@ class TestSkillToolLoader:
         assert link not in files
         assert str(outside) not in files
 
+    async def test_a_second_load_replaces_the_first_ones_tools(
+        self, temp_skills_dir, temp_core_db
+    ):
+        """A runtime reload must pick up the *edited* code (§10C).
+
+        The loader registered with `replace=False` and never unregistered, so a
+        second load of the same skill reported "already registered" for the
+        skill's own tools and the edited module never reached the registry —
+        every skill edit needed an application restart.
+        """
+        from tools.registry import ToolRegistry
+
+        directory = write_skill(temp_skills_dir, "helper")
+        write_tool(directory, "hello.py", _HELLO_TOOL)
+        await sync_to_db(temp_skills_dir)
+
+        registry = ToolRegistry()
+        first = await load_skill_tools(registry, root=temp_skills_dir)
+        assert first["tools"] == ["helper.skill_hello"]
+        assert first["errors"] == []
+
+        # The user edits the tool's behaviour; the file on disk is new.
+        write_tool(
+            directory,
+            "hello.py",
+            _HELLO_TOOL.replace('ToolResult.ok("hello")', 'ToolResult.ok("edited")'),
+        )
+        second = await load_skill_tools(registry, root=temp_skills_dir)
+
+        assert second["errors"] == []
+        assert second["removed"] == ["helper.skill_hello"]
+        assert second["tools"] == ["helper.skill_hello"]
+        result = await registry.execute("skill_hello", {}, approval=True)
+        assert result["output"] == "edited"
+
+    async def test_disabling_a_skill_takes_its_tools_with_it(
+        self, temp_skills_dir, temp_core_db
+    ):
+        """Disable means *unavailable now*, not unavailable after a restart.
+
+        Before the sync semantics, disabling pulled the skill out of prompt
+        discovery immediately but its tools stayed callable in the live
+        registry until the process restarted.
+        """
+        from tools.registry import ToolRegistry
+
+        directory = write_skill(temp_skills_dir, "helper")
+        write_tool(directory, "hello.py", _HELLO_TOOL)
+        await sync_to_db(temp_skills_dir)
+
+        registry = ToolRegistry()
+        await load_skill_tools(registry, root=temp_skills_dir)
+        assert registry.has("skill_hello")
+
+        await set_enabled("helper", False)
+        report = await load_skill_tools(registry, root=temp_skills_dir)
+
+        assert not registry.has("skill_hello")
+        assert report["removed"] == ["helper.skill_hello"]
+        assert report["tools"] == []
+
 
 _SCARY_TOOL = """
 from tools.base import BaseTool, ToolResult

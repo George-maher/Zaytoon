@@ -254,6 +254,40 @@ async def lifespan(app):
     except Exception as e:
         safe_error(e, operation="startup.skill_tools", component="api.startup")
 
+    # Skill changes take effect at runtime: enable, disable and delete all
+    # publish `SKILL_CHANGED`, and this subscriber re-syncs the skill tool
+    # modules into the *live* registry. Without it the registry was a startup
+    # snapshot — disabling a skill pulled it out of prompt discovery at once
+    # but left its tools callable until a restart, and deleting a skill left
+    # orphaned entries behind. The lock serialises overlapping changes so two
+    # quick toggles cannot interleave unregister/register.
+    _skill_sync_lock = asyncio.Lock()
+    _unsubscribe_skill_sync = None
+    try:
+        from core.events import CoreEventType, bus as core_bus
+        from core.skills import load_skill_tools as _resync_skill_tools
+
+        async def _on_skill_changed(event) -> None:
+            if getattr(event, "type", None) is not CoreEventType.SKILL_CHANGED:
+                return
+            async with _skill_sync_lock:
+                try:
+                    resync = await _resync_skill_tools(tool_executor.registry)
+                except Exception as e:  # noqa: BLE001 — a change is never fatal
+                    safe_error(e, operation="skills.resync", component="api.skills")
+                    return
+            if resync["tools"] or resync["removed"]:
+                logger.info(
+                    "Skill tools resynced: %d loaded, %d removed",
+                    len(resync["tools"]),
+                    len(resync["removed"]),
+                )
+
+        _unsubscribe_skill_sync = core_bus.subscribe(_on_skill_changed)
+    except Exception as e:
+        safe_error(e, operation="startup.skill_resync", component="api.startup")
+        _unsubscribe_skill_sync = None
+
     loop = asyncio.get_running_loop()
 
     async def _load_stt():
@@ -280,6 +314,13 @@ async def lifespan(app):
 
     logger.info("Zaytoon AI started on %s:%s", config.BACKEND_HOST, config.BACKEND_PORT)
     yield
+    # Stop watching skill changes first: a reload firing mid-shutdown would
+    # re-register tools into registries the rest of teardown is closing.
+    if _unsubscribe_skill_sync is not None:
+        try:
+            _unsubscribe_skill_sync()
+        except Exception as e:  # noqa: BLE001
+            safe_error(e, operation="shutdown.skill_resync", component="api.shutdown")
     # Terminals before the scheduler: a dev server the user started should be
     # told to stop while the event loop is still running, rather than being
     # orphaned when the process exits.

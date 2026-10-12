@@ -30,6 +30,8 @@ function AIFloatingBar({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
+  onStop,
+  busy = false,
 }) {
   return (
     <div
@@ -53,6 +55,8 @@ function AIFloatingBar({
         onVoiceStart={onVoiceStart}
         onVoiceStop={onVoiceStop}
         voiceMode={voiceMode}
+        onStop={onStop}
+        busy={busy}
       />
     </div>
   );

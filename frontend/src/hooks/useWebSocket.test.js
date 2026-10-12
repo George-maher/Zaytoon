@@ -264,6 +264,78 @@ describe('inbound: streaming tokens', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('inbound: sources', () => {
+  // The `sources` frame carries no response_id, so association is by wire
+  // order: it lands after the prose and before the final `message`.
+  const source = {
+    n: 1,
+    kind: 'page',
+    url: 'https://example.com/a',
+    host: 'example.com',
+    title: 'A page',
+    retrieved_at: '2026-10-12T12:00:00Z',
+  }
+
+  it('attaches citations to the streaming bubble they belong to', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'token', content: 'answer', response_id: 'r1' })
+      socket.emit({ type: 'sources', sources: [source] })
+    })
+
+    const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(assistant).toHaveLength(1)
+    expect(assistant[0].sources).toEqual([source])
+    expect(assistant[0].streaming).toBe(true)
+  })
+
+  it('holds citations for the final message when nothing was streaming', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'sources', sources: [source] })
+      socket.emit({ type: 'message', content: 'done', response_id: 'r1' })
+    })
+
+    const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(assistant).toHaveLength(1)
+    expect(assistant[0].content).toBe('done')
+    expect(assistant[0].sources).toEqual([source])
+  })
+
+  it('never stamps a previous reply with a later turn’s citations', async () => {
+    // A completed bubble is not this turn's; the held list must not bleed
+    // backwards onto it (that is what the streaming-only guard is for).
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'message', content: 'first', response_id: 'r1' })
+      socket.emit({ type: 'sources', sources: [source] })
+    })
+
+    const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(assistant).toHaveLength(1)
+    expect(assistant[0].sources ?? []).toHaveLength(0)
+  })
+
+  it('ignores a malformed sources frame without dropping the turn', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'token', content: 'text', response_id: 'r1' })
+      socket.emit({ type: 'sources', sources: 'not-an-array' })
+      socket.emit({ type: 'message', content: 'text', response_id: 'r1' })
+    })
+
+    const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(assistant).toHaveLength(1)
+    expect(assistant[0].content).toBe('text')
+    expect(assistant[0].sources ?? []).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('inbound: status vocabulary', () => {
   // The backend emits exactly these. The hook used to set the status to
   // "processing...", which is not among them, so the HUD rendered a literal

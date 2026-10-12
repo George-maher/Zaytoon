@@ -89,7 +89,17 @@ export default function useWebSocket() {
   const [subtitle, setSubtitle] = useState("");
   const [voiceMode, setVoiceMode] = useState(false);
   const [awaitingCommand, setAwaitingCommand] = useState(false);
-  const [language, setLanguage] = useState("en");
+  const [language, setLanguage] = useState(() => {
+    // Restored from the device so an Arabic session survives a reload. The
+    // value used to reset to "en" every time, which threw away the user's
+    // choice (and the RTL layout) on every restart.
+    try {
+      const saved = localStorage.getItem("zaytoon-language");
+      return saved === "ar" ? "ar" : "en";
+    } catch (e) {
+      return "en";
+    }
+  });
   const [reminders, setReminders] = useState([]);
   const [pendingConfirmation, setPendingConfirmation] = useState(null);
   const [speakingVoice, setSpeakingVoice] = useState(null);
@@ -126,6 +136,12 @@ export default function useWebSocket() {
   const isProcessingRef = useRef(false);
   const renderedResponseIds = useRef(new Set());
   const renderedContentHashes = useRef(new Set());
+  // Sources for the turn in flight: set by the `sources` frame (which the
+  // backend sends *before* the final `message`) and consumed when that
+  // message lands. Held in a ref rather than dropped because the client used
+  // to have no `sources` case at all — the frame fell through the switch and
+  // citations never reached the transcript.
+  const pendingSourcesRef = useRef([]);
   const unsentSpeechRef = useRef(false);
   const confirmationRef = useRef(null);
   // Tools currently in flight, name → display label. See `tool_started`.
@@ -344,6 +360,12 @@ export default function useWebSocket() {
           const responseId = data.response_id;
           const contentHashValue = data.content ? contentHash(data.content) : null;
           
+          // Citations the `sources` frame held for this turn (it precedes
+          // this frame on the wire). Taken and cleared here so a cancelled
+          // turn's leftovers can never attach to the next reply.
+          const turnSources = pendingSourcesRef.current;
+          pendingSourcesRef.current = [];
+          
           const isDuplicate = (responseId && renderedResponseIds.current.has(responseId)) ||
                              (contentHashValue && renderedContentHashes.current.has(contentHashValue));
           
@@ -364,7 +386,14 @@ export default function useWebSocket() {
               if (last && last.role === "assistant" && last.streaming) {
                 return [
                   ...prev.slice(0, -1),
-                  { ...last, content: data.content, streaming: false, trace_id: data.trace_id },
+                  {
+                    ...last,
+                    content: data.content,
+                    streaming: false,
+                    trace_id: data.trace_id,
+                    // Already attached mid-stream, or held for this frame.
+                    sources: last.sources || turnSources,
+                  },
                 ];
               }
               return [
@@ -375,6 +404,7 @@ export default function useWebSocket() {
                   content: data.content,
                   streaming: false,
                   trace_id: data.trace_id,
+                  sources: turnSources,
                   ts: clockTime(),
                 },
               ];
@@ -385,6 +415,26 @@ export default function useWebSocket() {
         case "subtitle":
           setSubtitle((prev) => (prev !== data.content ? data.content : prev));
           break;
+        case "sources": {
+          // Citations for the current turn (≤12, sent after the prose and
+          // before the final `message`). The frame carries no response_id on
+          // the wire, so association is by order: it lands while this turn's
+          // bubble is still streaming, and the `message` frame that follows
+          // picks up anything held here when no bubble was streaming yet.
+          const sourceList = Array.isArray(data.sources)
+            ? data.sources.filter((s) => s && (s.url || s.title))
+            : [];
+          pendingSourcesRef.current = sourceList;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            // Only a *streaming* assistant bubble is known to be this turn's.
+            // Attaching to the last completed message would stamp a previous
+            // reply with citations from a later tool-only turn.
+            if (!last || last.role !== "assistant" || !last.streaming) return prev;
+            return [...prev.slice(0, -1), { ...last, sources: sourceList }];
+          });
+          break;
+        }
         case "audio_start":
           audioChunksRef.current = [];
           audioChunksRef.format = data.format || "mpeg";
@@ -678,6 +728,18 @@ export default function useWebSocket() {
     };
   }, [connectWebSocket, isSocketOpen]);
 
+  // Persist the language whenever it changes — whether the user toggled it or
+  // Whisper inferred it from speech — so the next session (and the RTL layout
+  // that follows it) starts where the last one left off.
+  useEffect(() => {
+    try {
+      localStorage.setItem("zaytoon-language", language);
+    } catch (e) {
+      // Private mode / disabled storage: the session still works, it just
+      // will not remember.
+    }
+  }, [language]);
+
   const sendMessage = useCallback(
     (text) => {
       if (!text.trim() || isProcessingRef.current) return;
@@ -696,6 +758,9 @@ export default function useWebSocket() {
         return;
       }
       isProcessingRef.current = true;
+      // A cancelled previous turn may have left citations unclaimed; the new
+      // turn must start with a clean slate.
+      pendingSourcesRef.current = [];
       addMessage("user", text);
       // client_msg_id: a client-generated id the backend can use to drop a
       // duplicate send (double Enter, a retry after a flaky reconnect).
@@ -1056,6 +1121,7 @@ if (rms > threshold) {
     setMessages([]);
     renderedResponseIds.current.clear();
     renderedContentHashes.current.clear();
+    pendingSourcesRef.current = [];
     // Progress is per-turn, so clearing the transcript clears it too.
     setPlan([]);
     setActiveTool(null);

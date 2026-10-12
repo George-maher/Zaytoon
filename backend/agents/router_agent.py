@@ -41,7 +41,24 @@ KEYWORD_ROUTES: list[tuple[re.Pattern, str, float]] = [
     # -- verbs that imply acting on the machine ----------------------------
     (re.compile(r"(remind|reminder|فكرني|ذكرني|تذكير|نبهني)"), "scheduling", 0.9),
     (re.compile(r"\b(schedule)\b"), "scheduling", 0.9),
-    (re.compile(r"(open|launch|start|close|stop|شغل|شغال|فتح|افتح|إغلاق|أغلق|اغلق|اقفل|قفل)\s*\w+"), "tools", 0.85),
+    # -- virtual machines ---------------------------------------------------
+    # Placed *after* the memory/scheduling rules so "remember my vm name"
+    # stays a memory request and "remind me to suspend the vm" stays a
+    # reminder, and *before* the catch-all so "show me the available virtual
+    # machines" cannot become a chat turn. Without this rule those phrasings
+    # fell through to the LLM fallback — or matched the catch-all outright —
+    # so listing VMs depended on a rate-limited model, and on exhaustion the
+    # request became `chat` while `vm_list` sat unused in the registry (the
+    # same failure the `what time` rule was written to prevent). `ubuntu` and
+    # `parrot` are here because in this product they name the lab guests, not
+    # a generic OS discussion: "wait until ubuntu is ready" is
+    # `vm_guest_check`, and routing it to `chat` makes the VM workflow
+    # unreachable without an LLM.
+    (re.compile(r"(vmware|vmrun|virtual machines?|\bvms?\b|\bguest\b|hypervisor|ubuntu|parrot|افتراضي)"), "tools", 0.92),
+    # `شغّل` (with shadda) is the everyday imperative "start it" — the plain
+    # `شغل` alternative never matches it, so every Egyptian "شغّل X" phrasing
+    # fell through to the LLM.
+    (re.compile(r"(open|launch|start|close|stop|شغل|شغّل|شغال|فتح|افتح|إغلاق|أغلق|اغلق|اقفل|قفل)\s*\w+"), "tools", 0.85),
     (re.compile(r"(run|تشغيل|execute|نفذ)\s+(?:\w+\s+){0,2}(python|code|script|command|أمر|كود)"), "action", 0.9),
     (re.compile(r"(search|بحث|ابحث|google|دور)"), "tools", 0.85),
     (re.compile(r"(write|اكتب|build|إنشاء)\s+(code|app|application|function|component|تطبيق|برنامج|صفحة)"), "code", 0.85),

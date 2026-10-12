@@ -46,6 +46,16 @@ class FakeSocket {
  * code is replaced, so the components under test are the real ones.
  */
 function stubBrowserApis() {
+  // The language choice now persists to localStorage so it survives a
+  // reload — which means a test that clicks LANG would otherwise drag every
+  // *later* test into an Arabic boot state (this is how the STOP tests came
+  // to look for an English "path" label in a rendered Arabic sidebar).
+  // Reset here so each test starts from the default, toggle or not.
+  try {
+    localStorage.removeItem("zaytoon-language");
+  } catch (e) {
+    /* no storage available */
+  }
   const ctx2d = new Proxy(
     {
       canvas: { width: 300, height: 60 },
@@ -70,7 +80,8 @@ function stubBrowserApis() {
  * reference, which is exactly how this broke the first time.
  */
 async function renderAndOpen() {
-  await act(async () => { render(<App />); });
+  let view;
+  await act(async () => { view = render(<App />); });
   // Wait for the home screen to render, then open a project via the path input
   // (the desktop bridge is not available in jsdom, so the path input is used)
   await act(async () => {
@@ -83,6 +94,9 @@ async function renderAndOpen() {
   await act(async () => {
     await new Promise((r) => setTimeout(r, 100));
   });
+  // Returned so a test can unmount (a reload) and prove what a fresh mount
+  // restores; existing callers ignore it.
+  return view;
 }
 
 describe("App runtime", () => {
@@ -769,6 +783,25 @@ describe("App runtime", () => {
       expect(document.documentElement.getAttribute("dir")).toBe("rtl"),
     );
     expect(document.documentElement.getAttribute("lang")).toBe("ar");
+  });
+
+  it("keeps the chosen language across a reload", async () => {
+    // The toggle above persists the choice; a fresh mount must come back in
+    // the same language with nobody clicking LANG again. `unmount` + render
+    // is a reload as far as state goes — and the document effect at App.jsx
+    // runs on mount, so the attribute is the observable proof.
+    const view = await renderAndOpen();
+    await waitFor(() => expect(FakeSocket.last.readyState).toBe(1));
+    const lang = screen.getByTitle("LANG");
+    await act(async () => { fireEvent.click(lang); });
+    await waitFor(() =>
+      expect(document.documentElement.getAttribute("lang")).toBe("ar"),
+    );
+    view.unmount();
+
+    await act(async () => { render(<App />); });
+    expect(document.documentElement.getAttribute("lang")).toBe("ar");
+    expect(document.documentElement.getAttribute("dir")).toBe("rtl");
   });
 });
 

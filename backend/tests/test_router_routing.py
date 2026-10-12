@@ -77,6 +77,22 @@ EXPECTED = {
     "analyze this problem for me": "complex",
     "run python script.py": "action",
     "execute this command": "action",
+    # -- virtual machine workflows (§6B) ------------------------------------
+    # Each is a phrasing the VM adapter can serve with the tools in the
+    # registry, and each must reach `tools` without the LLM: on an exhausted
+    # free tier these used to fall back to `chat` (the catch-all) or to the
+    # model, so VM discovery was unreachable exactly when the model was busy.
+    "open vmware": "tools",
+    "show me the available virtual machines": "tools",
+    "what virtual machines do i have": "tools",
+    "list my vms": "tools",
+    "start ubuntu": "tools",
+    "launch my parrot os vm": "tools",
+    "wait until ubuntu is ready": "tools",
+    "run the authorized lab assessment in my parrot vm": "tools",
+    "what can you see in the guest": "tools",
+    "اعرض لي الاجهزة الافتراضية": "tools",
+    "شغّل اوبونتو": "tools",
 }
 
 

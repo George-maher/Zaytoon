@@ -30,7 +30,11 @@ class TestHealth:
 
     def test_reports_a_status_and_version(self, client):
         body = client.get("/health").json()
-        assert body["status"] in ("ok", "degraded")
+        # `unverified` joined the vocabulary when the provider probe became
+        # evidence-based: configured-but-never-probed is neither `ok` (a
+        # guess) nor `degraded` (an alarm), and a test suite configures a
+        # provider without ever sending it a request.
+        assert body["status"] in ("ok", "degraded", "unverified")
         assert body["version"]
 
     def test_reports_the_llm_chain_without_raising(self, client):
@@ -149,13 +153,21 @@ class TestWorkspaceEndpoint:
         assert response.status_code == 400
 
     def test_post_rejects_a_relative_path(self, client):
-        # `X:/no/such/drive` is a missing drive in cmd.exe and an ordinary
-        # *relative* path on POSIX, where the old handler mkdir'd it inside the
-        # source tree and answered 200. "Absolute or refused" is the same rule
-        # on every OS, which is the only reason this case is testable here.
-        response = client.post("/settings/workspace", json={"root": "X:/no/such/drive"})
-        assert response.status_code == 400
-        assert "absolute" in response.json()["error"].lower()
+        # "Absolute or refused" is the same rule on every OS; the old handler
+        # mkdir'd a relative path inside the source tree and answered 200.
+        # `no/such/tree` is relative on both platforms, so the message word is
+        # assertable anywhere. `X:/no/such/drive` is a missing drive in cmd.exe
+        # but an *absolute* path to Python on Windows — it clears the absolute
+        # check and is refused one step later when creation fails (WinError 3),
+        # so only its status is asserted here.
+        relative = client.post("/settings/workspace", json={"root": "no/such/tree"})
+        assert relative.status_code == 400
+        assert "absolute" in relative.json()["error"].lower()
+
+        missing_drive = client.post(
+            "/settings/workspace", json={"root": "X:/no/such/drive"}
+        )
+        assert missing_drive.status_code == 400
 
     def test_post_rejects_a_path_that_cannot_be_a_directory(self, client, tmp_path):
         blocker = tmp_path / "not-a-dir"

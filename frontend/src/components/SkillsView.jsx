@@ -32,6 +32,14 @@ function SkillsView({ language = "en" }) {
   const [saving, setSaving] = useState(false);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ name: "", description: "" });
+  // Filter box over the list (§10: "Search and filter skills").
+  const [query, setQuery] = useState("");
+  // Two-step delete: the first press arms, the second deletes. Destructive
+  // actions used to fire on a single click with no confirmation at all.
+  const [confirmingDelete, setConfirmingDelete] = useState(null);
+  // Transient success feedback — create/save/delete used to succeed silently,
+  // which reads the same as doing nothing.
+  const [notice, setNotice] = useState(null);
   //: The declared permissions. Fetched, never hard-coded: the manifest
   //: validator rejects an unknown name, so a list duplicated in the client
   //: inevitably offers something the backend will refuse.
@@ -39,6 +47,24 @@ function SkillsView({ language = "en" }) {
   const [formPermissions, setFormPermissions] = useState([]);
 
   const enabledCount = useMemo(() => skills.filter((s) => s.enabled).length, [skills]);
+
+  const filteredSkills = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return skills;
+    return skills.filter((s) =>
+      [s.name, s.description, ...(s.permissions || [])]
+        .filter(Boolean)
+        .some((field) => String(field).toLowerCase().includes(needle)),
+    );
+  }, [skills, query]);
+
+  // Notices clear themselves so a stale "SAVED" cannot outlive the edit it
+  // describes.
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = setTimeout(() => setNotice(null), 3000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -105,14 +131,16 @@ function SkillsView({ language = "en" }) {
       setForm({ name: "", description: "" });
       setFormPermissions([]);
       setCreating(false);
+      setNotice(ar ? `تم إنشاء «${form.name}»` : `Created “${form.name}”`);
       await load();
     },
-    [form, formPermissions, load],
+    [form, formPermissions, load, ar],
   );
 
   const inspect = useCallback(async (name) => {
     setSelected(name);
     setEditing(false);
+    setConfirmingDelete(null);
     const result = await api.getSkill(name);
     if (result.error) {
       setError(result.error);
@@ -137,6 +165,7 @@ function SkillsView({ language = "en" }) {
         setError(result.error);
       } else {
         setEditing(false);
+        setNotice(ar ? "تم حفظ التعليمات" : "Instructions saved");
         await inspect(selected);
       }
     } catch (e) {
@@ -144,7 +173,7 @@ function SkillsView({ language = "en" }) {
     } finally {
       setSaving(false);
     }
-  }, [selected, detail, editContent, inspect]);
+  }, [selected, detail, editContent, inspect, ar]);
 
   const remove = useCallback(
     async (name) => {
@@ -153,6 +182,7 @@ function SkillsView({ language = "en" }) {
         setError(result.error);
       } else {
         setError(null);
+        setNotice(ar ? `تم حذف «${name}»` : `Deleted “${name}”`);
         if (selected === name) {
           setSelected(null);
           setDetail(null);
@@ -160,7 +190,7 @@ function SkillsView({ language = "en" }) {
         await load();
       }
     },
-    [selected, load],
+    [selected, load, ar],
   );
 
   if (loading) {
@@ -199,6 +229,29 @@ function SkillsView({ language = "en" }) {
             {error}
           </p>
         )}
+
+        {notice && (
+          <p
+            role="status"
+            style={{ padding: "var(--space-2) var(--space-3)", color: "var(--hud-green)", fontSize: "var(--font-sm)" }}
+          >
+            {notice}
+          </p>
+        )}
+
+        <div style={{ padding: "var(--space-2) var(--space-3)", borderBottom: "var(--border-w) solid var(--hud-edge-faint)" }}>
+          <input
+            type="search"
+            className="hud-input w-full"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setConfirmingDelete(null);
+            }}
+            placeholder={ar ? "ابحث في المهارات…" : "Search skills…"}
+            aria-label={ar ? "ابحث في المهارات" : "Search skills"}
+          />
+        </div>
 
         {creating && (
           <form
@@ -287,7 +340,7 @@ function SkillsView({ language = "en" }) {
 
         <div className="flex-1 overflow-y-auto">
           <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-            {skills.map((skill) => (
+            {filteredSkills.map((skill) => (
               <li
                 key={skill.name}
                 style={{ borderTop: "var(--border-w) solid var(--hud-edge-faint)" }}
@@ -334,15 +387,56 @@ function SkillsView({ language = "en" }) {
                     {ar ? "عرض" : "VIEW"}
                   </button>
                   <button
-                    onClick={() => remove(skill.name)}
+                    onClick={() => {
+                      if (confirmingDelete === skill.name) {
+                        setConfirmingDelete(null);
+                        remove(skill.name);
+                      } else {
+                        // Arm first: a second click is the confirmation. There
+                        // is no dialog to dismiss if it was a mis-click —
+                        // clicking anything else re-arms nothing.
+                        setConfirmingDelete(skill.name);
+                      }
+                    }}
                     className="hud-micro"
-                    style={{ padding: "var(--space-1) var(--space-2)", fontSize: "var(--font-xs)", cursor: "pointer", background: "transparent", border: "var(--border-w) solid var(--hud-edge-faint)", color: "var(--hud-red)" }}
+                    aria-label={
+                      confirmingDelete === skill.name
+                        ? ar
+                          ? `تأكيد حذف ${skill.name}`
+                          : `Confirm deleting ${skill.name}`
+                        : ar
+                          ? `حذف ${skill.name}`
+                          : `Delete ${skill.name}`
+                    }
+                    style={{
+                      padding: "var(--space-1) var(--space-2)",
+                      fontSize: "var(--font-xs)",
+                      cursor: "pointer",
+                      background:
+                        confirmingDelete === skill.name
+                          ? "color-mix(in srgb, var(--hud-amber) 12%, transparent)"
+                          : "transparent",
+                      border: "var(--border-w) solid var(--hud-edge-faint)",
+                      color:
+                        confirmingDelete === skill.name ? "var(--hud-amber)" : "var(--hud-red)",
+                    }}
                   >
-                    {ar ? "حذف" : "DEL"}
+                    {confirmingDelete === skill.name
+                      ? ar
+                        ? "تأكيد؟"
+                        : "CONFIRM?"
+                      : ar
+                        ? "حذف"
+                        : "DEL"}
                   </button>
                 </div>
               </li>
             ))}
+            {filteredSkills.length === 0 && skills.length > 0 && (
+              <li className="hud-micro" style={{ padding: "var(--space-4)", color: "var(--hud-text-mute)" }}>
+                {ar ? `لا نتائج لـ «${query}»` : `No skills match “${query}”`}
+              </li>
+            )}
             {skills.length === 0 && (
               <li className="hud-micro" style={{ padding: "var(--space-4)", color: "var(--hud-text-mute)" }}>
                 {ar

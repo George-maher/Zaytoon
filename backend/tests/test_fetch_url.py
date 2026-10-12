@@ -92,9 +92,17 @@ class TestAddressPolicy:
         ``127.1`` and friends are not parseable IPs, so `parse_public_url` lets them
         through as hostnames — and they must not reach a socket. glibc resolves all
         three to loopback, and the resolved address is what the class check sees.
+        Windows' getaddrinfo implements neither glibc shorthand nor hex/decimal
+        forms: the name fails to resolve, which reaches the same refusal one
+        clause earlier ("does not resolve") — also before any socket opens.
         """
         for spelling in ("127.1", "0x7f000001", "2130706433"):
-            answers = {info[4][0] for info in socket.getaddrinfo(spelling, 80)}
+            try:
+                answers = {info[4][0] for info in socket.getaddrinfo(spelling, 80)}
+            except socket.gaierror:
+                with pytest.raises(SecurityError, match="does not resolve"):
+                    run(netguard.resolve_public(f"http://{spelling}/x"))
+                continue
             assert answers == {"127.0.0.1"}, (spelling, answers)
             with pytest.raises(SecurityError, match="127.0.0.1"):
                 run(netguard.resolve_public(f"http://{spelling}/x"))

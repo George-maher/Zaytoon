@@ -79,6 +79,18 @@ _UNAVAILABLE = (
     "api key",
 )
 
+#: The transport's fixed advisory when synthesis produced no audio
+#: (``api/websocket.py::_SPEECH_UNAVAILABLE_*`` — mirrored by sentence here,
+#: because this script is a pure client and must not import the server). It
+#: rides an ``error`` frame because that is the protocol's only "tell the user
+#: something went wrong" channel, but it is not a *turn* failure: the reply
+#: above it is complete. Recognised by its exact sentence so it can never veto
+#: a scenario that otherwise passed, and reported separately instead.
+_SPEECH_NOTICE = (
+    "the reply above is complete, but no audio could be produced",
+    "\u0627\u0644\u0631\u062f \u0623\u0639\u0644\u0627\u0647 \u0643\u0627\u0645\u0644\u060c \u0644\u0643\u0646 \u062a\u0639\u0630\u0631 \u0625\u0646\u062a\u0627\u062c \u0627\u0644\u0635\u0648\u062a",
+)
+
 RESULTS: list[tuple[str, str, str]] = []
 
 
@@ -118,12 +130,20 @@ class Turn:
         self.sources: list[dict] = []
         self.frames: list[str] = []
         self.error: str = ""
+        self.speech_unavailable: bool = False
 
     @property
     def final(self) -> str:
         return self.messages[-1] if self.messages else ""
 
-    def note(self, frame: dict) -> None:
+    def note(self, frame: dict) -> bool:
+        """Record one frame. Returns True when it should END the wait.
+
+        Only a real error is terminal. The speech advisory rides an ``error``
+        frame but the turn is still running — it lands mid-drain, *before*
+        the ``done`` that closes the turn — so breaking on it read as "no
+        ``done`` status" on every scenario while the voice service was down.
+        """
         kind = frame.get("type")
         self.frames.append(kind or "?")
         if kind == "token":
@@ -143,7 +163,21 @@ class Turn:
         elif kind == "message":
             self.messages.append(frame.get("content", ""))
         elif kind == "error":
-            self.error = frame.get("content", "")
+            content = frame.get("content", "")
+            # Compared lowercased: the English sentence opens with a capital
+            # on the wire, and a substring test that misses by case is a
+            # silent one — the advisory would land in `error` and veto the
+            # scenario anyway. Arabic has no case, so one lowering serves both.
+            lowered = content.lower()
+            if any(sentence in lowered for sentence in _SPEECH_NOTICE):
+                # The reply is complete; only the speaker failed. Recorded as
+                # an attribute of the turn, never as its error — one broken
+                # voice service must not veto a scenario that otherwise ran.
+                self.speech_unavailable = True
+                return False
+            self.error = content
+            return True
+        return False
 
 
 def _looks_like_tool_json(text: str) -> bool:
@@ -187,7 +221,7 @@ async def run_turn(message: str, approve: bool | None = None) -> Turn:
             frame = json.loads(raw)
             if frame.get("type") == "audio_chunk":
                 continue
-            turn.note(frame)
+            terminal = turn.note(frame)
             kind = frame.get("type")
             if kind == "require_confirmation" and approve is not None:
                 await ws.send(json.dumps({
@@ -196,7 +230,7 @@ async def run_turn(message: str, approve: bool | None = None) -> Turn:
                     "approved": approve,
                 }))
                 continue
-            if kind == "error":
+            if terminal:
                 break
             if kind == "message":
                 message_at = time.monotonic()

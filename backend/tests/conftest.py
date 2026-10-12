@@ -23,6 +23,7 @@ themselves (see ``test_ollama_provider.py``).
 
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -34,6 +35,48 @@ from config import PROVIDER_OPENROUTER, config
 _ISOLATED_HOME = Path(tempfile.mkdtemp(prefix="zaytoon-tests-"))
 os.environ["ZAYTOON_DATA_DIR"] = str(_ISOLATED_HOME)
 os.environ["DATABASE_URL"] = f"sqlite:///{_ISOLATED_HOME / 'zaytoon.db'}"
+
+
+def write_fake_executable(target: Path, body: str) -> Path:
+    """Write ``body`` as an executable stand-in at ``target``; return its path.
+
+    ``body`` is a ``str.format`` template (``{{``/``}}`` for literal braces, an
+    optional ``{python}`` placeholder for the interpreter). POSIX gets the
+    classic extensionless shebang file. **Windows cannot execute a shebang
+    script at all**: ``CreateProcess`` raises ``WinError 193`` ("%1 is not a
+    valid Win32 application"), which is why every guest-ssh and vmrun fake
+    failed on the development platform while looking perfectly correct. There
+    the same body goes to ``<name>_runner.py`` and a ``<name>.cmd`` wrapper
+    runs it through the interpreter. Both paths were verified on this
+    machine: the shebang form fails with exactly that error, the wrapper
+    runs, and argv arrives intact — spaces included, which is what the
+    argv-recording fakes assert on.
+    """
+    rendered = body.format(python=sys.executable)
+    if os.name != "nt":
+        target.write_text(f"#!{sys.executable}\n{rendered}", encoding="utf-8")
+        target.chmod(0o755)
+        return target
+    runner = target.with_name(f"{target.name}_runner.py")
+    runner.write_text(rendered, encoding="utf-8")
+    wrapper = target.with_name(f"{target.name}.cmd")
+    wrapper.write_text(
+        f'@echo off\r\n"{sys.executable}" "{runner}" %*\r\n',
+        encoding="utf-8",
+    )
+    return wrapper
+
+
+@pytest.fixture
+def fake_exe():
+    """Factory fixture: ``fake_exe(path, template) -> Path``.
+
+    Exposed as a fixture so both suites that need a fake executable (the
+    guest-ssh fakes in ``tests/`` and the vmrun fakes in ``tests/core/``) use
+    the same platform logic instead of growing two shebang templates that
+    disagree about what Windows can run.
+    """
+    return write_fake_executable
 
 
 def pytest_unconfigure(*_args):

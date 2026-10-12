@@ -588,6 +588,26 @@ class TestSkills:
     def test_install_needs_a_source(self, client):
         assert client.post("/skills/install", json={}).status_code == 422
 
+    def test_the_app_watches_skill_changes_at_runtime(
+        self, temp_core_db, temp_secrets, temp_workspace
+    ):
+        """`SKILL_CHANGED` must have a subscriber, or nothing ever reloads.
+
+        Create/enable/disable/delete publish that event; without the lifespan
+        subscriber the live registry stays a startup snapshot, so a skill
+        edited or disabled in the UI keeps its old tools until a restart
+        (§10C: "should not require a manual application restart"). The count
+        must also come back down — a watcher that survives shutdown keeps
+        reloading into registries the next run has replaced.
+        """
+        from api.main import app
+        from core.events import bus
+
+        before = bus.subscriber_count
+        with TestClient(app):
+            assert bus.subscriber_count > before, "SKILL_CHANGED is not watched"
+        assert bus.subscriber_count == before, "the watcher outlived shutdown"
+
 
 class TestProviders:
     def test_the_builtin_ollama_provider_exists(self, client):

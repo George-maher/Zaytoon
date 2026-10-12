@@ -41,6 +41,15 @@ _MAX_TRACES = 1000
 #: so they are tracked here and released when the socket closes.
 _TERMINAL_SUBSCRIPTIONS: dict = {}
 
+#: Sockets already told their speaker is silent this session. `stream_synthesize`
+#: swallows its failures — one dead sentence must not eat a reply that already
+#: streamed as text — which also makes the silence invisible from the transport
+#: side. Without a notice the user gets a reply that simply stops making noise.
+#: The notice goes out once per session while the failure persists, is re-armed
+#: by any successful synthesis, and never fires for an interrupt. Socket
+#: identity is enough: the entry is dropped when the socket closes.
+_TTS_SILENT_SESSIONS: set[int] = set()
+
 # Client-generated message ids already accepted, per session. A client that
 # retries a send — a double click, a reconnect replaying its last frame, a
 # socket library redelivering — must produce exactly ONE logical turn, and
@@ -521,12 +530,25 @@ async def create_websocket_handler(
         unsubscribe_core()
         for detach in _TERMINAL_SUBSCRIPTIONS.pop(id(websocket), []):
             detach()
+        _TTS_SILENT_SESSIONS.discard(id(websocket))
         _SESSION_ORCHESTRATORS.pop(session_id, None)
         state = session_states.pop(session_id, None)
         if state:
             if state.confirmation_manager:
                 state.confirmation_manager.cancel_all("websocket closed")
             state.cancel()
+
+
+#: Fixed bilingual notice for "the reply is complete, but the speaker is dead".
+#: Human-written, never derived from an exception's text — the wire carries the
+#: fact, the log carries the detail.
+_SPEECH_UNAVAILABLE_EN = (
+    "The reply above is complete, but no audio could be produced — "
+    "the voice service is unavailable right now."
+)
+_SPEECH_UNAVAILABLE_AR = (
+    "الرد أعلاه كامل، لكن تعذر إنتاج الصوت — خدمة الأصوات غير متاحة الآن."
+)
 
 
 async def _stream_tts_chunks(
@@ -588,6 +610,7 @@ async def _stream_tts_chunks(
         had_audio = True
 
         chunk_index = 0
+        failed = False
         try:
             async for audio_chunk in tts.stream_synthesize(
                 new_text, voice=voice, language=language,
@@ -604,6 +627,7 @@ async def _stream_tts_chunks(
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            failed = True
             safe_error(e, operation="tts", component="voice.tts")
             await connection_manager.send(websocket, add_trace({
                 "type": "error",
@@ -612,6 +636,32 @@ async def _stream_tts_chunks(
                     language=language if language in ("en", "ar") else "en",
                 ),
             }))
+
+        # No audio arrived for a reason the TTS layer recorded (the service
+        # refused us, the package is missing): name it once per session
+        # instead of leaving a silent speaker with no explanation. The
+        # `isinstance` gate is load-bearing — a MagicMock tts in the flow
+        # tests answers `getattr` with a Mock, which must not read as a
+        # recorded failure. A cancelled turn stays silent: the user chose it.
+        reason = getattr(tts, "last_stream_error", None)
+        if (
+            chunk_index == 0
+            and isinstance(reason, str)
+            and reason
+            and not failed
+            and not (cancel_event and cancel_event.is_set())
+        ):
+            if id(websocket) not in _TTS_SILENT_SESSIONS:
+                _TTS_SILENT_SESSIONS.add(id(websocket))
+                await connection_manager.send(websocket, add_trace({
+                    "type": "error",
+                    "content": _SPEECH_UNAVAILABLE_AR
+                    if language == "ar"
+                    else _SPEECH_UNAVAILABLE_EN,
+                }))
+        elif chunk_index > 0:
+            # Speech is working again; re-arm the notice for the next failure.
+            _TTS_SILENT_SESSIONS.discard(id(websocket))
 
         logger.info(f"TTS: {chunk_index} chunks, voice='{voice}'")
     finally:

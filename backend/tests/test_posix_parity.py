@@ -15,6 +15,7 @@ that gets answered.
 import asyncio
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,9 +104,20 @@ class TestDarwinCounters:
         assert parse("") is None
 
     def test_cpu_percent_across_two_samples(self, monkeypatch):
+        # The clock is pinned: Windows' monotonic() does not advance between
+        # two back-to-back calls here (measured: delta 0.0), so `_cpu` would
+        # honestly report "sampling" for the second reading forever. The
+        # arithmetic under test is the delta, not the OS timer — real samples
+        # are seconds apart, where the clock does advance.
         samples = iter([(1000, 100), (2000, 400)])
+        clock = iter([100.0, 101.0])
         monkeypatch.setattr(resources, "_cpu_ticks", lambda: samples.__next__())
         monkeypatch.setattr(resources, "_PREV", None)
+        monkeypatch.setattr(
+            resources,
+            "time",
+            SimpleNamespace(monotonic=lambda: next(clock)),
+        )
         first = resources._cpu()
         assert first == {"percent": None, "status": "sampling"}, first
         second = resources._cpu()

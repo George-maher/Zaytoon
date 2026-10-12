@@ -24,7 +24,11 @@ export default memo(function InputBar({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
-  onStop: _onStop,
+  onStop,
+  /** True while a turn is generating or speaking — the window in which STOP
+   *  means something. Without it the button would either always show (and
+   *  interrupt nothing) or never show. */
+  busy = false,
   multiline = false,
 }) {
   const inputRef = useRef(null);
@@ -162,6 +166,27 @@ export default memo(function InputBar({
           </button>
         )}
       </div>
+
+      {onStop && busy && (
+        <button
+          type="button"
+          onClick={onStop}
+          className="font-mono font-bold transition-all flex-none"
+          style={{
+            padding: "var(--space-3) var(--space-4)",
+            background: "color-mix(in srgb, var(--hud-red) 10%, transparent)",
+            color: "var(--hud-red)",
+            border: "var(--border-w) solid var(--hud-edge)",
+            borderInlineStartColor: "var(--hud-edge-faint)",
+            fontSize: "var(--font-md)",
+            letterSpacing: "0.18em",
+          }}
+          title={language === "ar" ? "إيقاف التوليد الحالي" : "Stop the current response"}
+          aria-label={language === "ar" ? "إيقاف" : "Stop"}
+        >
+          {language === "ar" ? "إيقاف" : "STOP"}
+        </button>
+      )}
 
       <button
         type="submit"

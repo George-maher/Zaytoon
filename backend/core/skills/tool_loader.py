@@ -155,15 +155,42 @@ def _raise_floor(tool: BaseTool) -> None:
         tool.permission = PERMISSION_CONFIRM
 
 
+def _loaded_map(registry: Any) -> Dict[str, List[str]]:
+    """Tools this loader registered on ``registry``, keyed by skill name.
+
+    Kept on the registry rather than in a module global: callers (and tests)
+    build a fresh registry per run, and a global map would have one run's tool
+    names "removed" from another run's registry. If the registry will not take
+    the attribute, tracking degrades to nothing and resync silently does not
+    happen — the loader's contract is that it never raises.
+    """
+    existing = getattr(registry, "_skill_tools", None)
+    if isinstance(existing, dict):
+        return existing
+    created: Dict[str, List[str]] = {}
+    try:
+        registry._skill_tools = created  # noqa: SLF001 — see docstring
+    except Exception:  # noqa: BLE001
+        return created
+    return created
+
+
 async def load_skill_tools(
     registry: Any, root: Optional[str] = None
 ) -> Dict[str, Any]:
     """Register every enabled skill's tools into ``registry``.
 
-    Returns ``{"skills": N, "modules": N, "tools": [names], "errors": [...]}``.
-    Never raises: an unreadable skills directory or a failing module is an
-    entry in ``errors``, because the caller is startup and the requirement is
-    that a broken skill cannot stop the app from booting.
+    Returns ``{"skills": N, "modules": N, "tools": [names], "removed": [names],
+    "errors": [...]}``. Never raises: an unreadable skills directory or a
+    failing module is an entry in ``errors``, because the caller is startup and
+    the requirement is that a broken skill cannot stop the app from booting.
+
+    This is a **sync**, not a first-time load: a second call replaces what the
+    first registered for each skill (an edited module's new code wins), and
+    takes the tools of a skill that is no longer enabled — disabled and deleted
+    skills must not stay callable until a restart. Only the *skill loader's own*
+    tools are replaced: a name that collides with a built-in is still refused,
+    because the built-in was never registered by this loader.
     """
     from core.skills.registry import enabled_names, skills_root
 
@@ -172,6 +199,10 @@ async def load_skill_tools(
         "modules": 0,
         "tools": [],
         "errors": [],
+        #: Tools unregistered because their skill was disabled, deleted or is
+        #: being reloaded. A sync has to say what it took out, or "nothing
+        #: changed" and "everything was replaced" are indistinguishable.
+        "removed": [],
         #: Tools whose needs exceed their skill's declaration. Advisory unless
         #: ``SKILL_STRICT_PERMISSIONS``; kept out of ``errors`` in that case so a
         #: caller's "did anything break" check keeps meaning what it used to.
@@ -192,7 +223,30 @@ async def load_skill_tools(
 
     strict = bool(getattr(config, "SKILL_STRICT_PERMISSIONS", False))
 
+    loaded = _loaded_map(registry)
+    unregister = getattr(registry, "unregister", None)
+
+    def _forget(skill: str) -> None:
+        """Drop the tools this loader previously registered for ``skill``."""
+        for tool_name in loaded.pop(skill, []):
+            if unregister is None:
+                continue
+            try:
+                unregister(tool_name)
+            except Exception:  # noqa: BLE001 — one stale tool is not an error
+                continue
+            report["removed"].append(f"{skill}.{tool_name}")
+
+    # Disabled or deleted since the last load: its tools leave with it.
+    for stale in [s for s in list(loaded) if s not in names]:
+        _forget(stale)
+
     for name in names:
+        # Replace, don't collide: these are the skill's *own* previous tools,
+        # and without dropping them a reload of an even an unchanged skill
+        # would trip `register(replace=False)` on its own name — an edited
+        # module's code would never reach the registry.
+        _forget(name)
         skill_dir = os.path.join(base, name)
         if not os.path.isdir(skill_dir):
             # Enabled in the database but gone from disk: the user needs to
@@ -284,6 +338,7 @@ async def load_skill_tools(
                     )
                 else:
                     report["tools"].append(f"{name}.{tool.name()}")
+                    loaded.setdefault(name, []).append(tool.name())
 
     for entry in report["policy"]:
         logger.warning(

@@ -30,8 +30,7 @@ from core.virtualization.vmware import VMwareWorkstation
 # ---------------------------------------------------------------------------
 # The fake executable
 # ---------------------------------------------------------------------------
-_FAKE_VMRUN = '''#!{python}
-"""A stand-in for `vmrun`. Reads its scenario from $FAKE_VMRUN_STATE."""
+_FAKE_VMRUN = '''"""A stand-in for `vmrun`. Reads its scenario from $FAKE_VMRUN_STATE."""
 import json, os, sys
 
 state_path = os.environ.get("FAKE_VMRUN_STATE", "")
@@ -78,11 +77,14 @@ sys.exit(int(response.get("returncode", 0)))
 
 
 @pytest.fixture
-def fake_vmrun(tmp_path):
-    """A scenario-driven fake `vmrun`, plus handles to drive it."""
-    script = tmp_path / "vmrun"
-    script.write_text(_FAKE_VMRUN.format(python=sys.executable), encoding="utf-8")
-    script.chmod(0o755)
+def fake_vmrun(tmp_path, fake_exe):
+    """A scenario-driven fake `vmrun`, plus handles to drive it.
+
+    Written through the shared `fake_exe` factory: a shebang script cannot
+    execute on Windows (`WinError 193`), which failed all 28 of these tests
+    on the development platform before any assertion ran.
+    """
+    script = fake_exe(tmp_path / "vmrun", _FAKE_VMRUN)
 
     state_file = tmp_path / "state.json"
     log_file = tmp_path / "calls.log"

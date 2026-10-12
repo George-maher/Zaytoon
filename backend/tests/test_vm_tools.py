@@ -28,8 +28,7 @@ from tools.base import ToolValidationError
 # ---------------------------------------------------------------------------
 # A fake `ssh`, so the argv and the exit-code handling are real
 # ---------------------------------------------------------------------------
-_FAKE_SSH = '''#!{python}
-"""A stand-in for `ssh`. Reads its script from $FAKE_SSH_SCRIPT."""
+_FAKE_SSH = '''"""A stand-in for `ssh`. Reads its script from $FAKE_SSH_SCRIPT."""
 import json, os, sys
 
 argv = sys.argv[1:]
@@ -54,10 +53,11 @@ sys.exit(int(script.get("exit_code", 0)))
 
 
 @pytest.fixture
-def fake_ssh(tmp_path):
-    script = tmp_path / "ssh"
-    script.write_text(_FAKE_SSH.format(python=sys.executable), encoding="utf-8")
-    script.chmod(0o755)
+def fake_ssh(tmp_path, fake_exe):
+    # Written through the shared factory rather than as a shebang script:
+    # Windows cannot execute those (`WinError 193`), so on the development
+    # platform every guest test failed before a single assertion ran.
+    script = fake_exe(tmp_path / "ssh", _FAKE_SSH)
     scenario = tmp_path / "ssh_scenario.json"
     log = tmp_path / "ssh_calls.log"
     scenario.write_text("{}", encoding="utf-8")

@@ -665,6 +665,8 @@ export default memo(function App() {
           onVoiceStart={startVoiceMode}
           onVoiceStop={stopVoiceMode}
           voiceMode={voiceMode}
+          onStop={requestStop}
+          busy={isTyping || isSpeaking || !!pendingConfirmation}
         />
       )}
 

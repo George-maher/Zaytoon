@@ -335,6 +335,7 @@ export default memo(function ChatView({
           onVoiceStop={onVoiceStop}
           voiceMode={voiceMode}
           onStop={onStop}
+          busy={isTyping || isSpeaking || !!pendingConfirmation}
           multiline
         />
       </div>

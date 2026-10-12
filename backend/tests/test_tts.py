@@ -72,3 +72,79 @@ def test_stream_synthesize_not_available():
             chunks.append(chunk)
         assert len(chunks) == 0
     asyncio.run(test())
+
+
+async def test_a_missing_package_is_recorded_as_a_reason():
+    """Silence with a cause must leave a trace the transport can read."""
+    tts = TextToSpeech()
+    tts._available = False
+    [c async for c in tts.stream_synthesize("Hello")]
+    assert tts.last_stream_error == "edge-tts is not installed"
+
+
+async def test_a_swallowed_stream_failure_leaves_a_readable_reason(monkeypatch):
+    """`stream_synthesize` never raises — so silence must still be traceable.
+
+    One dead sentence must not eat a reply that already streamed as text,
+    which also makes the failure invisible from the transport's side. The
+    recorded class name is the seam that lets the transport name it; the
+    detail stays in the redacted log line.
+    """
+    import edge_tts
+
+    class Boom:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            raise RuntimeError("refused")
+            yield b""  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(edge_tts, "Communicate", Boom)
+    tts = TextToSpeech()
+    tts._available = True
+
+    chunks = [c async for c in tts.stream_synthesize("hello there")]
+
+    assert chunks == []
+    assert tts.last_stream_error == "RuntimeError"
+    assert "refused" not in (tts.last_stream_error or "")
+
+
+async def test_a_successful_stream_clears_a_previous_failure(monkeypatch):
+    """A recovered service must re-arm the transport's one-shot notice."""
+    import edge_tts
+
+    class Refuser:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            raise RuntimeError("refused")
+            yield b""  # pragma: no cover
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"\x00\x01"}
+
+    monkeypatch.setattr(edge_tts, "Communicate", Refuser)
+    tts = TextToSpeech()
+    tts._available = True
+    [c async for c in tts.stream_synthesize("hello there")]
+    assert tts.last_stream_error == "RuntimeError"
+
+    monkeypatch.setattr(edge_tts, "Communicate", Worker)
+    chunks = [c async for c in tts.stream_synthesize("hello again")]
+
+    assert chunks == [b"\x00\x01"]
+    assert tts.last_stream_error is None
+
+
+async def test_empty_text_is_nothing_to_say_not_a_failure():
+    tts = TextToSpeech()
+    tts._available = True
+    [c async for c in tts.stream_synthesize("   ")]
+    assert tts.last_stream_error is None

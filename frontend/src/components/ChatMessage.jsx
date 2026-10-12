@@ -102,6 +102,72 @@ export default memo(function ChatMessage({ msg, language }) {
             </span>
           )}
         </p>
+        {!isUser && Array.isArray(msg.sources) && msg.sources.length > 0 && (
+          <div
+            style={{ marginTop: "var(--space-2)", borderTop: "1px dashed var(--zt-border-subtle)", paddingTop: "var(--space-2)" }}
+          >
+            <span
+              className="font-mono"
+              style={{
+                color: "var(--hud-text-mute)",
+                fontSize: "var(--font-xs)",
+                letterSpacing: "0.16em",
+                display: "block",
+                marginBottom: "var(--space-1)",
+              }}
+            >
+              {language === "ar" ? "المصادر" : "SOURCES"}
+            </span>
+            <ol
+              dir="ltr"
+              className="font-mono"
+              style={{
+                display: "grid",
+                gap: "2px",
+                fontSize: "var(--font-xs)",
+                listStyle: "none",
+                padding: 0,
+                margin: 0,
+              }}
+            >
+              {msg.sources.map((src, i) => {
+                const href =
+                  typeof src?.url === "string" && /^https?:\/\//i.test(src.url) ? src.url : null;
+                const label = src?.title || src?.host || href || "";
+                return (
+                  <li key={`${src?.n ?? i}-${href || label}`} style={{ display: "flex", gap: "6px" }}>
+                    <span style={{ color: "var(--zt-accent-dim)" }}>{src?.n ?? i + 1}</span>
+                    {href ? (
+                      <a
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={href}
+                        style={{
+                          color: "var(--hud-cyan)",
+                          textDecoration: "none",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          maxWidth: "100%",
+                        }}
+                      >
+                        {label}
+                      </a>
+                    ) : (
+                      <span style={{ color: "var(--hud-text-dim)" }}>{label}</span>
+                    )}
+                    {src?.kind === "snippet" && (
+                      <span style={{ color: "var(--hud-text-faint, var(--hud-text-mute))" }}>
+                        {language === "ar" ? "(مقتطف)" : "(snippet)"}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        )}
         <div className="flex items-center" style={{ gap: "var(--space-3)", marginTop: "var(--space-2)" }}>
           <span
             className="font-mono"
