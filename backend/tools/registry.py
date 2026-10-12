@@ -414,6 +414,16 @@ class ToolRegistry:
         if confirmation_manager is None:
             return None
         try:
+            # Prefer the assessment-aware entry point when the channel has one.
+            # `request` alone re-derives the tier from name tables that cannot
+            # see a tool's own declaration, which is how a `confirm`-declared
+            # tool (and every skill tool) used to be approved with no prompt.
+            # Duck-typed channels — test doubles, embedders — only implement
+            # `request`, and are explicit decisions by construction, so they
+            # keep working unchanged.
+            aware = getattr(confirmation_manager, "request_with_assessment", None)
+            if aware is not None:
+                return bool(await aware(assessment, action, params))
             return bool(await confirmation_manager.request(action, params))
         except Exception as e:
             # Fail closed: an error in the approval channel is a denial.
@@ -483,15 +493,17 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
         local_exec,
         media,
         processes,
+        security,
         system,
         terminal,
+        virtualization,
         web,
     )
 
     registry = ToolRegistry(assessor=assessor)
     for module in (
         filesystem, terminal, local_exec, processes, applications, system,
-        web, fetch, git, coding, media,
+        web, fetch, git, coding, media, security, virtualization,
     ):
         registry.register_all(module.build_tools())
     logger.info("Tool registry ready with %d tools: %s", len(registry), registry.list())

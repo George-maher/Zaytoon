@@ -541,12 +541,35 @@ export async function getSkill(name) {
   return data;
 }
 
-/** Create a skill. It lands **disabled** — writing one is not activating it. */
-export async function createSkill(name, { description = "", instructions = "" } = {}) {
+/**
+ * The permission vocabulary a skill manifest may declare.
+ *
+ * Served by the backend rather than hard-coded here: the manifest validator
+ * rejects an unknown name, so a second copy in the client is a list that drifts
+ * into offering the user a permission the backend will refuse.
+ */
+export async function getSkillPermissions() {
+  const res = await fetch(`${API_BASE}/skills/permissions`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { permissions: [], max_enabled: 0, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Create a skill. It lands **disabled** — writing one is not activating it.
+ *
+ * `permissions` is what the skill *declares* it wants; the backend validates it
+ * against the vocabulary above and refuses an unknown name. Declaring is not
+ * granting: enforcement stays in the tool registry's gate.
+ */
+export async function createSkill(
+  name,
+  { description = "", instructions = "", permissions = [], tags = [] } = {},
+) {
   const res = await fetch(`${API_BASE}/skills`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, instructions }),
+    body: JSON.stringify({ name, description, instructions, permissions, tags }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
@@ -1058,4 +1081,182 @@ export async function getProcessLogs(id, tail = 40) {
     status: typeof data.status === "string" ? data.status : "",
     lines: Array.isArray(data.lines) ? data.lines : [],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Security workspace — target authorisations and the authorised probe
+// ---------------------------------------------------------------------------
+export async function getSecurityAuthorizations() {
+  const res = await fetch(`${API_BASE}/security/authorizations`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return { authorizations: [], operations: [], active_count: 0, error: data.error || `HTTP ${res.status}` };
+  }
+  return data;
+}
+
+/**
+ * Record a target authorisation.
+ *
+ * A 422 means the pattern was refused — a whole-internet wildcard, a public
+ * suffix, a single label. The message names the reason and is shown verbatim.
+ */
+export async function authorizeSecurityTarget({ targets, operations, ttl_days = null, note = "" }) {
+  const res = await fetch(`${API_BASE}/security/authorizations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ targets, operations, ttl_days, note }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function revokeSecurityAuthorization(id) {
+  const res = await fetch(`${API_BASE}/security/authorizations/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Run one non-destructive probe.
+ *
+ * Two steps, because `security_probe` is a `confirm`-tier tool and the approval
+ * has to be real. The first call opens no socket at all and returns a token
+ * plus what the probe *would* do; the second carries the user's answer. Scope
+ * refusal comes back as `{refused: true, message}` rather than an error, since
+ * that is the control working as intended and not a failure.
+ */
+export async function runSecurityProbe(url, { includeBody = false } = {}) {
+  const first = await fetch(`${API_BASE}/security/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, include_body: includeBody }),
+  });
+  const preview = await first.json().catch(() => ({}));
+  if (!first.ok) return { error: preview.error || `HTTP ${first.status}` };
+  if (preview.refused) return preview;
+  if (!preview.confirm) return { error: "The backend did not return a confirmation token." };
+
+  const second = await fetch(`${API_BASE}/security/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, include_body: includeBody, confirm: preview.confirm }),
+  });
+  const result = await second.json().catch(() => ({}));
+  if (!second.ok) return { error: result.error || `HTTP ${second.status}` };
+  if (result.success === false && result.error && !result.data) return { error: result.error };
+  const data = result.data || {};
+  return {
+    output: result.output || "",
+    status: data.status,
+    findings: data.findings || [],
+    authorization_id: data.authorization_id || preview.authorization_id,
+    authorized_target: data.authorized_target || preview.authorized_target,
+    error: result.error,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Virtual machines — VMware discovery, inventory and lifecycle
+// ---------------------------------------------------------------------------
+// Every lifecycle call is two-stage on purpose. The first request resolves the
+// machine and describes what would happen, opening nothing; the second carries
+// only the token, and the backend runs the operation that was previewed. So the
+// page shows the user a *named* machine and a specific action, and the approve
+// click is for that and nothing else.
+export async function getHypervisors() {
+  const res = await fetch(`${API_BASE}/virtualization/hypervisors`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { hypervisors: [], any_available: false, error: `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getVirtualMachines(runningOnly = false) {
+  const params = runningOnly ? "?running_only=true" : "";
+  const res = await fetch(`${API_BASE}/virtualization/vms${params}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { vms: [], count: 0, success: false, error: `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getVirtualMachine(ref) {
+  const res = await fetch(
+    `${API_BASE}/virtualization/vms/one?ref=${encodeURIComponent(ref)}`,
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getGuestConfig() {
+  const res = await fetch(`${API_BASE}/virtualization/guest`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { configured: false, problems: [], error: `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Step 1 — what would happen, to nothing.
+ *
+ * Returns the resolved machine, the tool's tier and any warnings. A refusal
+ * (an unknown or ambiguous name) comes back as `{success: false, error}` and is
+ * shown as-is: the backend's message lists the candidates, which is the only
+ * useful thing to say when a name did not identify one machine.
+ */
+export async function previewVmAction(ref, action, { mode, gui, waitForReady } = {}) {
+  const body = { ref, action };
+  if (mode) body.mode = mode;
+  if (gui !== undefined) body.gui = gui;
+  if (waitForReady !== undefined) body.wait_for_ready = waitForReady;
+  const res = await fetch(`${API_BASE}/virtualization/vms/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Step 2 — carry the user's answer. The operation comes from the token. */
+export async function confirmVmAction(token, { ref, action } = {}) {
+  const res = await fetch(`${API_BASE}/virtualization/vms/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: token, ref, action }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Step 1 of running a command in a guest. */
+export async function previewGuestExec(command, { vm, host, timeout } = {}) {
+  const body = { command };
+  if (vm) body.vm = vm;
+  if (host) body.host = host;
+  if (timeout) body.timeout = timeout;
+  const res = await fetch(`${API_BASE}/virtualization/guest/exec`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function confirmGuestExec(token, command) {
+  const res = await fetch(`${API_BASE}/virtualization/guest/exec`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: token, command }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
 }

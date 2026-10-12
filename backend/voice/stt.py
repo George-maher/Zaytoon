@@ -43,6 +43,18 @@ class TranscriptionResult:
     The language detected by Whisper is more trustworthy than re-sniffing the
     transcript text, so it is carried explicitly rather than being re-guessed
     downstream.
+
+    ``language`` is *always* derived from the audio:
+    :meth:`SpeechToText.transcribe_detailed` re-derives it from the transcript
+    even when the caller supplied a hint, so it is the language that was
+    actually spoken whatever the client guessed.
+
+    ``detected`` means "the caller supplied no hint" — a statement about the
+    *request*, not a confidence score for ``language``. It must never be used
+    to decide whether ``language`` is trustworthy: a client that always sends a
+    hint (the browser client does) would then never be told which language it
+    just spoke, and the UI could not switch to Arabic on a spoken Arabic
+    request. Use ``language`` for that.
     """
 
     text: str
@@ -137,7 +149,11 @@ class SpeechToText:
         re-derived from the transcript so a wrong hint cannot misroute the TTS
         voice.
         """
-        auto_detected = not language
+        # `detected` records whether the *caller* supplied a hint. It is not
+        # a statement about the returned language: that is re-derived from
+        # the transcript below either way, which is what makes it safe for
+        # the transport to report it unconditionally.
+        no_hint_supplied = not language
         hint = routing.normalize_language(language) if language else None
 
         loaded = self._load_model()
@@ -146,13 +162,13 @@ class SpeechToText:
                 err = self._load_error or "STT model not loaded"
                 logger.warning(f"transcribe() skipped: {err}")
             return TranscriptionResult(
-                "", hint or routing.DEFAULT_LANGUAGE, False
+                "", hint or routing.DEFAULT_LANGUAGE, no_hint_supplied
             )
 
         if len(audio_data) < 100:
             logger.warning(f"Audio too small ({len(audio_data)} bytes), discarding")
             return TranscriptionResult(
-                "", hint or routing.DEFAULT_LANGUAGE, False
+                "", hint or routing.DEFAULT_LANGUAGE, no_hint_supplied
             )
 
         audio_format = detect_audio_format(audio_data)
@@ -195,7 +211,7 @@ class SpeechToText:
             return TranscriptionResult(
                 text=cleaned,
                 language=detected_lang,
-                detected=auto_detected,
+                detected=no_hint_supplied,
                 duration=float(getattr(info, "duration", 0.0) or 0.0),
                 voice_hint=routing.get_voice(detected_lang),
             )
@@ -203,7 +219,7 @@ class SpeechToText:
         except Exception as e:
             safe_error(e, operation="transcribe", component="voice.stt")
             return TranscriptionResult(
-                "", hint or routing.DEFAULT_LANGUAGE, False
+                "", hint or routing.DEFAULT_LANGUAGE, no_hint_supplied
             )
         finally:
             if tmp_path and os.path.exists(tmp_path):

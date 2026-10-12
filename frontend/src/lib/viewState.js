@@ -36,6 +36,8 @@ export const VIEWS = Object.freeze({
   WORKSPACE: "workspace",
   TASKS: "tasks",
   SKILLS: "skills",
+  SECURITY: "security",
+  MACHINES: "machines",
   MODELS: "models",
   SETTINGS: "settings",
 });
@@ -48,6 +50,8 @@ export const VIEW_LIST = Object.freeze([
   VIEWS.WORKSPACE,
   VIEWS.TASKS,
   VIEWS.SKILLS,
+  VIEWS.SECURITY,
+  VIEWS.MACHINES,
   VIEWS.MODELS,
   VIEWS.SETTINGS,
 ]);
@@ -106,6 +110,27 @@ const META = Object.freeze({
     en: "Skills",
     ar: "المهارات",
     glyph: "✦",
+  }),
+  [VIEWS.SECURITY]: Object.freeze({
+    kind: "screen",
+    // SecurityView: target authorisations + the non-destructive probe. It is
+    // `ready` because it mounts — the page manages authorisations and runs
+    // probes; it is not a placeholder for a scanner that does not exist.
+    ready: true,
+    en: "Security",
+    ar: "الأمان",
+    glyph: "⛨",
+  }),
+  [VIEWS.MACHINES]: Object.freeze({
+    kind: "screen",
+    // VirtualMachinesView: hypervisor discovery, VM inventory with the
+    // observation behind each state, and the lifecycle actions — each of which
+    // is previewed and then explicitly confirmed, because powering a machine
+    // off is not something a single stray click should do.
+    ready: true,
+    en: "Virtual Machines",
+    ar: "الأنظمة الافتراضية",
+    glyph: "◫",
   }),
   [VIEWS.MODELS]: Object.freeze({
     kind: "screen",

@@ -70,7 +70,33 @@ def _native_module_reason(module: str) -> str:
 
 
 _TK_MISSING = _tk_unavailable_reason()
-_AUDIO_MISSING = _native_module_reason("sounddevice") if not _TK_MISSING else ""
+#: Probed unconditionally. An earlier revision wrote
+#: ``_native_module_reason("sounddevice") if not _TK_MISSING else ""``, which
+#: made the audio probe conditional on Tk being *present*. On a host missing
+#: both — a plain Linux container, i.e. the documented Docker and CI case —
+#: the audio check never ran, `test_audio_pipeline.py` was therefore not
+#: ignored, and it died at collection with `OSError: PortAudio library not
+#: found`: a hard error that reads like a broken audio pipeline. Two
+#: independent native libraries need two independent probes.
+_AUDIO_MISSING = _native_module_reason("sounddevice")
+
+
+def modules_to_ignore(*, tk_reason: str, audio_reason: str) -> list[str]:
+    """Which test modules this host cannot even collect.
+
+    Pure, so the policy is testable without arranging for a real machine to be
+    missing Tk: see ``tests/test_native_skip_policy.py``. De-duplicated in
+    declaration order, because `test_telemetry.py` needs both.
+    """
+    ignored: list[str] = []
+    for reason, modules in ((tk_reason, _TK_DEPENDENT), (audio_reason, _AUDIO_DEPENDENT)):
+        if not reason:
+            continue
+        for module in modules:
+            if module not in ignored:
+                ignored.append(module)
+    return ignored
+
 
 for _reason, _modules in ((_TK_MISSING, _TK_DEPENDENT), (_AUDIO_MISSING, _AUDIO_DEPENDENT)):
     if _reason:
@@ -80,9 +106,7 @@ for _reason, _modules in ((_TK_MISSING, _TK_DEPENDENT), (_AUDIO_MISSING, _AUDIO_
         )
 
 if _TK_MISSING or _AUDIO_MISSING:
-    _skipped = (_TK_DEPENDENT if _TK_MISSING else []) + (
-        _AUDIO_DEPENDENT if _AUDIO_MISSING else []
-    )
+    _skipped = modules_to_ignore(tk_reason=_TK_MISSING, audio_reason=_AUDIO_MISSING)
     collect_ignore = _skipped
     _missing = "; ".join(
         reason for reason in (_TK_MISSING, _AUDIO_MISSING) if reason

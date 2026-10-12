@@ -27,7 +27,9 @@ carry the whole contract:
 ```
 
 ``permissions`` is what the skill *asks for*, declared from the same
-ten-name vocabulary the tool tiers derive from (see :mod:`core.permissions`).
+named vocabulary the tool tiers derive from (see :mod:`core.permissions`) —
+which is why the count is not written down here: it grew when virtualization
+added its three grants, and a number in prose is a number that will be wrong.
 It is inspection, not enforcement: the loader's tier floor (``confirm``) is
 what actually restrains a skill's tools, because a manifest is a claim and
 the floor is a fact. An unknown name is rejected here so the declaration

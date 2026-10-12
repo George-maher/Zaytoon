@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from core.api.approvals import ApprovalTokens, run_approved_tool
 from core.permissions import DECISION_ASK, VALID_DECISIONS, describe as describe_permissions
 from core.providers import (
     VALID_TIERS,
@@ -61,6 +62,31 @@ async def skills_list() -> Dict[str, Any]:
     return await list_skills()
 
 
+@skills_router.get("/skills/permissions")
+async def skills_permissions() -> Dict[str, Any]:
+    """The permission vocabulary a skill manifest may declare.
+
+    Declared *before* ``/skills/{name}`` on purpose: FastAPI matches routes in
+    declaration order, so with the parameterised route first this path would be
+    read as a skill literally named "permissions" and answer 404.
+
+    The list is served from ``ALL_PERMISSIONS`` rather than restated in the
+    client, so the picker in the Skills page cannot drift from what the
+    manifest validator accepts — the drift failure mode being a user choosing
+    a permission the backend then rejects with a message about a name they
+    never typed.
+    """
+    from core.permissions import ALL_PERMISSIONS
+
+    return {
+        "permissions": [
+            {"name": permission.value, "label": permission.label}
+            for permission in sorted(ALL_PERMISSIONS, key=lambda p: p.value)
+        ],
+        "max_enabled": MAX_ENABLED,
+    }
+
+
 @skills_router.get("/skills/{name}")
 async def skill_get(name: str) -> Dict[str, Any]:
     detail = skill_detail(name)
@@ -93,6 +119,14 @@ async def skill_create(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             description=(data.get("description") or "").strip(),
             instructions=data.get("instructions"),
             enabled=bool(data.get("enabled", False)),
+            # These two were accepted by the client and dropped here, so a skill
+            # created asking for `filesystem.read` came back with
+            # `permissions: []` — the UI then reported "asks for: (nothing)"
+            # and the requirement that a skill's requested permissions be
+            # visible before it is enabled could not be met. `create` validates
+            # them against the known vocabulary, so a bad name is a 422.
+            permissions=data.get("permissions"),
+            tags=data.get("tags"),
         )
     except SkillExists as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -545,3 +579,172 @@ async def system_info() -> Dict[str, Any]:
         "workspace": str(config.workspace_path),
         "paths": paths.describe(),
     }
+
+# ===========================================================================
+# Security workspace — target authorisation
+# ===========================================================================
+security_router = APIRouter()
+
+
+@security_router.get("/security/authorizations")
+async def security_authorizations() -> Dict[str, Any]:
+    """Every target authorisation, active and lapsed, with the operation list."""
+    from core.security import scope
+
+    return await scope.describe()
+
+
+@security_router.post("/security/authorizations", status_code=201)
+async def security_authorize(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Record an authorisation for user-stated targets.
+
+    This is the **only** way an active assessment becomes permitted. There is
+    deliberately no tool that reaches it: a model must not be able to widen its
+    own scope, and a test asserts no registered tool imports this module.
+
+    ``targets`` takes a host, an address, a CIDR, or a ``*.domain`` wildcard. A
+    pattern covering every host is refused by the validator — an authorisation
+    for everything is not an authorisation, and storing one would make the
+    record a lie the UI then displays as a real scope.
+    """
+    from core.security import scope
+
+    targets = data.get("targets")
+    if isinstance(targets, str):
+        targets = [targets]
+    if not targets:
+        single = data.get("target")
+        targets = [single] if single else []
+    operations = data.get("operations")
+    if isinstance(operations, str):
+        operations = [operations]
+    if not operations:
+        operations = [scope.OP_HTTP_PROBE]
+
+    ttl = data.get("ttl_days")
+    try:
+        ttl_days = None if ttl in (None, "") else float(ttl)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "ttl_days must be a number") from None
+
+    try:
+        created = await scope.create(
+            targets,
+            operations,
+            note=str(data.get("note") or ""),
+            ttl_days=ttl_days,
+        )
+    except scope.ScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return created.to_dict()
+
+
+@security_router.delete("/security/authorizations/{authorization_id}")
+async def security_revoke(authorization_id: str) -> Dict[str, Any]:
+    """Revoke an authorisation.
+
+    The row is kept with a ``revoked_at`` stamp rather than deleted: a report
+    that says which authorisation permitted a probe has to stay true afterwards,
+    which it cannot if the record is gone.
+    """
+    from core.security import scope
+
+    if not await scope.revoke(authorization_id):
+        raise HTTPException(404, f"No active authorisation: {authorization_id}")
+    return {"id": authorization_id, "revoked": True}
+
+
+# ===========================================================================
+# The probe endpoint: a real approval, in two steps
+# ===========================================================================
+# `security_probe` is a `confirm`-tier tool, so a single REST call that ran it
+# would have to either bypass the gate (never) or invent an approval (also
+# never). The WebSocket path solves this by asking the user and awaiting the
+# answer; REST has no channel to ask on. So the ask is split across two requests
+# that the Security Workspace performs as two clicks:
+#
+#   1. `{url}`                 → scope check only; no socket is opened. Returns
+#                                what the probe *would* do, plus a token.
+#   2. `{url, confirm: token}` → the same call, carrying the user's answer.
+#
+# The gate still runs on step 2. It is answered by calling
+# `ConfirmationManager.resolve()` on the one request this endpoint caused —
+# which is the same call the WebSocket handler makes when the user clicks
+# Approve, except the click happened on this page. Nothing is skipped:
+# validation, scope authorisation, the tier gate and the audit record all run
+# in order, and the approval is recorded against a request the manager itself
+# issued.
+#
+# A token is single-use and short-lived. Tokens are held in memory rather than
+# the database: an approval is a gesture in the moment, and a durable one that
+# outlived the page it was given on would be a standing permission, which is
+# what the authorisation record is for.
+#
+# The machinery moved to `core.api.approvals` when the VM routes needed the same
+# thing. These names are kept — and kept pointing at the *same objects* — so the
+# probe's own behaviour and its tests are unchanged by the move, while there is
+# only one implementation of "mint, expire, spend".
+_PROBE_APPROVALS = ApprovalTokens(ttl=120.0, cap=256, prefix="probe")
+_PROBE_TOKENS: Dict[str, float] = _PROBE_APPROVALS.tokens
+_PROBE_TOKEN_TTL_S = _PROBE_APPROVALS.ttl
+_PROBE_TOKEN_MAX = _PROBE_APPROVALS.cap
+_prune_probe_tokens = _PROBE_APPROVALS.prune
+
+
+@security_router.post("/security/probe")
+async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """A non-destructive HTTP probe against a target the user authorised.
+
+    Two-step. Step 1 opens no socket at all, so a preview can never have a side
+    effect on the target.
+    """
+    from core.security import scope
+
+    url = (data.get("url") or "").strip()
+    if not url:
+        raise HTTPException(422, "'url' is required")
+    include_body = bool(data.get("include_body", False))
+    confirm = (data.get("confirm") or "").strip()
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not host:
+        raise HTTPException(422, "'url' must be an absolute http(s) URL")
+
+    # -- Scope, before anything else. The same call the tool will make, so the
+    #    preview cannot disagree with the attempt.
+    try:
+        authorization = await scope.require_authorized(host, scope.OP_HTTP_PROBE)
+    except scope.OutOfScope as exc:
+        return {"refused": True, "reason": "out_of_scope", "message": str(exc)}
+    except scope.ScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    if not confirm:
+        token = _PROBE_APPROVALS.issue()
+        return {
+            "requires_confirmation": True,
+            "confirm": token,
+            "url": url,
+            "host": host,
+            "authorization_id": authorization.id,
+            "authorized_target": authorization.target,
+            "message": (
+                f"Sends one non-destructive GET to {host}, under authorisation "
+                f"{authorization.id}. Nothing is written on the target."
+            ),
+        }
+
+    if not _PROBE_APPROVALS.consume(confirm):
+        raise HTTPException(
+            409, "Unknown or expired confirmation token. Request the probe again."
+        )
+
+    # -- Step 2: the user answered. Run it through the process's real registry.
+    result = await run_approved_tool(
+        "security_probe", {"url": url, "include_body": include_body}
+    )
+    if isinstance(result, dict):
+        result.setdefault("authorization_id", authorization.id)
+        result.setdefault("authorized_target", authorization.target)
+    return result

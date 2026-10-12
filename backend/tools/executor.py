@@ -66,7 +66,7 @@ class ToolExecutor:
         reminder_service=None,
         scheduler=None,
         confirmation_manager: Optional[ConfirmationManager] = None,
-        risk_assessor: Optional[iskAssessor] = None,
+        risk_assessor: Optional[RiskAssessor] = None,
         registry: Optional[ToolRegistry] = None,
     ) -> None:
         self.toolkit = toolkit  # accepted for compatibility; unused

@@ -47,6 +47,14 @@ class Permission(str, Enum):
     GIT_WRITE = "git.write"
     GIT_DESTRUCTIVE = "git.destructive"
     SYSTEM_MODIFY = "system.modify"
+    # Virtualization is three names, not one, on purpose. Starting a VM,
+    # running a command *inside* it, and driving its GUI have different blast
+    # radii, and a single `vm.manage` grant would let consent given for the
+    # first silently authorise the second. `vm.discover` is separate again so
+    # read-only inventory does not require a lifecycle grant.
+    VM_DISCOVER = "vm.discover"
+    VM_MANAGE = "vm.manage"
+    VM_GUEST_EXECUTE = "vm.guest.exec"
 
     @property
     def label(self) -> str:
@@ -64,6 +72,9 @@ _PERMISSION_LABELS: Dict[Permission, str] = {
     Permission.GIT_WRITE: "Change repository state",
     Permission.GIT_DESTRUCTIVE: "Irreversible git operations",
     Permission.SYSTEM_MODIFY: "Change system state",
+    Permission.VM_DISCOVER: "List virtual machines",
+    Permission.VM_MANAGE: "Start, stop and suspend virtual machines",
+    Permission.VM_GUEST_EXECUTE: "Run commands inside a virtual machine",
 }
 
 ALL_PERMISSIONS: FrozenSet[Permission] = frozenset(Permission)
@@ -193,6 +204,27 @@ def _capabilities_for(name: str) -> FrozenSet[Permission]:
 
     if name in ("get_time", "system_info", "calculator"):
         return frozenset()
+
+    # -- Virtualization ---------------------------------------------------
+    # Inventory is read-only. It starts no VM and contacts no guest.
+    if name in ("vm_list", "vm_status", "list_vms", "list_virtual_machines"):
+        return frozenset({Permission.VM_DISCOVER})
+
+    # Lifecycle acts on the host's hypervisor: it powers a machine on or off.
+    # `vm_open_console` is here rather than under desktop automation because
+    # what it opens is a VM console window, which is managed by the hypervisor.
+    if name in ("vm_start", "vm_stop", "vm_suspend", "vm_resume", "vm_open_console"):
+        return frozenset({Permission.VM_MANAGE})
+
+    # Commands that run *inside* a guest. `vm_guest_check` is included because
+    # it proves readiness by opening an authenticated session and running a
+    # probe — that is guest execution, and calling it "just a check" would be
+    # how a read-only-looking tool ends up executing something unaudited.
+    if name in ("vm_guest_exec", "vm_guest_check"):
+        return frozenset({
+            Permission.VM_GUEST_EXECUTE,
+            Permission.NETWORK_REQUEST,
+        })
 
     return frozenset()
 

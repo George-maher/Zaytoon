@@ -47,6 +47,7 @@ from services.provider_health import provider_health
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
 from core.api.routers import (
     files_router,
+    security_router,
     git_router,
     projects_router,
     providers_router,
@@ -54,6 +55,7 @@ from core.api.routers import (
     system_router,
     tasks_router,
     terminal_router,
+    virtualization_router,
 )
 from core.orchestrator import Orchestrator
 from core.providers import ensure_builtins as ensure_builtin_providers
@@ -424,6 +426,8 @@ app.include_router(terminal_router)
 app.include_router(skills_router)
 app.include_router(providers_router)
 app.include_router(system_router)
+app.include_router(security_router)
+app.include_router(virtualization_router)
 
 
 app.add_middleware(

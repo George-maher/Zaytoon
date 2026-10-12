@@ -392,6 +392,8 @@ def create(
     root: Optional[str] = None,
     instructions: Optional[str] = None,
     enabled: bool = False,
+    permissions: Optional[List[str]] = None,
+    tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Write a new skill directory from a name and description.
 
@@ -403,9 +405,29 @@ def create(
     ``enabled`` defaults to **False**. Writing a file is not switching a skill
     on, and a user who has just created fifteen skills has not agreed to carry
     fifteen skills' instructions in every prompt.
+
+    ``permissions`` is the set of permissions the skill *declares* it wants. It
+    is written into the manifest and validated there against the known
+    vocabulary, so an unknown name is a 422 and not a silently-ignored row —
+    the failure the caller needs, because a skill that asks for
+    ``filesystem.write`` and silently gets less is a skill that fails at run
+    time with no explanation.
+
+    Declaring is not granting. Enforcement is the registry's tier floor plus
+    ``/permissions`` decisions; see :func:`core.permissions.required_for`. A
+    manifest is a claim about what a skill wants, and nothing here should ever
+    make it a fact about what it may do.
     """
     payload = default_manifest(name, description)
     payload["enabled"] = bool(enabled)
+    if permissions is not None:
+        if not isinstance(permissions, (list, tuple)):
+            raise ManifestError("'permissions' must be a list of permission names")
+        payload["permissions"] = [str(item).strip() for item in permissions if str(item).strip()]
+    if tags is not None:
+        if not isinstance(tags, (list, tuple)):
+            raise ManifestError("'tags' must be a list of strings")
+        payload["tags"] = [str(item).strip() for item in tags if str(item).strip()]
     manifest = validate(payload, os.path.join(root or skills_root(), name))
 
     base = root or skills_root()

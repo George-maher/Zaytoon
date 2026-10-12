@@ -204,8 +204,16 @@ class TextToSpeech:
             profile = routing.select_voice_for_text(text, override=language)
             resolved_voice = self.resolve_voice(profile.language)
 
-        resolved_rate = rate or app_config.TTS_RATE
-        resolved_volume = volume or app_config.TTS_VOLUME
+        # Same three-step resolution as `synthesize` above: explicit argument,
+        # then configuration, then the locale profile. The profile term is not
+        # decoration — `os.getenv("TTS_RATE", "+0%")` returns `""` when the
+        # variable is *present but empty* (`TTS_RATE=` in a `.env`), and
+        # `"" or ""` is `""`, so without the last step edge-tts is handed
+        # `rate=""` and renders `<prosody rate="">`, which is malformed SSML
+        # and yields no audio. This is the streaming path, i.e. the default one
+        # (`TTS_STREAM_EARLY`), so it is the path that actually matters.
+        resolved_rate = rate or app_config.TTS_RATE or routing.rate_for(language)
+        resolved_volume = volume or app_config.TTS_VOLUME or routing.volume_for(language)
 
         try:
             import edge_tts
