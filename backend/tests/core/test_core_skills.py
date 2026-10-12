@@ -487,7 +487,7 @@ class TestRoot:
 
 
 class TestManifestPermissions:
-    """What a skill *asks for*, declared from the ten-name vocabulary.
+    """What a skill *asks for*, declared from the named permission vocabulary.
 
     Inspection, not enforcement — the loader's `confirm` floor is what
     restrains a skill's tools, because a manifest is a claim and the floor

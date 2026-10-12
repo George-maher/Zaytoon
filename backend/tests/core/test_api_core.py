@@ -845,7 +845,7 @@ class TestTierAssignmentApi:
 class TestPermissions:
     def test_the_vocabulary_is_listed(self, client):
         payload = client.get("/permissions").json()
-        assert len(payload["vocabulary"]) == 10
+        assert len(payload["vocabulary"]) == 13
         assert any(v["permission"] == "filesystem.delete" for v in payload["vocabulary"])
 
     def test_every_tool_is_mapped(self, client):

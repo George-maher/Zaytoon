@@ -226,6 +226,11 @@ COMMAND_ACTIONS = frozenset({
     # a background process is still an arbitrary command, so its command line
     # gets the same pattern inspection
     "process_start",
+    # A command inside a guest is still an arbitrary command. It runs in a
+    # different OS, which changes its blast radius but not whether its text
+    # deserves reading: `rm -rf /` inside a lab VM destroys that VM, and the
+    # user should be told which hazard was recognised before approving.
+    "vm_guest_exec",
 })
 
 #: The structured-execution members of :data:`COMMAND_ACTIONS`. These escalate
@@ -240,6 +245,10 @@ COMMAND_ACTIONS = frozenset({
 STRUCTURED_EXEC_ACTIONS = frozenset({
     "execute_local_command", "run_local_command", "exec_local",
     "process_start",
+    # Guest execution is machine-readable and built for repeated use, like the
+    # others here, so a command that matches a hazard is labelled DANGEROUS
+    # rather than the gentler CONFIRM the tool declares.
+    "vm_guest_exec",
 })
 
 #: Actions whose parameters contain source code judged against both pattern
@@ -424,6 +433,27 @@ class RiskAssessor:
                 if permission == PERMISSION_SAFE:
                     permission = PERMISSION_DANGEROUS
             summary = f"Close application: {app or 'unknown'}"
+
+        elif action_l in ("vm_stop",):
+            # A soft stop asks the guest to shut down and is recoverable. A hard
+            # stop pulls the power: anything the guest had not flushed is gone,
+            # and on a VM with a snapshot-pending disk it can leave the image
+            # inconsistent. That is a DANGEROUS action by the spec's own
+            # definition, and it arrives through a *parameter*, so the tier
+            # cannot be a property of the tool alone.
+            mode = self._as_text(params.get("mode") or "soft").strip().lower()
+            vm_name = self._as_text(params.get("vm")).strip()
+            if mode == "hard":
+                reasons.append("hard power-off: discards whatever the guest has not written")
+                permission = PERMISSION_DANGEROUS
+            summary = f"Stop VM: {vm_name or 'unknown'} ({mode})"
+
+        elif action_l in ("vm_start", "vm_suspend", "vm_resume", "vm_open_console"):
+            vm_name = self._as_text(params.get("vm")).strip()
+            summary = f"{action.replace('vm_', '').title()} VM: {vm_name or 'unknown'}"
+
+        elif action_l in ("vm_list", "vm_status"):
+            summary = "List virtual machines"
 
         elif action_l in ("open_app", "start_app"):
             app = self._as_text(params.get("app") or params.get("name")).strip()

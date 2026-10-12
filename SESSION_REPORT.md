@@ -9,6 +9,8 @@
 | `909e8a2` | Five defects: voice language handshake, TTS prosody, skill permissions, WS log level, desktop conftest | 2672 backend / 613 frontend / 366 desktop |
 | `edf4815` | This report, first revision | — |
 | `5510497` | Confirmation-gate fix, scope-enforced security layer, Security Workspace, three test-only defects | 2792 backend / 627 frontend / 366 desktop |
+| `3e60fd6` `8bb6325` | Dev proxy for `/security`; report corrections | 627 frontend |
+| `b7e4c1a`+ | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
 
 `main` has not been touched; nothing was merged. Two items from the first
 revision are corrected here (§8 web search, §11 test changes) and the voice
@@ -276,6 +278,96 @@ table-dropping call at the user's real database. All three now set
 `CORE_DB_PATH`, and the fix is verified by asserting that
 `backend/data/core.db`'s mtime is unchanged across a full suite run.
 
+## 5f. Virtualization: VMware control and guest execution
+
+**Before this work there was no virtualization support in the repository at
+all** — `grep -i 'vmware|vmrun|virtualbox|libvirt|qemu'` over the source matched
+nothing. Section 6 of the brief calls VM control a required feature, so this was
+the largest genuinely-missing capability, and the most self-contained one to
+build well.
+
+### What was built
+
+* `core/virtualization/` — an adapter package. `base.py` holds the contract
+  (`Hypervisor`, `VMInfo`, `VMState`, `CommandOutcome`, program resolution);
+  `vmware.py` holds every VMware-specific detail; `guest.py` holds the SSH
+  channel. A second hypervisor would be a sibling file, not a branch in every
+  tool. Nothing above the package knows that VMware exists.
+* **Nine tools**, registered through the ordinary registry: `vm_list`,
+  `vm_status`, `vm_start`, `vm_stop`, `vm_suspend`, `vm_resume`,
+  `vm_open_console`, `vm_guest_check`, `vm_guest_exec`. The registry went from
+  38 to 47 tools.
+* **Three new named permissions** — `vm.discover`, `vm.manage`,
+  `vm.guest.exec` — rather than one. The brief requires VM lifecycle, guest
+  command execution and desktop automation to stay distinct, and a single grant
+  would let consent for "start Ubuntu" authorise "run this in Ubuntu". The
+  vocabulary went from 10 names to 13.
+* **`docs/VMWARE.md`** — the real environment variables, the guest setup, and
+  an explicit list of what is not implemented.
+
+### The decisions that matter
+
+**Nothing assumes an install path.** `vmrun` and the UI binary are resolved from
+an explicit setting, then `PATH`, then per-platform candidate directories — and
+each candidate must stat as a regular *executable file*, so a directory named
+`vmrun` is not returned as the program.
+
+**State is reported from evidence, or reported unknown.** The one that matters:
+if `vmrun list` cannot be run, a VM's state is `unknown`, **not** `stopped`.
+Reported `stopped` without having asked is the kind of confident wrong answer
+that makes an agent untrustworthy, and it is asserted against directly
+(`test_vmrun_failing_means_unknown_never_stopped`). A `.lck` directory is
+surfaced as a hint but never decides state, because a stale lock is
+indistinguishable from a live one.
+
+**Ambiguous names are refused.** Exact display name → exact `.vmx` stem →
+*unique* substring. Two matches is an error listing both. There is deliberately
+no closest-match branch: that is how "start Ubuntu" boots `Ubuntu-16.04-OLD`.
+
+**Readiness is earned.** `vm_start` reports `running` and says, in its own
+output, that a running process and a console window are not boot evidence.
+`vmrun checkToolsState` is recorded as a *host-side* signal. Readiness is true
+only when an authenticated command succeeds inside the guest.
+`test_a_running_vm_without_a_probe_is_not_ready` and
+`test_a_console_window_is_reported_as_a_window` pin both halves.
+
+**No credentials, by construction.** `GuestTarget` has no password field.
+Authentication is key or agent only; `BatchMode=yes` and
+`PasswordAuthentication=no` are always passed. Host-key checking is `yes` by
+default, `accept-new` is available for a freshly built guest, and `no` is
+*unreachable through configuration* — a test asserts the refusal. A missing key
+produces an instruction, not a hang.
+
+**Destructive VM operations escalate through the existing table.** A `hard`
+stop is DANGEROUS with the reason "hard power-off: discards whatever the guest
+has not written", and a guest command is inspected by the same
+`HIGH_RISK_COMMAND_PATTERNS` that already guard `execute_local_command`.
+`vm_guest_exec` was added to `COMMAND_ACTIONS` and `STRUCTURED_EXEC_ACTIONS`, so
+the escalation is the existing machinery rather than a parallel rule set.
+
+### Verification — and its honest limit
+
+Three test files, **94 tests**, all passing:
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/core/test_virtualization_vmware.py` | 37 | Discovery, inventory parsing, state classification, resolution refusals, lifecycle argv, timeouts, readiness |
+| `tests/test_vm_tools.py` | 47 | Tool tiers, permissions, prerequisite messages, the guest channel over a fake `ssh`, the gate |
+| `tests/test_vm_workflows.py` | 10 | The six user requests of §6B as *distinct* operations, and the two never-conflate claims |
+
+The fakes are **executables on disk**, spawned for real: a scripted `vmrun` and
+a scripted `ssh`. That tests the argv the adapter builds and the output it
+parses, which a monkeypatched runner would not. Three guards were validated by
+injecting the fault each exists for — unknown-state→stopped, ambiguity→first
+match, and host-key verification→disableable — and each failed exactly its own
+test.
+
+**The limit, stated plainly: VMware is not installed on this host, so no real VM
+was ever started and no real guest was ever connected to.** Everything above is
+tested against fakes. That is a strong test of the adapter and a *weak* test of
+VMware itself, and `docs/VMWARE.md` says so in its first paragraph. Do not read
+"37 passing tests" as "verified against VMware".
+
 ## 6. Root cause detail: the voice defect
 
 `backend/voice/stt.py` computes:
@@ -360,6 +452,27 @@ that came out of testing them:
 | **new** `backend/tests/test_security_probe_route.py` | 28 tests |
 | `backend/tests/test_security_probe*.py`, `tests/core/test_security_scope.py` | `ZAYTOON_DB_PATH` → `CORE_DB_PATH` (§5e) |
 
+Third batch — virtualization (§5f):
+
+| File | Change |
+|---|---|
+| `backend/core/virtualization/__init__.py` | **new** — the package surface |
+| `backend/core/virtualization/base.py` | **new** — `Hypervisor`, `VMInfo`, `VMState`, `CommandOutcome`, `resolve_program`, `run_command` |
+| `backend/core/virtualization/vmware.py` | **new** — the VMware adapter: discovery, inventory, state, lifecycle, readiness |
+| `backend/core/virtualization/guest.py` | **new** — `GuestTarget`, `GuestSession`, `GuestResult` |
+| `backend/tools/virtualization.py` | **new** — the nine VM tools |
+| `backend/core/permissions.py` | `vm.discover`, `vm.manage`, `vm.guest.exec`; capability table |
+| `backend/tools/safety.py` | `vm_guest_exec` joins `COMMAND_ACTIONS` + `STRUCTURED_EXEC_ACTIONS`; `vm_stop --hard` → DANGEROUS |
+| `backend/tools/registry.py` | `virtualization` module registered |
+| `backend/config.py` | Virtualization section (13 settings) |
+| `backend/core/skills/manifest.py` | The prose count of the vocabulary removed, not updated |
+| **new** `backend/tests/core/test_virtualization_vmware.py` | 37 tests |
+| **new** `backend/tests/test_vm_tools.py` | 47 tests |
+| **new** `backend/tests/test_vm_workflows.py` | 10 tests |
+| **new** `docs/VMWARE.md` | Setup, variables, and the unverified-path warning |
+| `backend/tests/core/test_core_permissions.py`, `test_api_core.py` | The vocabulary pin 10 → 13, with the reason recorded |
+| `frontend/vite.config.js` | `/security` dev proxy; `allowedHosts` opt-in via `VITE_ALLOWED_HOSTS` |
+
 Every new test was run against the reverted fix and observed to fail before
 being accepted — 5, 4 and 6 failures respectively for the voice, skill and
 desktop guards; 1 for the token TTL (§5c); 1 for the App wiring of the Security
@@ -372,7 +485,7 @@ placed after it proved nothing.
 | Area | Status | Evidence |
 |---|---|---|
 | Remote commit inspection | **PASS** | SHA verified, `0 0` divergence |
-| Backend tests | **PASS** | 2792 passed / 5 skipped (baseline 2650/5) |
+| Backend tests | **PASS** | 2887 passed / 5 skipped (baseline 2650/5; +237 across three batches) |
 | Frontend lint/test/build | **PASS** | eslint clean; 627 passed; build 489 kB / 141 kB gzip |
 | Desktop tests (Linux) | **PASS** | 366 passed / 2 skipped (was a collection error) |
 | Voice — language handshake | **PASS** | reproduced, fixed, 8 tests, guard verified |
@@ -380,13 +493,16 @@ placed after it proved nothing.
 | Voice — real microphone/audio | **NOT TESTED** | no audio device; no interactive desktop |
 | Voice — Arabic audio playback | **NOT TESTED** | needs a sound device + network to edge-tts |
 | Web search | **BLOCKED — infrastructure, not code** | **Corrected.** The earlier explanation (a missing `trust_env`, so `HTTPS_PROXY` was ignored) was wrong: there are **no proxy variables set at all** in this environment, so no proxy was being bypassed. Egress here is an **allow-list**: `pypi.org` and `registry.npmjs.org` answer 200 while `api.github.com`, the DuckDuckGo hosts and `huggingface.co` fail with `ConnectError`. Search therefore cannot reach any provider from this sandbox, and no code change can alter that. The tool still degrades honestly (`Search failed: …`) rather than inventing results. **Unverified on a machine with real egress.** |
-| Computer control | **PARTIAL** | 38 tools over `ToolRegistry`; app launching/interception is Windows-first and unverifiable here |
+| Computer control | **PARTIAL** | 47 tools over `ToolRegistry`; app launching/interception is Windows-first and unverifiable here |
 | Skills management | **PARTIAL** | create/validate/enable/disable/delete + permission declaration work end-to-end (verified against a live server); natural-language creation, drafts, version history and per-skill execution logs are **not implemented** |
 | Security / permissions (the gate) | **PASS** | the declared tier now reaches the prompt for every tool, including skill-registered ones; 8 tests, and 19 pre-existing duck-typed doubles still pass |
 | Security — target scope enforcement | **PASS** | enforced in `tools/security.py` before any socket, not in prompts; 65 scope tests + 19 probe tests + 28 route tests; **no registered tool can reach `scope.create`** |
 | Security — non-destructive assessment + evidence | **PASS** | confirmed-only findings with evidence and remediation; Scenario F all five legs PASS live |
 | Security workspace UI | **PARTIAL — running, not yet human-verified** | the page exists, is wired into `App.jsx`, and its nav entry proves its screen mounts (12 tests). A dev server is running in this session on port 3000 with the backend on 8000, so the page can be opened and driven now (see below). I have confirmed the served app and its `/security` data path over HTTP, but **I have no browser here**, so nobody has clicked it yet — the last mile is yours to confirm. |
 | JARVIS UI/UX, orb, RTL | **PARTIAL** | pre-existing HUD/orb/theme and i18n exist and are untouched; I did **not** redesign the UI, so I make no claim about it. The new page follows the existing token/glyph system and switches language without reload (tested). |
+| Virtual machines — VMware discovery & lifecycle | **PARTIAL — implemented, tested against fakes, never run against VMware** | 47 adapter + tool tests, 10 workflow tests. Discovery, inventory, state-with-evidence, lifecycle argv, timeouts and refusal-to-guess all covered. **VMware is not installed here**, so no real VM was started: the real-VMware path is unverified and `docs/VMWARE.md` leads with that. |
+| Virtual machines — guest command execution | **PARTIAL — implemented, never run against a real guest** | Key-only SSH channel with host-key verification; stdout/stderr/exit code/duration captured; prerequisite failures (no account, no address, no Tools) each reported precisely. No guest existed to connect to. |
+| Virtual machines — snapshots, networking, deletion | **FAIL (not implemented)** | Deliberately absent rather than half-built; list in `docs/VMWARE.md`. |
 | Windows / macOS | **NOT TESTED** | Linux only; CI has all three legs but was not run |
 | Performance | **NOT TESTED** | no measurements taken |
 
@@ -424,7 +540,15 @@ rather than smoothed over.
    authorisation logic, input handling or any payload-driven class of bug, and
    the report it prints says so. Widening it is a separate piece of work with
    its own scope rules.
-7. Cosmetic: `tests/test_process_manager.py` intermittently emits
+7. **Verify the VMware path on a host that has VMware.** This is the single
+   largest unverified area of the virtualization work, and it cannot be closed
+   here. The specific things to confirm first, in order: that `vmrun list`
+   output parses on Windows (paths with spaces and the `Total running VMs:`
+   header), that `-T ws` is right for the installed edition, and that
+   `getGuestIPAddress` returns a usable address for the guest being targeted.
+8. VM snapshots, network/resource changes and VM deletion — see
+   `docs/VMWARE.md`.
+9. Cosmetic: `tests/test_process_manager.py` intermittently emits
    `PytestUnraisableExceptionWarning` (`BaseSubprocessTransport.__del__` after
    the loop closed). Confirmed pre-existing and flaky — it appears in roughly
    one run in three *in isolation*, with no change from this work, and no test
@@ -528,6 +652,37 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example.com' localhost:3
 To try Scenario F by hand: authorise `127.0.0.1`, run a probe against
 `http://127.0.0.1:8099/admin`, then revoke it and run it again.
 
+### Virtualization (no VMware needed — the fakes are executables)
+
+```bash
+cd backend && PYTHONPATH=../.github python -m pytest \
+  tests/core/test_virtualization_vmware.py \
+  tests/test_vm_tools.py \
+  tests/test_vm_workflows.py -q          # 94 passed
+
+# What the tools do on a host with no VMware: an actionable message, and no
+# security refusal (blocked is for decisions, not for missing software).
+cd backend && PYTHONPATH=../.github python - <<'EOF'
+import asyncio, api.main as api_main
+async def main():
+    for tool, params in (("vm_list", {}), ("vm_start", {"vm": "Ubuntu"})):
+        r = await api_main.tool_executor.execute(tool, params)
+        print(tool, "| success:", r.get("success"),
+              "| blocked:", r.get("blocked"),
+              "| needs confirm:", r.get("requires_confirmation"))
+asyncio.run(main())
+EOF
+# -> vm_list  | success: False | blocked: None | needs confirm: None
+# -> vm_start | success: False | blocked: None | needs confirm: True
+
+# The vocabulary and the tool count, live.
+curl -s localhost:8000/permissions | python -c \
+  'import sys,json; d=json.load(sys.stdin); print(len(d["vocabulary"]), "grants"); print([t["name"] for t in d["tools"] if t["name"].startswith("vm_")])'
+
+# On a machine that does have VMware, this is the first thing to try.
+export VMWARE_VMRUN="/usr/bin/vmrun"   # or leave unset to be discovered
+```
+
 ### The new guards
 
 ```bash
@@ -556,6 +711,14 @@ Nothing was merged to `main`; work stayed on `arena/af56e022-zaytoon`.
 | `backend/tests/test_security_probe*.py`, `tests/core/test_security_scope.py` | `CORE_DB_PATH` (§5e) | corrected |
 | `frontend/src/lib/viewState.test.js` | Vocabulary pin extended for the new destination | extended, not relaxed |
 | `frontend/src/App.runtime.test.jsx` | Security destination added to the nav walk | extended |
+| `backend/tests/core/test_core_permissions.py`, `test_api_core.py` | Vocabulary pin 10 → 13 | updated, with the reason recorded in the test |
+
+The permission-vocabulary pin is the one number that changed because the
+product changed rather than because a test was inconvenient: `vm.discover`,
+`vm.manage` and `vm.guest.exec` are three genuinely distinct grants, and the
+test now says so instead of just counting. The same count appeared in three
+places and in one prose docstring; the docstring now names no number, because a
+number in prose is a number that will be wrong.
 
 The one apparent relaxation — `viewState.test.js` — is an extension: a real
 destination with a mounted screen was added, and the test pins the vocabulary

@@ -590,6 +590,59 @@ class Config:
     TTS_SENTENCE_TIMEOUT: float = 1.5
 
     # ------------------------------------------------------------------
+    # Virtualization (VMware Workstation, and a guest SSH channel)
+    # ------------------------------------------------------------------
+    # Nothing here assumes an install path. `vmrun` and the Workstation UI are
+    # located by probing the paths below at runtime and checking that what is
+    # found is a real, executable file — writing one machine's
+    # `C:\Program Files (x86)\VMware\...` into a shared default is how a tool
+    # ends up "working" on exactly one laptop.
+    #
+    # `VMWARE_BIN_DIRS` is the search list; `VMWARE_TOOLS_DIR` is *not* used,
+    # because VMware Tools belongs inside the guest, not on the host.
+    VMWARE_BIN_DIRS: str = os.getenv("VMWARE_BIN_DIRS", "")
+    #: Explicit path to `vmrun`. When set it is used as given and must exist —
+    #: silently falling back to a discovered binary would hide a typo and make
+    #: the tool act on a different installation than the operator configured.
+    VMWARE_VMRUN: str = os.getenv("VMWARE_VMRUN", "")
+    #: Explicit path to the Workstation UI executable (`vmware` / `vmware.exe`).
+    VMWARE_UI: str = os.getenv("VMWARE_UI", "")
+
+    #: Directories scanned for `*.vmx` files, to answer "what VMs do I have?".
+    #: Empty means: read the hypervisor's own inventory file, and look in the
+    #: conventional per-user VM directory if it exists. Scanning the whole disk
+    #: for virtual machines is not a thing this tool will do.
+    VM_INVENTORY_DIRS: str = os.getenv("VM_INVENTORY_DIRS", "")
+
+    #: How long a lifecycle command (`vmrun start`, `stop`, ...) may take.
+    #: `vmrun start` returns as soon as the VM is launched, so this is not the
+    #: boot timeout — see `VM_READY_TIMEOUT`.
+    VM_OPERATION_TIMEOUT: float = _env_float("VM_OPERATION_TIMEOUT", 60.0)
+    #: How long "wait until it is ready" may take before reporting a timeout.
+    #: Readiness is never inferred from the window or the process; see
+    #: `core/virtualization/vmware.py`.
+    VM_READY_TIMEOUT: float = _env_float("VM_READY_TIMEOUT", 180.0)
+    VM_READY_POLL: float = _env_float("VM_READY_POLL", 5.0)
+    #: Ceiling on any single command run inside a guest.
+    VM_GUEST_TIMEOUT: float = _env_float("VM_GUEST_TIMEOUT", 30.0)
+
+    #: Guest SSH defaults. These are defaults for *what to connect to*, not
+    #: credentials: authentication is by key or agent only. See
+    #: `core/virtualization/guest.py` for why a password is never accepted.
+    VM_GUEST_USER: str = os.getenv("VM_GUEST_USER", "")
+    #: Private key to use. A path, and deliberately load-bearing: with no key
+    #: and no agent, a non-interactive connection cannot succeed, and the tool
+    #: says so instead of prompting for a password it must not hold.
+    VM_GUEST_IDENTITY: str = os.getenv("VM_GUEST_IDENTITY", "")
+    VM_GUEST_CONNECT_TIMEOUT: float = _env_float("VM_GUEST_CONNECT_TIMEOUT", 10.0)
+    #: `strict` (default) or `accept-new`. Never `no`: see the guest module.
+    VM_GUEST_HOST_KEY_POLICY: str = _env_str("VM_GUEST_HOST_KEY_POLICY", "strict")
+    #: Extra `-o` options for the guest channel, comma-separated. For unusual
+    #: setups (a jump host, a non-standard port) rather than for weakening
+    #: checks that are on by default.
+    VM_GUEST_SSH_OPTIONS: str = os.getenv("VM_GUEST_SSH_OPTIONS", "")
+
+    # ------------------------------------------------------------------
     # Tool safety sandbox (human-in-the-loop)
     # ------------------------------------------------------------------
     TOOL_SAFETY_ENABLED: bool = _env_bool("TOOL_SAFETY_ENABLED", True)

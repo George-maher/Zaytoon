@@ -18,8 +18,25 @@ from tools.safety import PERMISSION_CONFIRM, PERMISSION_DANGEROUS, PERMISSION_SA
 
 
 class TestVocabulary:
-    def test_ten_permissions(self):
-        assert len(ALL_PERMISSIONS) == 10
+    def test_the_vocabulary_is_pinned(self):
+        """Thirteen names, and the count is deliberate.
+
+        It was ten until virtualization was added, which contributed three
+        rather than one: `vm.discover`, `vm.manage` and `vm.guest.exec` are
+        separate grants because listing VMs, powering one on, and running a
+        command *inside* one have different blast radii. A single `vm.manage`
+        would let consent for the first authorise the second. Updating this
+        number is the reminder to ask whether the new grant is really distinct.
+        """
+        assert len(ALL_PERMISSIONS) == 13
+
+    def test_the_vm_grants_do_not_imply_each_other(self):
+        from core.permissions import Permission, required_for
+
+        assert Permission.VM_DISCOVER in required_for("vm_list", "safe")
+        assert Permission.VM_MANAGE not in required_for("vm_list", "safe")
+        assert Permission.VM_GUEST_EXECUTE not in required_for("vm_start", "confirm")
+        assert Permission.VM_MANAGE not in required_for("vm_guest_exec", "confirm")
 
     def test_every_permission_is_described(self):
         rows = describe()

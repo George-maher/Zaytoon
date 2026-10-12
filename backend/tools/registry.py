@@ -496,13 +496,14 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
         security,
         system,
         terminal,
+        virtualization,
         web,
     )
 
     registry = ToolRegistry(assessor=assessor)
     for module in (
         filesystem, terminal, local_exec, processes, applications, system,
-        web, fetch, git, coding, media, security,
+        web, fetch, git, coding, media, security, virtualization,
     ):
         registry.register_all(module.build_tools())
     logger.info("Tool registry ready with %d tools: %s", len(registry), registry.list())
