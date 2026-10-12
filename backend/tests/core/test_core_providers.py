@@ -16,6 +16,7 @@ from core.providers import (
     has_all,
     list_models,
     list_providers,
+    mark_chat_verified,
     mark_verified,
     missing,
     normalise,
@@ -355,6 +356,46 @@ class TestProviderCrud:
         stamp = await mark_verified(provider["id"])
         reread = await get_provider(provider["id"])
         assert reread["verified_at"] == stamp
+
+    async def test_mark_chat_verified_stamps_the_setup_proof(
+        self, temp_core_db, temp_secrets
+    ):
+        """A chat pass is a connectivity pass by construction — both columns."""
+        provider = await make_provider("Chat", url="http://x")
+        assert provider["chat_verified_at"] is None
+
+        stamp = await mark_chat_verified(provider["id"])
+        reread = await get_provider(provider["id"])
+        assert reread["verified_at"] == stamp
+        assert reread["chat_verified_at"] == stamp
+
+
+class TestSetupStamp:
+    async def test_the_upgrade_stamp_covers_only_prior_use(
+        self, temp_core_db, temp_secrets
+    ):
+        """An existing install upgrades quietly; a fresh one must still test.
+
+        The shipped SQL is run by hand: a fresh database has already applied
+        every migration, so the UPDATE is the only part of migration 5 that
+        can be observed after the fact — and it is the part with a decision
+        in it (a provider with recorded models has served this user before).
+        """
+        from core import db
+        from core.db import SETUP_STAMP_SQL
+
+        used = await save_provider(
+            None, name="Used", kind="ollama", base_url="http://localhost:11434"
+        )
+        fresh = await save_provider(
+            None, name="Fresh", kind="ollama", base_url="http://localhost:11434"
+        )
+        await save_model(used["id"], "qwen3.5:9b", capabilities=["chat"])
+
+        await db.execute(SETUP_STAMP_SQL)
+
+        assert (await get_provider(used["id"]))["chat_verified_at"]
+        assert (await get_provider(fresh["id"]))["chat_verified_at"] is None
 
 
 class TestModels:

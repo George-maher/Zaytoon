@@ -18,9 +18,11 @@ from core.providers import (
     delete_model,
     delete_provider,
     ensure_builtins,
+    get_provider,
     get_tier_assignments,
     list_models,
     list_providers,
+    mark_chat_verified,
     mark_verified,
     plan,
     provider_health,
@@ -265,6 +267,114 @@ async def provider_refresh(provider_id: str) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Model refresh failed for %s: %s", provider_id, type(exc).__name__)
         raise HTTPException(502, f"Could not reach the endpoint: {type(exc).__name__}") from exc
+
+
+@providers_router.post("/providers/{provider_id}/test-chat")
+async def provider_test_chat(
+    provider_id: str, data: Optional[Dict[str, Any]] = Body(default=None)
+) -> Dict[str, Any]:
+    """Generate one real completion — the only acceptable proof of setup.
+
+    ``POST /test`` proves the endpoint answers; this proves a model can
+    actually be asked something and reply. The first-run wizard completes on
+    this and nothing else, because a 200 from a models-list endpoint says
+    nothing about whether the key may generate, the model exists, or the
+    answer is well-formed — and every one of those failures is what a new
+    user is actually setting up. A failed test is a 200 with ``ok: false``
+    and the reason: the endpoint being broken is the answer, not a server
+    error, and the UI needs the text to show.
+    """
+    from core.providers.client import (
+        DEFAULT_TIMEOUT,
+        OpenAICompatibleClient,
+        ProviderTransportError,
+    )
+    from core.providers.store import resolve_api_key
+
+    provider = await get_provider(provider_id)
+    if provider is None:
+        raise HTTPException(404, f"No such provider: {provider_id}")
+
+    payload: Dict[str, Any] = data or {}
+    model_id = str(payload.get("model") or "").strip()
+    if not model_id:
+        rows = await list_models(provider_id=provider_id, enabled_only=True)
+        model_id = rows[0]["id"] if rows else ""
+    if not model_id:
+        raise HTTPException(
+            409,
+            "No models recorded for this provider — refresh its models first.",
+        )
+
+    message = str(payload.get("message") or "Reply with the single word: OK")[:500]
+    key = await resolve_api_key(provider_id) if provider["requires_key"] else None
+    client = OpenAICompatibleClient(
+        provider["base_url"],
+        api_key=key,
+        kind=provider["kind"],
+        timeout=float(provider.get("timeout_s") or DEFAULT_TIMEOUT),
+        org_id=provider.get("org_id"),
+    )
+    started = time.monotonic()
+    try:
+        reply = await client.complete(
+            [{"role": "user", "content": message}],
+            model=model_id,
+            max_tokens=32,
+            temperature=0.0,
+        )
+    except ProviderTransportError as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        logger.info("test-chat failed for %s: %s", provider["name"], exc)
+        return {
+            "ok": False,
+            "connected": False,
+            "provider_id": provider_id,
+            "provider": provider["name"],
+            "model": model_id,
+            "latency_ms": latency,
+            "error": str(exc),
+        }
+    finally:
+        await client.aclose()
+
+    latency = int((time.monotonic() - started) * 1000)
+    stamp = await mark_chat_verified(provider_id)
+    return {
+        "ok": True,
+        "connected": True,
+        "provider_id": provider_id,
+        "provider": provider["name"],
+        "model": model_id,
+        "latency_ms": latency,
+        # What the model said, bounded: this is a connectivity proof, not a
+        # transcript. The preview exists so the wizard can show "the model
+        # replied" and never for a chat log.
+        "reply": (reply or "").strip()[:200],
+        "verified_at": stamp,
+    }
+
+
+@providers_router.get("/setup/status")
+async def setup_status() -> Dict[str, Any]:
+    """Is first-run setup done? Answered only by a real chat test.
+
+    The setup banner and the wizard both read this. A provider that merely
+    exists — or answered a reachability probe — does not complete setup:
+    wrong key scope, a missing model and an exhausted balance each look
+    exactly like success until a completion is attempted.
+    """
+    providers = await list_providers()
+    stamps = sorted(
+        p["chat_verified_at"] for p in providers if p.get("chat_verified_at")
+    )
+    return {
+        "setup_required": not stamps,
+        "providers_total": len(providers),
+        "providers_enabled": sum(1 for p in providers if p.get("enabled")),
+        "providers_chat_verified": len(stamps),
+        "verified_at": stamps[-1] if stamps else None,
+    }
 
 
 @providers_router.get("/models")

@@ -48,6 +48,20 @@ BUSY_BACKOFF_S = 0.2
 # Written as numbered migrations rather than one ``CREATE TABLE IF NOT EXISTS``
 # blob so an upgraded database gets new columns instead of silently keeping the
 # old shape. Index 0 is the initial schema.
+
+#: The data half of migration 5, kept as a named constant because it is the
+#: part worth testing: the ``ALTER`` runs once on a schema where the column is
+#: missing and can never observe its own effect. A provider that already has
+#: recorded models has served this user before, so its setup counts as proven;
+#: a provider without models is a fresh configuration and must still pass a
+#: real chat test.
+SETUP_STAMP_SQL = """
+    UPDATE providers
+       SET chat_verified_at = COALESCE(updated_at, created_at)
+     WHERE chat_verified_at IS NULL
+       AND EXISTS (SELECT 1 FROM models m WHERE m.provider_id = providers.id)
+"""
+
 _MIGRATIONS: List[str] = [
     # -- 0: initial ------------------------------------------------------
     """
@@ -274,6 +288,17 @@ _MIGRATIONS: List[str] = [
     """
     ALTER TABLE models ADD COLUMN policy_reason TEXT;
     """,
+
+    # -- 5: first-run setup proof -----------------------------------------
+    # The wizard and the setup banner read this column: setup completes only
+    # after a *real* chat test (POST /providers/{id}/test-chat). A
+    # reachability probe proves the endpoint answers and says nothing about
+    # whether the key may generate or the model exists — every failure this
+    # guards against shows up only when a completion is attempted. Existing
+    # installs are stamped from prior use (see SETUP_STAMP_SQL); fresh ones
+    # stay unverified until a completion actually happens.
+    "ALTER TABLE providers ADD COLUMN chat_verified_at TEXT;\n"
+    + SETUP_STAMP_SQL,
 ]
 
 

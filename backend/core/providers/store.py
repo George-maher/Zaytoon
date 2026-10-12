@@ -368,6 +368,9 @@ def _provider_row(row: Dict[str, Any]) -> Dict[str, Any]:
         # When a connectivity test last *passed* — NULL means unverified, and
         # the UI must not present that as connected.
         "verified_at": row.get("verified_at"),
+        # When a *chat* test last passed. Strictly later-or-equal than
+        # verified_at: only a generated completion completes first-run setup.
+        "chat_verified_at": row.get("chat_verified_at"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -378,6 +381,21 @@ async def mark_verified(provider_id: str) -> Optional[str]:
     stamp = _now()
     ok = await db.execute(
         "UPDATE providers SET verified_at = ? WHERE id = ?", (stamp, provider_id)
+    )
+    return stamp if ok else None
+
+
+async def mark_chat_verified(provider_id: str) -> Optional[str]:
+    """Record that a real *chat* test just passed — the setup proof.
+
+    A reachability probe only proves the endpoint answers; this is the one
+    event that may complete first-run setup, so it stamps both columns (a
+    chat pass is a connectivity pass by construction).
+    """
+    stamp = _now()
+    ok = await db.execute(
+        "UPDATE providers SET verified_at = ?, chat_verified_at = ? WHERE id = ?",
+        (stamp, stamp, provider_id),
     )
     return stamp if ok else None
 
@@ -626,6 +644,8 @@ __all__ = [
     "get_tier_assignments",
     "list_models",
     "list_providers",
+    "mark_chat_verified",
+    "mark_verified",
     "policy_verdict",
     "resolve_api_key",
     "save_model",

@@ -700,6 +700,138 @@ class TestProviders:
         assert client.delete("/providers/nope").status_code == 404
 
 
+class TestSetupFlow:
+    """First-run setup completes only on a real chat test (W7).
+
+    A provider that merely exists, or answered a reachability probe, does not
+    complete setup: wrong key scope, a missing model and an exhausted balance
+    each look exactly like success until a completion is attempted.
+    """
+
+    @staticmethod
+    def _provider_with_model(client):
+        created = client.post("/providers", json={
+            "name": "Cloud", "kind": "openai_compatible",
+            "base_url": "https://api.example.com",
+        })
+        provider_id = created.json()["id"]
+        client.post("/models", json={
+            "provider_id": provider_id, "id": "cloud-mini",
+            "capabilities": ["chat"],
+        })
+        return provider_id
+
+    @staticmethod
+    def _fake_client(monkeypatch, reply="OK", error=None):
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def complete(self, messages, model, **kwargs):
+                if error is not None:
+                    raise error
+                return reply
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(
+            "core.providers.client.OpenAICompatibleClient", FakeClient
+        )
+
+    def test_a_fresh_install_requires_setup(self, client):
+        status = client.get("/setup/status").json()
+        assert status["setup_required"] is True
+        assert status["providers_chat_verified"] == 0
+
+    def test_creating_a_provider_does_not_complete_setup(self, client):
+        self._provider_with_model(client)
+        assert client.get("/setup/status").json()["setup_required"] is True
+
+    def test_a_reachable_endpoint_does_not_complete_setup(self, client, monkeypatch):
+        """The /test probe records verified_at; setup still waits for chat."""
+        provider_id = self._provider_with_model(client)
+
+        class FakeHealth:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def health(self):
+                return {"connected": True, "models": [{"id": "cloud-mini"}]}
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(
+            "core.providers.client.OpenAICompatibleClient", FakeHealth
+        )
+
+        probed = client.post(f"/providers/{provider_id}/test").json()
+
+        assert probed["connected"] is True
+        assert probed["verified_at"]      # the probe records itself...
+        assert client.get("/setup/status").json()["setup_required"] is True  # ...but setup waits
+
+    def test_a_real_chat_test_completes_setup(self, client, monkeypatch):
+        provider_id = self._provider_with_model(client)
+        self._fake_client(monkeypatch, reply="  OK  ")
+
+        result = client.post(f"/providers/{provider_id}/test-chat").json()
+
+        assert result["ok"] is True
+        assert result["connected"] is True
+        assert result["model"] == "cloud-mini"
+        assert result["reply"] == "OK"          # trimmed
+        assert isinstance(result["latency_ms"], int)
+        assert result["verified_at"]
+
+        status = client.get("/setup/status").json()
+        assert status["setup_required"] is False
+        assert status["providers_chat_verified"] == 1
+
+    def test_a_failed_chat_test_does_not_complete_setup(self, client, monkeypatch):
+        from core.providers.client import ProviderTransportError
+
+        provider_id = self._provider_with_model(client)
+        self._fake_client(
+            monkeypatch,
+            error=ProviderTransportError("HTTP 401: bad key", status=401, kind="fatal"),
+        )
+
+        result = client.post(f"/providers/{provider_id}/test-chat").json()
+
+        assert result["ok"] is False
+        assert result["connected"] is False
+        assert "401" in result["error"]        # the endpoint's words, shown
+        assert client.get("/setup/status").json()["setup_required"] is True
+        assert client.get(f"/providers/{provider_id}").json()["chat_verified_at"] is None
+
+    def test_chat_test_without_models_is_a_409(self, client):
+        created = client.post("/providers", json={
+            "name": "Bare", "kind": "openai_compatible",
+            "base_url": "https://api.example.com",
+        })
+        provider_id = created.json()["id"]
+
+        response = client.post(f"/providers/{provider_id}/test-chat")
+
+        assert response.status_code == 409
+        assert "refresh" in response.json()["error"]
+
+    def test_chat_test_for_an_unknown_provider_is_a_404(self, client):
+        response = client.post("/providers/nope/test-chat")
+        assert response.status_code == 404
+
+    def test_the_reply_preview_is_bounded(self, client, monkeypatch):
+        """A connectivity proof, not a transcript."""
+        provider_id = self._provider_with_model(client)
+        self._fake_client(monkeypatch, reply="x" * 5000)
+
+        result = client.post(f"/providers/{provider_id}/test-chat").json()
+
+        assert len(result["reply"]) == 200
+
+
 class TestModels:
     def test_record_and_list(self, client):
         client.post("/providers", json={
