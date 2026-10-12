@@ -385,7 +385,7 @@ placed after it proved nothing.
 | Security / permissions (the gate) | **PASS** | the declared tier now reaches the prompt for every tool, including skill-registered ones; 8 tests, and 19 pre-existing duck-typed doubles still pass |
 | Security — target scope enforcement | **PASS** | enforced in `tools/security.py` before any socket, not in prompts; 65 scope tests + 19 probe tests + 28 route tests; **no registered tool can reach `scope.create`** |
 | Security — non-destructive assessment + evidence | **PASS** | confirmed-only findings with evidence and remediation; Scenario F all five legs PASS live |
-| Security workspace UI | **PARTIAL** | the page exists, is wired into `App.jsx` and its nav entry proves its screen mounts (12 tests). **Not verified in a real browser** — no display here, and the app cannot run an LLM turn without Ollama, so the page has not been driven against a live backend by a human. |
+| Security workspace UI | **PARTIAL — running, not yet human-verified** | the page exists, is wired into `App.jsx`, and its nav entry proves its screen mounts (12 tests). A dev server is running in this session on port 3000 with the backend on 8000, so the page can be opened and driven now (see below). I have confirmed the served app and its `/security` data path over HTTP, but **I have no browser here**, so nobody has clicked it yet — the last mile is yours to confirm. |
 | JARVIS UI/UX, orb, RTL | **PARTIAL** | pre-existing HUD/orb/theme and i18n exist and are untouched; I did **not** redesign the UI, so I make no claim about it. The new page follows the existing token/glyph system and switches language without reload (tested). |
 | Windows / macOS | **NOT TESTED** | Linux only; CI has all three legs but was not run |
 | Performance | **NOT TESTED** | no measurements taken |
@@ -508,6 +508,25 @@ curl -s -X POST $B/security/authorizations -H 'Content-Type: application/json' \
 curl -s -X POST $B/security/authorizations -H 'Content-Type: application/json' \
   -d '{"targets":["*.co.uk"],"operations":["http.probe"]}'    # -> 422
 ```
+
+### Seeing the Security Workspace
+
+The dev server is running on port 3000 against the backend on 8000, so this is
+live in the session's preview pane. Nothing else needs starting.
+
+```bash
+# What is running, and what the page's data path returns
+curl -s localhost:8000/security/authorizations
+curl -s localhost:3000/security/authorizations          # same data, via the dev proxy
+
+# The proxy entry is new; without it the page only works when the browser can
+# reach :8000 directly, which a remote preview cannot do.
+# `VITE_ALLOWED_HOSTS` is opt-in so Vite's strict Host check stays the default:
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example.com' localhost:3000   # 403
+```
+
+To try Scenario F by hand: authorise `127.0.0.1`, run a probe against
+`http://127.0.0.1:8099/admin`, then revoke it and run it again.
 
 ### The new guards
 
