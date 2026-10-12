@@ -313,3 +313,22 @@ class TestRegistryStreaming:
 
         assert full == "recovered answer"
         assert seen == ["partial "]  # no second stream of anything
+
+
+def test_the_outcome_is_read_from_the_exception_not_the_message():
+    """`kind` wins; the string-matching fallbacks remain only for old callers.
+
+    The old version matched the literal substring "Timeout" in str(exc), so a
+    reworded message would silently re-label every future failure.
+    """
+    llm = LLMClient()
+
+    assert llm._registry_outcome(
+        ProviderTransportError("worded differently now", kind="rate_limited")
+    ) == "rate_limited"
+    assert llm._registry_outcome(
+        ProviderTransportError("anything", status=500)
+    ) == "server_error"                      # legacy: status, no kind
+    assert llm._registry_outcome(
+        ProviderTransportError("Timeout waiting")
+    ) == "timeout"                           # legacy: message, no kind/status

@@ -22,6 +22,7 @@ help.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -70,12 +71,33 @@ def canonical_base_url(url: str) -> str:
 
 
 class ProviderTransportError(RuntimeError):
-    """A provider request failed. ``retryable`` says whether to try another model."""
+    """A provider request failed.
 
-    def __init__(self, message: str, *, status: int = 0, retryable: bool = False):
+    ``retryable`` says whether to try another *model* (the budget decision);
+    ``kind`` says what class of failure this is, in the same vocabulary the
+    attempt records and cooldowns use: ``rate_limited``, ``server_error``,
+    ``fatal``, ``timeout``, ``malformed``, ``connect_error``. It is set here,
+    at the failure site where the cause is known — the alternative was
+    string-matching the message downstream, so rewording an error silently
+    re-labelled every future failure.
+
+    ``kind=""`` means one class could not be determined: the discovery
+    aggregate joins failures of several kinds, and an exception constructed
+    by an older caller carries none.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 0,
+        retryable: bool = False,
+        kind: str = "",
+    ):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        self.kind = kind
 
 
 #: Status codes where trying a *different* model is the right response. A 401 is
@@ -122,6 +144,7 @@ class OpenAICompatibleClient:
         # provable without a live endpoint or a network.
         self.base_url = canonical_base_url(base_url)
         self.kind = kind
+        self._timeout = timeout
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
@@ -220,15 +243,35 @@ class OpenAICompatibleClient:
         payload = self._payload(messages, model, max_tokens, temperature, tools, stop)
         payload["stream"] = True
         pending: Dict[int, Dict[str, str]] = {}
+        # The stall guard. A whole stream is unbounded by design — a long
+        # generation is normal — but *silence* is not: a model that opens the
+        # stream and then says nothing must not hold the turn open forever.
+        # The bound is the provider's own request timeout when it is tighter,
+        # STREAM_IDLE_TIMEOUT as the cap. It applies twice over, deliberately:
+        # as the httpx read timeout (covers connect and the header wait on a
+        # real socket) and around each line read below (covers any transport,
+        # including test doubles that never touch a socket).
+        read_bound = min(self._timeout, STREAM_IDLE_TIMEOUT)
+        stream_timeout = httpx.Timeout(self._timeout, read=read_bound)
         try:
             async with self._client.stream(
-                "POST", "/v1/chat/completions", json=payload, timeout=None
+                "POST", "/v1/chat/completions", json=payload, timeout=stream_timeout
             ) as response:
                 if response.status_code >= 400:
                     body = await response.aread()
                     raise _classify(response.status_code, body)
 
-                async for line in response.aiter_lines():
+                lines = response.aiter_lines()
+                while True:
+                    try:
+                        line = await asyncio.wait_for(lines.__anext__(), read_bound)
+                    except StopAsyncIteration:
+                        break
+                    except (asyncio.TimeoutError, TimeoutError):
+                        raise ProviderTransportError(
+                            f"Stream stalled: no data for {read_bound:g}s",
+                            retryable=True, kind="timeout",
+                        ) from None
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -282,9 +325,14 @@ class OpenAICompatibleClient:
                         for line in rendered:
                             yield "\n" + line
         except httpx.HTTPError as exc:
+            if isinstance(exc, httpx.TimeoutException):
+                raise ProviderTransportError(
+                    f"Stream stalled: no data for {read_bound:g}s",
+                    retryable=True, kind="timeout",
+                ) from exc
             raise ProviderTransportError(
                 f"Transport error while streaming: {type(exc).__name__}",
-                retryable=True,
+                retryable=True, kind="connect_error",
             ) from exc
 
     async def health(self) -> Dict[str, Any]:
@@ -351,8 +399,14 @@ class OpenAICompatibleClient:
         try:
             response = await self._client.post(path, json=payload)
         except httpx.HTTPError as exc:
+            if isinstance(exc, httpx.TimeoutException):
+                raise ProviderTransportError(
+                    f"Request timed out ({type(exc).__name__})",
+                    retryable=True, kind="timeout",
+                ) from exc
             raise ProviderTransportError(
-                f"Transport error: {type(exc).__name__}", retryable=True
+                f"Transport error: {type(exc).__name__}",
+                retryable=True, kind="connect_error",
             ) from exc
         if response.status_code >= 400:
             raise _classify(response.status_code, response.content)
@@ -365,11 +419,23 @@ def _classify(status: int, body: bytes) -> ProviderTransportError:
     The body is decoded and truncated for the message, but only after
     redaction — a provider's error body can echo the request, and the request
     carries the prompt.
+
+    ``kind`` mirrors ``LLMClient._classify_status`` exactly: the outcome
+    vocabulary (``rate_limited`` / ``server_error`` / ``fatal``) is one set,
+    produced where the status is read. Cooldowns and metrics key off it.
     """
     from common.reporting import redact
 
     text = redact(body.decode("utf-8", errors="replace"))[:300]
     retryable = status in RETRYABLE_STATUS and status not in FATAL_STATUS
+    if status == 429:
+        kind = "rate_limited"
+    elif status in FATAL_STATUS:
+        kind = "fatal"
+    elif status in RETRYABLE_STATUS:
+        kind = "server_error"
+    else:
+        kind = "fatal"
     hint = ""
     if status == 429:
         hint = " (rate limited — try a different model)"
@@ -381,7 +447,8 @@ def _classify(status: int, body: bytes) -> ProviderTransportError:
             "/v1 to the base URL itself)"
         )
     return ProviderTransportError(
-        f"HTTP {status}{hint}: {text or '(empty body)'}", status=status, retryable=retryable
+        f"HTTP {status}{hint}: {text or '(empty body)'}",
+        status=status, retryable=retryable, kind=kind,
     )
 
 
@@ -390,7 +457,8 @@ def _json(response) -> Dict[str, Any]:
         return response.json()
     except ValueError as exc:
         raise ProviderTransportError(
-            "Provider returned a non-JSON response", retryable=False
+            "Provider returned a non-JSON response",
+            retryable=False, kind="malformed",
         ) from exc
 
 
@@ -438,7 +506,8 @@ def _extract_text(payload: Dict[str, Any]) -> str:
     choices = payload.get("choices") or []
     if not choices:
         raise ProviderTransportError(
-            "Provider returned no choices — the completion is empty", retryable=True
+            "Provider returned no choices — the completion is empty",
+            retryable=True, kind="malformed",
         )
     message = choices[0].get("message") or {}
     content = message.get("content")

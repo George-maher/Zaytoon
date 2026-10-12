@@ -13,13 +13,19 @@ adapter behaviour is proven deterministically with no network.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import httpx
 import pytest
 
 from agents.engine import extract_tool_calls
-from core.providers.client import OpenAICompatibleClient
+from core.providers.client import (
+    STREAM_IDLE_TIMEOUT,
+    OpenAICompatibleClient,
+    ProviderTransportError,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -318,3 +324,149 @@ async def test_no_org_header_by_default():
     await client.complete(MESSAGES, model="m")
 
     assert seen["org"] is None
+
+
+# ---------------------------------------------------------------------------
+# Failure taxonomy (W3): one vocabulary, produced at the failure site
+# ---------------------------------------------------------------------------
+class TestFailureKinds:
+    @pytest.mark.parametrize(
+        "status,kind,retryable",
+        [
+            (429, "rate_limited", True),
+            (500, "server_error", True),
+            (503, "server_error", True),
+            (529, "server_error", True),
+            (401, "fatal", False),
+            (404, "fatal", False),
+            (400, "fatal", False),
+            (422, "fatal", False),
+        ],
+    )
+    async def test_http_status_is_classified_into_the_attempt_vocabulary(
+        self, status, kind, retryable
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json={"error": "boom"})
+
+        client = make_client(handler)
+        with pytest.raises(ProviderTransportError) as caught:
+            await client.complete(MESSAGES, model="m")
+
+        assert caught.value.kind == kind
+        assert caught.value.retryable is retryable
+        assert caught.value.status == status
+
+    async def test_a_connect_error_is_not_a_timeout(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused")
+
+        client = make_client(handler)
+        with pytest.raises(ProviderTransportError) as caught:
+            await client.complete(MESSAGES, model="m")
+
+        assert caught.value.kind == "connect_error"
+        assert caught.value.retryable is True
+
+    async def test_a_read_timeout_is_a_timeout(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("too slow")
+
+        client = make_client(handler)
+        with pytest.raises(ProviderTransportError) as caught:
+            await client.complete(MESSAGES, model="m")
+
+        assert caught.value.kind == "timeout"
+
+    async def test_a_non_json_body_is_malformed(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text="<html>login page</html>",
+                headers={"content-type": "text/html"},
+            )
+
+        client = make_client(handler)
+        with pytest.raises(ProviderTransportError) as caught:
+            await client.complete(MESSAGES, model="m")
+
+        assert caught.value.kind == "malformed"
+        assert caught.value.retryable is False
+
+    async def test_an_empty_choices_list_is_malformed(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"choices": []})
+
+        client = make_client(handler)
+        with pytest.raises(ProviderTransportError) as caught:
+            await client.complete(MESSAGES, model="m")
+
+        assert caught.value.kind == "malformed"
+
+
+# ---------------------------------------------------------------------------
+# The stall guard: silence has a deadline, duration does not
+# ---------------------------------------------------------------------------
+class _StallingStream(httpx.AsyncByteStream):
+    """A stream that opens and then says nothing — the failure mode that hung."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    async def __aiter__(self):
+        await asyncio.sleep(self._delay)
+        yield b'data: {"choices": [{"delta": {"content": "late"}}]}\n\n'
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_silent_stream_is_reported_as_stalled_not_hung():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, stream=_StallingStream(30.0),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = OpenAICompatibleClient(
+        "http://provider.test", timeout=0.3,
+        transport=httpx.MockTransport(handler),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProviderTransportError) as caught:
+        async for _ in client.stream(MESSAGES, model="m"):
+            pass
+    elapsed = time.monotonic() - started
+
+    assert caught.value.kind == "timeout"
+    assert caught.value.retryable is True
+    assert "stalled" in str(caught.value)
+    # Fails in a fraction of a second rather than holding the turn for the
+    # 30 s the stream would have taken to say anything.
+    assert elapsed < 5.0
+
+
+async def test_the_read_bound_is_the_tighter_of_provider_timeout_and_the_cap():
+    """STREAM_IDLE_TIMEOUT was exported and never enforced; now it bounds reads."""
+    captured: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.extensions.get("timeout", {}))
+        return sse({"choices": [{"delta": {"content": "x"}}]})
+
+    # Default provider timeout (120 s) -> the 90 s stall cap applies.
+    client = OpenAICompatibleClient(
+        "http://provider.test", transport=httpx.MockTransport(handler),
+    )
+    async for _ in client.stream(MESSAGES, model="m"):
+        pass
+    assert captured[-1]["read"] == STREAM_IDLE_TIMEOUT
+
+    # A tighter per-provider timeout wins over the cap.
+    client2 = OpenAICompatibleClient(
+        "http://provider.test", timeout=10,
+        transport=httpx.MockTransport(handler),
+    )
+    async for _ in client2.stream(MESSAGES, model="m"):
+        pass
+    assert captured[-1]["read"] == 10

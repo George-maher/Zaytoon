@@ -743,7 +743,19 @@ class LLMClient:
         return decision
 
     def _registry_outcome(self, exc: Any) -> str:
-        """Map a transport failure onto the chain's attempt vocabulary."""
+        """Map a transport failure onto the chain's attempt vocabulary.
+
+        The client classifies each failure once, at the failure site, and the
+        ``kind`` travels on the exception. The old version guessed from
+        ``str(exc)`` — matching the literal substring ``"Timeout"`` — so
+        rewording a message silently re-labelled every future failure
+        (``connect_error`` vs ``timeout`` decided cooldowns and metrics).
+        The status/message fallbacks remain for exceptions constructed
+        without a kind.
+        """
+        kind = getattr(exc, "kind", "") or ""
+        if kind:
+            return kind
         status = getattr(exc, "status", 0) or 0
         if status:
             return self._classify_status(status)
