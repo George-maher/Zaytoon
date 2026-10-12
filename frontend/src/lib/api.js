@@ -1159,3 +1159,104 @@ export async function runSecurityProbe(url, { includeBody = false } = {}) {
     error: result.error,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Virtual machines — VMware discovery, inventory and lifecycle
+// ---------------------------------------------------------------------------
+// Every lifecycle call is two-stage on purpose. The first request resolves the
+// machine and describes what would happen, opening nothing; the second carries
+// only the token, and the backend runs the operation that was previewed. So the
+// page shows the user a *named* machine and a specific action, and the approve
+// click is for that and nothing else.
+export async function getHypervisors() {
+  const res = await fetch(`${API_BASE}/virtualization/hypervisors`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { hypervisors: [], any_available: false, error: `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getVirtualMachines(runningOnly = false) {
+  const params = runningOnly ? "?running_only=true" : "";
+  const res = await fetch(`${API_BASE}/virtualization/vms${params}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { vms: [], count: 0, success: false, error: `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getVirtualMachine(ref) {
+  const res = await fetch(
+    `${API_BASE}/virtualization/vms/one?ref=${encodeURIComponent(ref)}`,
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function getGuestConfig() {
+  const res = await fetch(`${API_BASE}/virtualization/guest`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { configured: false, problems: [], error: `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Step 1 — what would happen, to nothing.
+ *
+ * Returns the resolved machine, the tool's tier and any warnings. A refusal
+ * (an unknown or ambiguous name) comes back as `{success: false, error}` and is
+ * shown as-is: the backend's message lists the candidates, which is the only
+ * useful thing to say when a name did not identify one machine.
+ */
+export async function previewVmAction(ref, action, { mode, gui, waitForReady } = {}) {
+  const body = { ref, action };
+  if (mode) body.mode = mode;
+  if (gui !== undefined) body.gui = gui;
+  if (waitForReady !== undefined) body.wait_for_ready = waitForReady;
+  const res = await fetch(`${API_BASE}/virtualization/vms/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Step 2 — carry the user's answer. The operation comes from the token. */
+export async function confirmVmAction(token, { ref, action } = {}) {
+  const res = await fetch(`${API_BASE}/virtualization/vms/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: token, ref, action }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Step 1 of running a command in a guest. */
+export async function previewGuestExec(command, { vm, host, timeout } = {}) {
+  const body = { command };
+  if (vm) body.vm = vm;
+  if (host) body.host = host;
+  if (timeout) body.timeout = timeout;
+  const res = await fetch(`${API_BASE}/virtualization/guest/exec`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function confirmGuestExec(token, command) {
+  const res = await fetch(`${API_BASE}/virtualization/guest/exec`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: token, command }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}

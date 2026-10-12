@@ -170,7 +170,16 @@ class VMStatus(BaseTool):
         vmw = adapter()
         if not await vmw.available():
             return _unavailable(await vmw.why_unavailable())
-        info, how = await vmw.resolve_and_describe(vm)
+        try:
+            info, how = await vmw.resolve_and_describe(vm)
+        except VMOperationError as exc:
+            # Resolution failures are *expected* here — an ambiguous name, an
+            # unknown one, a `.vmx` that is gone — and their messages are the
+            # useful part: they list the candidates. Letting one escape reaches
+            # the registry's catch-all, which reports the exception *type* and
+            # withholds the message, so the user is told "VMOperationError" and
+            # not which machines exist to choose from.
+            return ToolResult.fail(str(exc))
         detail = (
             f"{info.name}: {info.state.value} ({info.state_evidence}). "
             f"Resolved by {how}."

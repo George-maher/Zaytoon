@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
-import uuid
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from core.api.approvals import ApprovalTokens, run_approved_tool
 from core.permissions import DECISION_ASK, VALID_DECISIONS, describe as describe_permissions
 from core.providers import (
     VALID_TIERS,
@@ -680,21 +679,16 @@ async def security_revoke(authorization_id: str) -> Dict[str, Any]:
 # the database: an approval is a gesture in the moment, and a durable one that
 # outlived the page it was given on would be a standing permission, which is
 # what the authorisation record is for.
-_PROBE_TOKENS: Dict[str, float] = {}
-_PROBE_TOKEN_TTL_S = 120.0
-_PROBE_TOKEN_MAX = 256
-
-
-def _prune_probe_tokens(now: float) -> None:
-    for key, stamp in list(_PROBE_TOKENS.items()):
-        if now - stamp > _PROBE_TOKEN_TTL_S:
-            _PROBE_TOKENS.pop(key, None)
-    if len(_PROBE_TOKENS) > _PROBE_TOKEN_MAX:
-        # Oldest first, so the cap cannot evict the token being used right now.
-        for key, _ in sorted(_PROBE_TOKENS.items(), key=lambda kv: kv[1])[
-            : len(_PROBE_TOKENS) - _PROBE_TOKEN_MAX
-        ]:
-            _PROBE_TOKENS.pop(key, None)
+#
+# The machinery moved to `core.api.approvals` when the VM routes needed the same
+# thing. These names are kept — and kept pointing at the *same objects* — so the
+# probe's own behaviour and its tests are unchanged by the move, while there is
+# only one implementation of "mint, expire, spend".
+_PROBE_APPROVALS = ApprovalTokens(ttl=120.0, cap=256, prefix="probe")
+_PROBE_TOKENS: Dict[str, float] = _PROBE_APPROVALS.tokens
+_PROBE_TOKEN_TTL_S = _PROBE_APPROVALS.ttl
+_PROBE_TOKEN_MAX = _PROBE_APPROVALS.cap
+_prune_probe_tokens = _PROBE_APPROVALS.prune
 
 
 @security_router.post("/security/probe")
@@ -705,7 +699,6 @@ async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]
     effect on the target.
     """
     from core.security import scope
-    from tools.safety import ConfirmationManager
 
     url = (data.get("url") or "").strip()
     if not url:
@@ -728,10 +721,7 @@ async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         raise HTTPException(422, str(exc)) from exc
 
     if not confirm:
-        now = time.monotonic()
-        _prune_probe_tokens(now)
-        token = f"probe_{uuid.uuid4().hex[:12]}"
-        _PROBE_TOKENS[token] = now
+        token = _PROBE_APPROVALS.issue()
         return {
             "requires_confirmation": True,
             "confirm": token,
@@ -745,50 +735,16 @@ async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]
             ),
         }
 
-    # The TTL is checked *here*, at use, not only when the table is next
-    # pruned. Pruning happens on the next preview, so enforcing age solely by
-    # pruning means a token survives for as long as nobody asks for another
-    # one: take a token, go to lunch, come back, and it still probes. Ageing
-    # is a property of the token, so it is tested on the token.
-    issued_at = _PROBE_TOKENS.pop(confirm, None)
-    if issued_at is None or time.monotonic() - issued_at > _PROBE_TOKEN_TTL_S:
+    if not _PROBE_APPROVALS.consume(confirm):
         raise HTTPException(
             409, "Unknown or expired confirmation token. Request the probe again."
         )
 
     # -- Step 2: the user answered. Run it through the process's real registry.
-    from api import main as api_main
-
-    # A manager for *this* approval. Its notifier resolves the request it is
-    # handed with `approved=True`, which is the same `resolve()` call the
-    # WebSocket transport makes — the answer is real, it is just already known.
-    answered: Dict[str, Any] = {}
-
-    async def _auto_answer(pending) -> None:
-        answered["request_id"] = pending.request_id
-        answered["action"] = pending.action
-        # Resolve asynchronously: `request()` is awaiting the future, and the
-        # notify callback runs before that await. Resolving inline is safe, but
-        # deferring keeps this identical in shape to the WS path.
-        asyncio.get_running_loop().call_soon(
-            manager.resolve, pending.request_id, True
-        )
-
-    manager = ConfirmationManager(notify=_auto_answer, timeout=15.0)
-
-    # `registry.execute`, not `tool_executor.execute`: the latter would supply
-    # the process-wide confirmation manager, which has no channel to answer on
-    # and would therefore refuse. Passing `manager` explicitly is the same call
-    # the WebSocket handler makes when a user approves — same registry, same
-    # gate, same audit record, different answer.
-    result = await api_main.tool_executor.registry.execute(
-        "security_probe",
-        {"url": url, "include_body": include_body},
-        confirmation_manager=manager,
+    result = await run_approved_tool(
+        "security_probe", {"url": url, "include_body": include_body}
     )
     if isinstance(result, dict):
         result.setdefault("authorization_id", authorization.id)
         result.setdefault("authorized_target", authorization.target)
-        if answered.get("request_id"):
-            result["approved_request_id"] = answered["request_id"]
     return result

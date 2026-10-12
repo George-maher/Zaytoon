@@ -32,6 +32,33 @@ if=… of=/dev/…`, `shutdown`, …) escalates to **dangerous** through the sam
 table that already guards `execute_local_command` — there is no VM-specific
 safety rule to drift out of sync.
 
+## Reaching it: the Virtual Machines screen and the HTTP routes
+
+You do not have to ask in chat. **Virtual Machines** is a destination in the
+sidebar (`◫`), backed by these routes:
+
+| Route | Kind | What it does |
+|---|---|---|
+| `GET /virtualization/hypervisors` | read-only | Whether each hypervisor's programs were found, and where |
+| `GET /virtualization/vms` | read-only | Inventory, with `state_evidence` per VM; `?running_only=` |
+| `GET /virtualization/vms/one?ref=` | read-only | One VM |
+| `GET /virtualization/guest` | read-only | What guest access is configured — never the secret itself |
+| `GET /virtualization/actions` | read-only | The action catalogue and each action's tier |
+| `POST /virtualization/vms/action` | **two-step** | Preview a lifecycle action, then confirm it |
+| `POST /virtualization/guest/exec` | **two-step** | Preview a guest command, then confirm it |
+
+The two acting routes never accept the operation on the second call. Step 1
+returns a single-use `confirm` token and *stores the operation*; step 2 ignores
+the request body and runs what was stored, then reports it. So a token issued for
+`start Ubuntu` cannot be spent on `stop Parrot --hard`, and the reply names what
+actually ran. A preview says what the tier is before anything happens: `hard`
+stops come back `dangerous`, and the screen will not let one be confirmed until
+its acknowledgement box is ticked.
+
+If no guest account is configured, `POST /virtualization/guest/exec` refuses
+*before any socket is opened* and tells you which variable is missing — see
+`GET /virtualization/guest`.
+
 ## Finding VMware
 
 Nothing assumes an install path. The adapter probes, in order:
@@ -165,12 +192,20 @@ is how you boot `Ubuntu-16.04-OLD` when you meant `Ubuntu 24.04 LTS`.
 ## Running the tests
 
 ```bash
+# Backend: the adapter, the tools, the workflows, and the HTTP surface.
 cd backend && PYTHONPATH=../.github python -m pytest \
   tests/core/test_virtualization_vmware.py \
   tests/test_vm_tools.py \
-  tests/test_vm_workflows.py -q
+  tests/test_vm_workflows.py \
+  tests/test_virtualization_routes.py -q          # 126 passed
+
+# Frontend: the screen.
+cd frontend && npx vitest run src/components/VirtualMachinesView.test.jsx   # 12 passed
 ```
 
 These use fake executables and need no VMware, no VM and no network. A grep for
 `vmware`/`vmrun` in the test files will confirm there is no real installation
-being touched.
+being touched. `tests/test_virtualization_routes.py` installs its fake adapter
+through `monkeypatch.setattr(vt, "_ADAPTER_FACTORY", …)`, so the routes,
+registry, confirmation manager and approval-token map under test are the real
+ones.

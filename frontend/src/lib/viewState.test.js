@@ -37,6 +37,7 @@ describe("view vocabulary", () => {
         "tasks",
         "skills",
         "security",
+        "machines",
         "models",
         "settings",
       ].sort(),
@@ -49,6 +50,7 @@ describe("view vocabulary", () => {
       VIEWS.TASKS,
       VIEWS.SKILLS,
       VIEWS.SECURITY,
+      VIEWS.MACHINES,
       VIEWS.MODELS,
       VIEWS.SETTINGS,
     ]);

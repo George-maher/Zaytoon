@@ -232,6 +232,19 @@ describe("App runtime", () => {
     );
 
     await act(async () => {
+      fireEvent.click(within(nav).getByRole("button", { name: "Virtual Machines" }));
+    });
+    // Its own heading and its own inventory list. The screen went from "nine
+    // tools and no way to reach them" to a destination, so the nav entry
+    // proving the screen mounts is the assertion that keeps it that way.
+    expect(screen.getByRole("heading", { name: "VIRTUAL MACHINES" })).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: /workspace/i })).not.toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: "Virtual Machines" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+
+    await act(async () => {
       fireEvent.click(within(nav).getByRole("button", { name: "Home" }));
     });
     expect(screen.queryByRole("navigation", { name: /workspace/i })).not.toBeInTheDocument();

@@ -27,6 +27,7 @@ import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import SkillsView from "./components/SkillsView";
 import SecurityView from "./components/SecurityView";
+import VirtualMachinesView from "./components/VirtualMachinesView";
 import ModelsView from "./components/ModelsView";
 import { VIEWS, resolveScreen } from "./lib/viewState";
 
@@ -628,6 +629,8 @@ export default memo(function App() {
         <SkillsView language={language} />
       ) : screen === VIEWS.SECURITY ? (
         <SecurityView language={language} />
+      ) : screen === VIEWS.MACHINES ? (
+        <VirtualMachinesView language={language} />
       ) : screen === VIEWS.MODELS ? (
         <ModelsView language={language} />
       ) : (

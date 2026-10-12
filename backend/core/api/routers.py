@@ -11,6 +11,7 @@ from core.api.registry_api import (
     terminal_router,
 )
 from core.api.tasks_api import router as tasks_router
+from core.api.virtualization_api import router as virtualization_router
 
 __all__ = [
     "files_router",
@@ -22,4 +23,5 @@ __all__ = [
     "system_router",
     "tasks_router",
     "terminal_router",
+    "virtualization_router",
 ]

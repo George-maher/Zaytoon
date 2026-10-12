@@ -340,3 +340,69 @@ def target_from_config(host: str = "", user: str = "") -> Optional[GuestTarget]:
         host_key_policy=str(getattr(Config, "VM_GUEST_HOST_KEY_POLICY", "strict") or "strict"),
         options=tuple(extra),
     )
+
+
+def guest_config_report() -> Dict[str, Any]:
+    """What the guest channel is configured to do, for the UI to display.
+
+    Reports *presence*, never contents. The account is shown because the user
+    needs to see what they configured; the identity is reported as a boolean
+    (set, and does the file exist) because a key path is not a secret but a key
+    is, and a habit of printing one is how it ends up in a screenshot.
+
+    ``problems`` is the honest half: each entry names a prerequisite that is
+    missing and what it stops. A UI that shows "guest access: available" when
+    no account is configured is worse than one that shows nothing, because the
+    user then reads every later failure as a bug.
+    """
+    from config import Config
+
+    user = str(getattr(Config, "VM_GUEST_USER", "") or "").strip()
+    identity = str(getattr(Config, "VM_GUEST_IDENTITY", "") or "").strip()
+    policy_raw = str(getattr(Config, "VM_GUEST_HOST_KEY_POLICY", "strict") or "strict").strip()
+    policy = (policy_raw or "strict").lower()
+    options = str(getattr(Config, "VM_GUEST_SSH_OPTIONS", "") or "").strip()
+
+    problems: List[str] = []
+    if not user:
+        problems.append(
+            "No guest account is configured (VM_GUEST_USER). Without one there is "
+            "no account to authenticate as, and Zaytoon will not guess one."
+        )
+    if identity and not os.path.isfile(os.path.expanduser(identity)):
+        problems.append(
+            "VM_GUEST_IDENTITY names a key that is not on disk. The connection "
+            "will fail rather than fall back to a password, because there is no "
+            "password to fall back to."
+        )
+    if policy in _FORBIDDEN_POLICIES:
+        problems.append(
+            f"VM_GUEST_HOST_KEY_POLICY is {policy_raw!r}, which would disable host "
+            f"verification. The channel refuses it and uses 'strict' instead: a "
+            f"machine that cannot tell one guest from another cannot authenticate "
+            f"a command to either."
+        )
+        policy = "strict"
+    if not identity and not os.environ.get("SSH_AUTH_SOCK"):
+        problems.append(
+            "No key is configured and no ssh-agent is running, so a key-only "
+            "connection cannot succeed. Set VM_GUEST_IDENTITY to a private key, "
+            "or start an agent and load one into it."
+        )
+
+    return {
+        "configured": bool(user),
+        "user": user,
+        "identity_set": bool(identity),
+        "identity_exists": bool(identity) and os.path.isfile(os.path.expanduser(identity)),
+        "host_key_policy": policy,
+        "connect_timeout_s": float(getattr(Config, "VM_GUEST_CONNECT_TIMEOUT", 10.0)),
+        "command_timeout_s": float(getattr(Config, "VM_GUEST_TIMEOUT", 30.0)),
+        "extra_options": [o.strip() for o in options.split(",") if o.strip()],
+        "authentication": "SSH key or agent only; a password is never accepted",
+        "address_source": (
+            "The guest's own address comes from VMware Tools inside the VM "
+            "(vmrun getGuestIPAddress), or from an address you pass explicitly."
+        ),
+        "problems": problems,
+    }

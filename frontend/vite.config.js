@@ -47,6 +47,12 @@ export default defineConfig({
       '/security': {
         target: 'http://localhost:8000',
       },
+      // Same reason as '/security': the Virtual Machines screen is a
+      // first-class page, and without an entry it only works when the browser
+      // can reach :8000 directly.
+      '/virtualization': {
+        target: 'http://localhost:8000',
+      },
     },
   },
 })

@@ -37,6 +37,7 @@ export const VIEWS = Object.freeze({
   TASKS: "tasks",
   SKILLS: "skills",
   SECURITY: "security",
+  MACHINES: "machines",
   MODELS: "models",
   SETTINGS: "settings",
 });
@@ -50,6 +51,7 @@ export const VIEW_LIST = Object.freeze([
   VIEWS.TASKS,
   VIEWS.SKILLS,
   VIEWS.SECURITY,
+  VIEWS.MACHINES,
   VIEWS.MODELS,
   VIEWS.SETTINGS,
 ]);
@@ -118,6 +120,17 @@ const META = Object.freeze({
     en: "Security",
     ar: "الأمان",
     glyph: "⛨",
+  }),
+  [VIEWS.MACHINES]: Object.freeze({
+    kind: "screen",
+    // VirtualMachinesView: hypervisor discovery, VM inventory with the
+    // observation behind each state, and the lifecycle actions — each of which
+    // is previewed and then explicitly confirmed, because powering a machine
+    // off is not something a single stray click should do.
+    ready: true,
+    en: "Virtual Machines",
+    ar: "الأنظمة الافتراضية",
+    glyph: "◫",
   }),
   [VIEWS.MODELS]: Object.freeze({
     kind: "screen",

@@ -10,7 +10,8 @@
 | `edf4815` | This report, first revision | — |
 | `5510497` | Confirmation-gate fix, scope-enforced security layer, Security Workspace, three test-only defects | 2792 backend / 627 frontend / 366 desktop |
 | `3e60fd6` `8bb6325` | Dev proxy for `/security`; report corrections | 627 frontend |
-| `985cc88` | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
+| `985cc88` `4475d05` | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
+| `b8e1464` | The VM REST surface and the Virtual Machines screen — see §5f, §7 fourth batch | 2919 backend / 641 frontend / 366 desktop |
 
 `main` has not been touched; nothing was merged. Two items from the first
 revision are corrected here (§8 web search, §11 test changes) and the voice
@@ -302,8 +303,60 @@ build well.
   command execution and desktop automation to stay distinct, and a single grant
   would let consent for "start Ubuntu" authorise "run this in Ubuntu". The
   vocabulary went from 10 names to 13.
+* **Seven HTTP routes** (`core/api/virtualization_api.py`, mounted in
+  `api/main.py`): five read-only — discovery, inventory, single-VM, guest config
+  report and an action catalogue — plus the two *acting* routes, VM action and
+  guest command, both two-step. The app went from 90 to **97 OpenAPI paths**,
+  which is the seven routes and nothing else. Without these the nine tools were
+  reachable only by a chat turn, which is not a control panel.
+* **A Virtual Machines screen** (`frontend/src/components/VirtualMachinesView.jsx`,
+  destination `VIEWS.MACHINES`, glyph `◫`) with eight `lib/api.js` helpers. The
+  inventory shows each VM's `state_evidence` next to its state, and `UNKNOWN` is
+  never dressed as `stopped`. Row actions are filtered to the ones applicable to
+  that VM's state, and a `dangerous` action cannot be confirmed until its
+  acknowledgement box is ticked.
 * **`docs/VMWARE.md`** — the real environment variables, the guest setup, and
   an explicit list of what is not implemented.
+
+### The approval token is bound to the operation, not to the request
+
+The acting routes are two-step: step 1 previews and issues a single-use token,
+step 2 executes. The obvious implementation stores the token and then executes
+whatever step 2 sends — which is a real bypass, because the thing the user
+approved and the thing that runs would then be two different things. So the
+record is `(tool, params, action)`, and step 2 **ignores the request body
+entirely**: it runs the recorded operation, and it *reports* the recorded
+operation, overwriting the result's `action`/`vm_ref` from the record rather than
+echoing whatever the caller claimed.
+
+Two guards exist for those two halves, and both were validated by fault
+injection:
+
+* Making step 2 honour the request body fails
+  `test_step_two_ignores_the_body_and_runs_what_was_approved`.
+* Storing the verb but *echoing the caller's claim* fails
+  `test_the_answer_names_what_ran_not_what_was_asked` — a caller who previewed
+  `start` and then sent `"action": "stop"` would have been told "stop" about
+  something that started.
+
+Demonstrated against the live server with a scripted `vmrun` on `PATH`:
+
+```
+preview start Ubuntu       -> tier confirm, token vm_d6cb9829f6ca
+confirm with body claiming stop Parrot --hard
+   reported action:        start       <- what ran
+   reported vm_ref:        .../Ubuntu.vmx
+   output:                 'Ubuntu' is now running (listed by `vmrun list`)
+running VMs afterwards:    ['Ubuntu'] <- Parrot untouched
+replaying the same token:  HTTP 409
+```
+
+The lesson that cost the most here: a stored tuple is a shape, and changing the
+shape means grepping every site that unpacks it. Widening `_PENDING` to three
+elements left `tool, recorded = pending` in the guest-exec branch, which raised
+`ValueError: too many values to unpack` and surfaced as an HTTP 500 on step 2 —
+visible only because the test asserts on the response *body*, not just the status
+code. A response assertion that prints the body is what finds these.
 
 ### The decisions that matter
 
@@ -347,13 +400,15 @@ the escalation is the existing machinery rather than a parallel rule set.
 
 ### Verification — and its honest limit
 
-Three test files, **94 tests**, all passing:
+Five test files, **138 tests**, all passing:
 
 | File | Tests | Covers |
 |---|---|---|
 | `tests/core/test_virtualization_vmware.py` | 37 | Discovery, inventory parsing, state classification, resolution refusals, lifecycle argv, timeouts, readiness |
 | `tests/test_vm_tools.py` | 47 | Tool tiers, permissions, prerequisite messages, the guest channel over a fake `ssh`, the gate |
 | `tests/test_vm_workflows.py` | 10 | The six user requests of §6B as *distinct* operations, and the two never-conflate claims |
+| `tests/test_virtualization_routes.py` | 32 | The HTTP surface: read-only routes cannot act, the body cannot redirect an operation, **asserted on the call *and* on the answer**; path recorded rather than display name; soft vs hard tier; single-use / expired / unknown / cross-surface tokens → 409; sweep-after-issue ordering; unknown VM lists candidates; 422s; `/actions` matches the registry; guest exec refuses before any socket |
+| `frontend/src/components/VirtualMachinesView.test.jsx` | 12 | Inventory and evidence rendering, `UNKNOWN` never shown as stopped, action filtering by state, the two-stage confirm, and the acknowledgement gate on a dangerous action |
 
 The fakes are **executables on disk**, spawned for real: a scripted `vmrun` and
 a scripted `ssh`. That tests the argv the adapter builds and the output it
@@ -362,11 +417,25 @@ injecting the fault each exists for — unknown-state→stopped, ambiguity→fir
 match, and host-key verification→disableable — and each failed exactly its own
 test.
 
+The route fakes (`test_virtualization_routes.py`) follow the same rule and are
+deliberately *not* shortcuts: they are installed by
+`monkeypatch.setattr(vt, "_ADAPTER_FACTORY", …)`, so the tests run the real route
+code, the real registry, the real confirmation manager and the real approval
+token map. An earlier attempt to test the route with a hand-built fake assembled
+outside the fixtures passed while the real fixtures were failing — it proved the
+code path existed, not that the route worked. The three bugs that run then
+exposed (a `KeyError` from the `vm_status` data shape, the sweep running before
+the prune, and the echoed verb) are all fixed and pinned. The binding guard was
+fault-injected and failed exactly its own test.
+
 **The limit, stated plainly: VMware is not installed on this host, so no real VM
 was ever started and no real guest was ever connected to.** Everything above is
-tested against fakes. That is a strong test of the adapter and a *weak* test of
-VMware itself, and `docs/VMWARE.md` says so in its first paragraph. Do not read
-"37 passing tests" as "verified against VMware".
+tested against fakes. That is a strong test of the adapter, of the routes and of
+the screen, and a *weak* test of VMware itself, and `docs/VMWARE.md` says so in
+its first paragraph. Do not read "138 passing tests" as "verified against
+VMware". The live walkthrough above used a scripted `vmrun` — a real executable
+spawned for real, which exercises the argv the adapter builds and the parsing it
+does, but which is still a script, not VMware.
 
 ## 6. Root cause detail: the voice defect
 
@@ -473,20 +542,50 @@ Third batch — virtualization (§5f):
 | `backend/tests/core/test_core_permissions.py`, `test_api_core.py` | The vocabulary pin 10 → 13, with the reason recorded |
 | `frontend/vite.config.js` | `/security` dev proxy; `allowedHosts` opt-in via `VITE_ALLOWED_HOSTS` |
 
+Fourth batch — the virtualization REST surface and the screen (§5f). Until this
+batch the nine tools existed but had **no HTTP route and no UI**, so the only way
+to reach them was a chat turn:
+
+| File | Change |
+|---|---|
+| `backend/core/api/approvals.py` | **new** — `ApprovalTokens` (issue/consume, TTL re-checked at use) and `run_approved_tool`, which passes a real `ConfirmationManager` into `registry.execute` |
+| `backend/core/api/registry_api.py` | Refactored onto `approvals.py`; its hand-rolled token map removed, so security and virtualization share one implementation |
+| `backend/core/api/virtualization_api.py` | **new** — 7 routes: 5 read-only (including the action catalogue), plus the 2 acting two-step routes |
+| `backend/core/api/routers.py`, `backend/api/main.py` | Export and mount the router (97 OpenAPI paths) |
+| `backend/core/virtualization/guest.py` | `guest_config_report()` appended — what is configured, **never the secret**; a forbidden host-key policy is reported and coerced to `strict` |
+| `backend/tools/virtualization.py` | `VMStatus.execute` catches `VMOperationError` instead of letting it reach the client as a 500 |
+| `frontend/src/lib/viewState.js` | `VIEWS.MACHINES` destination ("Virtual Machines" / "الأنظمة الافتراضية", glyph `◫`) |
+| `frontend/src/components/VirtualMachinesView.jsx` | **new** — hypervisor state, inventory with evidence, state-filtered actions, two-stage confirm, acknowledgement gate |
+| `frontend/src/lib/api.js` | Eight VM helpers |
+| `frontend/src/App.jsx` | Mounts `VirtualMachinesView` on `VIEWS.MACHINES` |
+| `frontend/vite.config.js` | `/virtualization` dev proxy |
+| **new** `backend/tests/test_virtualization_routes.py` | 32 tests |
+| **new** `frontend/src/components/VirtualMachinesView.test.jsx` | 12 tests |
+| `frontend/src/App.runtime.test.jsx` | The Virtual Machines nav entry now proves its screen mounts (17 total) |
+
 Every new test was run against the reverted fix and observed to fail before
 being accepted — 5, 4 and 6 failures respectively for the voice, skill and
 desktop guards; 1 for the token TTL (§5c); 1 for the App wiring of the Security
-screen; 1 for the strengthened tier test (§5d); and the "never contacted" guard
-was validated by injecting the fault *before* the check, since an injection
-placed after it proved nothing.
+screen; 1 for the strengthened tier test (§5d); 1 for the approval token's
+binding to the recorded operation; 1 for the acknowledgement gate that stops a
+`dangerous` action being confirmed unticked; and the "never contacted" guard was
+validated by injecting the fault *before* the check, since an injection placed
+after it proved nothing.
+
+Three of the four defects found in this batch were found **by the tests, not by
+reading the code**: the `vm_status` payload shape, the prune/sweep ordering, and
+the echoed verb that would have told a caller "stop" about something that
+started. The fourth — a 2-tuple unpack that raised `ValueError` into an HTTP 500 —
+was found because the assertion prints the response body. That is the pattern
+worth keeping: assert on the body, and print it.
 
 ## 8. Requirement status
 
 | Area | Status | Evidence |
 |---|---|---|
 | Remote commit inspection | **PASS** | SHA verified, `0 0` divergence |
-| Backend tests | **PASS** | 2887 passed / 5 skipped (baseline 2650/5; +237 across three batches) |
-| Frontend lint/test/build | **PASS** | eslint clean; 627 passed; build 489 kB / 141 kB gzip |
+| Backend tests | **PASS** | 2919 passed / 5 skipped (baseline 2650/5; +269 across four batches) |
+| Frontend lint/test/build | **PASS** | eslint clean; 641 passed; build 503 kB / 144 kB gzip (crossed the 500 kB warning threshold with this screen; see §9) |
 | Desktop tests (Linux) | **PASS** | 366 passed / 2 skipped (was a collection error) |
 | Voice — language handshake | **PASS** | reproduced, fixed, 8 tests, guard verified |
 | Voice — TTS prosody | **PASS** | reproduced, fixed, 5 tests |
@@ -500,9 +599,10 @@ placed after it proved nothing.
 | Security — non-destructive assessment + evidence | **PASS** | confirmed-only findings with evidence and remediation; Scenario F all five legs PASS live |
 | Security workspace UI | **PARTIAL — running, not yet human-verified** | the page exists, is wired into `App.jsx`, and its nav entry proves its screen mounts (12 tests). A dev server is running in this session on port 3000 with the backend on 8000, so the page can be opened and driven now (see below). I have confirmed the served app and its `/security` data path over HTTP, but **I have no browser here**, so nobody has clicked it yet — the last mile is yours to confirm. |
 | JARVIS UI/UX, orb, RTL | **PARTIAL** | pre-existing HUD/orb/theme and i18n exist and are untouched; I did **not** redesign the UI, so I make no claim about it. The new page follows the existing token/glyph system and switches language without reload (tested). |
-| Virtual machines — VMware discovery & lifecycle | **PARTIAL — implemented, tested against fakes, never run against VMware** | 47 adapter + tool tests, 10 workflow tests. Discovery, inventory, state-with-evidence, lifecycle argv, timeouts and refusal-to-guess all covered. **VMware is not installed here**, so no real VM was started: the real-VMware path is unverified and `docs/VMWARE.md` leads with that. |
-| Virtual machines — guest command execution | **PARTIAL — implemented, never run against a real guest** | Key-only SSH channel with host-key verification; stdout/stderr/exit code/duration captured; prerequisite failures (no account, no address, no Tools) each reported precisely. No guest existed to connect to. |
+| Virtual machines — VMware discovery & lifecycle | **PARTIAL — implemented, tested against fakes, never run against VMware** | 47 adapter + tool tests, 10 workflow tests, 32 route tests. Discovery, inventory, state-with-evidence, lifecycle argv, timeouts and refusal-to-guess all covered, and the two-step approval was walked live against a scripted `vmrun`. **VMware is not installed here**, so no real VM was started: the real-VMware path is unverified and `docs/VMWARE.md` leads with that. |
+| Virtual machines — guest command execution | **PARTIAL — implemented, never run against a real guest** | Key-only SSH channel with host-key verification; stdout/stderr/exit code/duration captured; prerequisite failures (no account, no address, no Tools) each reported precisely. The route refuses before any socket when the channel is unconfigured — verified live. No guest existed to connect to. |
 | Virtual machines — snapshots, networking, deletion | **FAIL (not implemented)** | Deliberately absent rather than half-built; list in `docs/VMWARE.md`. |
+| Virtual Machines screen | **PARTIAL — running, not yet human-verified** | `VirtualMachinesView.jsx` + `VIEWS.MACHINES` + 8 API helpers, 12 tests, eslint clean, and the nav entry proves the screen mounts (17 App tests). A dev server is live on port 3000 with the backend on 8000 and a scripted `vmrun`, so the page can be opened now; **nobody has clicked it**, because there is no browser here. |
 | Windows / macOS | **NOT TESTED** | Linux only; CI has all three legs but was not run |
 | Performance | **NOT TESTED** | no measurements taken |
 
@@ -529,26 +629,34 @@ rather than smoothed over.
    in any packaged build. The confirmed infrastructure finding above makes the
    case for it: search is the one subsystem that talks to arbitrary hosts by
    design.
-3. **Run the Security Workspace in a real browser** against a live backend.
-   The page is wired and unit-tested, but it has not been driven by a human —
-   no display here, and no LLM turn is possible without Ollama.
-4. Skills: natural-language creation, draft saving, version history, per-skill
-   execution logs (the UI currently has create/edit/enable/disable/delete only).
-5. Real-device voice validation on Windows and macOS.
-6. **`security_probe` covers configuration only.** It checks response headers
+3. **Run the Security Workspace and the Virtual Machines screen in a real
+   browser** against a live backend. Both are wired, tested and reachable; both
+   have only ever been fetched over HTTP, never rendered by a person.
+4. **Code-split the bundle.** The main chunk reached **503 kB** (144 kB gzip)
+   with this work and now trips Vite's 500 kB warning — a threshold, not a
+   defect, but it is the first time this project has crossed it and the next
+   screen will make it worse. `React.lazy` per destination is the fix and it is
+   an afternoon's work, not a rewrite; it does not belong in the same change as
+   a new subsystem.
+5. **Skills**: natural-language creation, draft saving, version history,
+   per-skill execution logs (the UI currently has
+   create/edit/enable/disable/delete only).
+6. **Real-device voice validation** on Windows and macOS — and an interactive
+   LLM turn, which needs Ollama, absent here.
+7. **`security_probe` covers configuration only.** It checks response headers
    from one non-destructive request. It does not test authentication,
    authorisation logic, input handling or any payload-driven class of bug, and
    the report it prints says so. Widening it is a separate piece of work with
    its own scope rules.
-7. **Verify the VMware path on a host that has VMware.** This is the single
+8. **Verify the VMware path on a host that has VMware.** This is the single
    largest unverified area of the virtualization work, and it cannot be closed
    here. The specific things to confirm first, in order: that `vmrun list`
    output parses on Windows (paths with spaces and the `Total running VMs:`
    header), that `-T ws` is right for the installed edition, and that
    `getGuestIPAddress` returns a usable address for the guest being targeted.
-8. VM snapshots, network/resource changes and VM deletion — see
+9. VM snapshots, network/resource changes and VM deletion — see
    `docs/VMWARE.md`.
-9. Cosmetic: `tests/test_process_manager.py` intermittently emits
+10. Cosmetic: `tests/test_process_manager.py` intermittently emits
    `PytestUnraisableExceptionWarning` (`BaseSubprocessTransport.__del__` after
    the loop closed). Confirmed pre-existing and flaky — it appears in roughly
    one run in three *in isolation*, with no change from this work, and no test
@@ -683,6 +791,71 @@ curl -s localhost:8000/permissions | python -c \
 export VMWARE_VMRUN="/usr/bin/vmrun"   # or leave unset to be discovered
 ```
 
+### Virtualization — the HTTP surface, and the binding guard, live
+
+Nothing here needs VMware either. The script below is a `vmrun` stand-in that
+tracks which VMs it started, so the lifecycle is *observable* rather than merely
+acknowledged. It must be a real executable on `PATH`, because the adapter spawns
+it.
+
+```bash
+mkdir -p /tmp/fakevms/ubuntu /tmp/fakevms/parrot
+printf 'guestOS = "ubuntu-64"\n' > /tmp/fakevms/ubuntu/Ubuntu.vmx
+printf 'guestOS = "debian-64"\n' > /tmp/fakevms/parrot/Parrot.vmx
+cat > /tmp/fake-vmrun <<'SH'
+#!/usr/bin/env python3
+import json, os, sys
+STATE = "/tmp/fake-vmrun-state.json"
+argv = sys.argv[1:]
+verb = argv[2] if argv[0] == "-T" else argv[0]
+rest = argv[3:] if argv[:1] == ["-T"] else argv[1:]
+state = json.load(open(STATE)) if os.path.exists(STATE) else {"running": []}
+running = state.setdefault("running", [])
+if verb == "list":
+    print("Total running VMs: %d" % len(running)); [print(p) for p in running]; sys.exit(0)
+if verb in ("start", "stop"):
+    t = rest[0]
+    running.append(t) if verb == "start" and t not in running else None
+    running.remove(t) if verb == "stop" and t in running else None
+    json.dump(state, open(STATE, "w")); print("%s %s" % (verb, t)); sys.exit(0)
+if verb == "getGuestIPAddress":
+    print("10.0.0.9"); sys.exit(0)
+print("vmrun: %s ok" % verb)
+SH
+chmod +x /tmp/fake-vmrun
+
+# Serve with the fake hypervisor and an inventory directory that has VMs in it.
+cd backend && CORE_DB_PATH=/tmp/vm-live.sqlite VMWARE_VMRUN=/tmp/fake-vmrun \
+  VM_INVENTORY_DIRS=/tmp/fakevms PYTHONPATH=../.github \
+  ../.venv/bin/python -m uvicorn api.main:app --port 8000 &
+
+B=http://127.0.0.1:8000
+curl -s $B/virtualization/hypervisors | head -c 200
+curl -s $B/virtualization/vms        # each state carries its state_evidence
+
+# Preview a start, then spend the token on a DIFFERENT operation. What runs, and
+# what the answer says ran, must both be the recorded `start Ubuntu`.
+P=$(curl -s -X POST $B/virtualization/vms/action -H 'Content-Type: application/json' \
+      -d '{"action":"start","ref":"Ubuntu"}')
+T=$(echo "$P" | python -c 'import sys,json; print(json.load(sys.stdin)["confirm"])')
+curl -s -X POST $B/virtualization/vms/action -H 'Content-Type: application/json' \
+  -d "{\"action\":\"stop\",\"ref\":\"Parrot\",\"mode\":\"hard\",\"confirm\":\"$T\"}"
+#   -> "action": "start", "vm_ref": ".../Ubuntu.vmx"   (the body is ignored)
+curl -s $B/virtualization/vms | python -c \
+  'import sys,json; print([v["name"] for v in json.load(sys.stdin)["vms"] if v["state"]=="running"])'
+#   -> ['Ubuntu']      Parrot untouched
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $B/virtualization/vms/action \
+  -H 'Content-Type: application/json' -d "{\"action\":\"start\",\"ref\":\"Ubuntu\",\"confirm\":\"$T\"}"
+#   -> 409   the token is single-use
+```
+
+The tests for this surface, and for the screen that drives it:
+
+```bash
+cd backend && PYTHONPATH=../.github ../.venv/bin/python -m pytest tests/test_virtualization_routes.py -q   # 32 passed
+cd frontend && npx vitest run src/components/VirtualMachinesView.test.jsx                                # 12 passed
+```
+
 ### The new guards
 
 ```bash
@@ -709,8 +882,8 @@ Nothing was merged to `main`; work stayed on `arena/af56e022-zaytoon`.
 | `desktop/tests/conftest.py` | Tk and PortAudio probed independently | strengthened |
 | `backend/tests/test_declared_tier_is_enforced.py` | `asyncio.get_running_loop()`; result assertion added (§5d) | strengthened |
 | `backend/tests/test_security_probe*.py`, `tests/core/test_security_scope.py` | `CORE_DB_PATH` (§5e) | corrected |
-| `frontend/src/lib/viewState.test.js` | Vocabulary pin extended for the new destination | extended, not relaxed |
-| `frontend/src/App.runtime.test.jsx` | Security destination added to the nav walk | extended |
+| `frontend/src/lib/viewState.test.js` | Vocabulary pin extended for the two new destinations | extended, not relaxed |
+| `frontend/src/App.runtime.test.jsx` | Security and Virtual Machines destinations added to the nav walk, asserting each screen mounts | extended |
 | `backend/tests/core/test_core_permissions.py`, `test_api_core.py` | Vocabulary pin 10 → 13 | updated, with the reason recorded in the test |
 
 The permission-vocabulary pin is the one number that changed because the
@@ -720,10 +893,29 @@ test now says so instead of just counting. The same count appeared in three
 places and in one prose docstring; the docstring now names no number, because a
 number in prose is a number that will be wrong.
 
-The one apparent relaxation — `viewState.test.js` — is an extension: a real
-destination with a mounted screen was added, and the test pins the vocabulary
+No test file was deleted, and no failing test was removed to reach green. Three
+frontend assertions were *rewritten*, and all three are recorded here because a
+rewritten assertion is where a weakened one would hide:
+
+* `VirtualMachinesView.test.jsx` first used `getByText("Ubuntu")` and
+  `getByText("CONFIRM")`. Both threw — legitimately: each machine name appears
+  twice (inventory and guest selector), and the confirm button's accessible name
+  is `CONFIRM · <action>`, built from two text nodes. The fix was to query the
+  list by its `aria-label` and the button by role; the assertions became
+  *stronger*, because they now pin which region each name came from.
+* The same file's failure count dropped 7 → 0 only after the duplicate was
+  *explained*, not after the assertion was loosened.
+
+The one apparent relaxation — `viewState.test.js` — is an extension: real
+destinations with mounted screens were added, and the test pins the vocabulary
 exactly, so both lists grew. It is not a loosened assertion; it is the same
-strict `toEqual` over one more entry.
+strict `toEqual` over more entries.
+
+**On the response-shape assertions.** `test_virtualization_routes.py` asserts
+with the body included (`assert body["success"] is True, body`). That single
+habit is what made three defects legible instead of mysterious: a literal
+`{ref}` in a message, a verb echoed from the request, and a 500 whose only clue
+was a `ValueError` in the server log.
 
 **On `security_probe`'s tier.** The tool is registered at `confirm` and the
 tier gate runs *before* it is allowed to build a client. The endpoint that runs
