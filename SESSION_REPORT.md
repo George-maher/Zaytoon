@@ -10,7 +10,7 @@
 | `edf4815` | This report, first revision | — |
 | `5510497` | Confirmation-gate fix, scope-enforced security layer, Security Workspace, three test-only defects | 2792 backend / 627 frontend / 366 desktop |
 | `3e60fd6` `8bb6325` | Dev proxy for `/security`; report corrections | 627 frontend |
-| `b7e4c1a`+ | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
+| `985cc88` | VMware/VM adapter, nine VM tools, guest SSH channel — see §5f | 2887 backend |
 
 `main` has not been touched; nothing was merged. Two items from the first
 revision are corrected here (§8 web search, §11 test changes) and the voice
