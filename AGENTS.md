@@ -201,6 +201,36 @@ registry so the user is not asked twice.
 the same attempt budget, and the Ollama path (`_complete_ollama` /
 `_stream_ollama`) validates the contract identically.
 
+### The registry is the configuration (`core/providers/`)
+
+A provider is a **row**, not an environment variable: kind
+(`ollama` / `openai_compatible` / `openrouter`), a validated base URL,
+write-only credentials, optional `timeout_s` / `org_id`. Models are rows
+against it, with the endpoint's own claims recorded and the free-only
+refusals stored visible (`policy_reason`), never silently dropped. Routing,
+transport and the settings UI all read the same rows; the legacy
+`GET/POST /settings/ai` is a **facade over the registry**, so an old client
+and the new one cannot disagree. **Full reference: `docs/PROVIDERS.md`.**
+
+Two rules that are not negotiable, each with a test that is the tripwire:
+
+- **No silent local→hosted fallback.** When the registry default is local
+  (`kind: ollama`, or an `openai_compatible` on loopback/private by address
+  class) and it cannot answer, the request refuses with a controlled
+  bilingual message (`kind: local_default_blocked`) rather than crossing to a
+  hosted model the user never chose to send data to. Hosted→local and
+  within-provider fallback are unchanged. An unreadable registry never
+  triggers the guard — it must never be the *reason* a request fails.
+- **Reachability is not proof.** `POST /providers/{id}/test` (a models-list
+  probe) may set `verified_at`; first-run setup completes **only** on
+  `POST /providers/{id}/test-chat`, a real 32-token completion that sets
+  `chat_verified_at`. `GET /setup/status` reads the latter, because wrong key
+  scope, a missing model and an exhausted balance each look exactly like
+  success until a completion is attempted.
+
+Live proof (real Ollama, no mocks): `python scripts/verify_providers_live.py`
+— 13 checks over the same route functions the API serves.
+
 ### The invariant
 
 > Only a validated completion that satisfies the contract of the current request
