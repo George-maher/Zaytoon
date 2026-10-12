@@ -922,16 +922,24 @@ class LLMClient:
                 full = ""
                 got_delta = False
                 try:
+                    sink: List[str] = []
                     async for delta in transport.stream(
                         messages, model=candidate.model_id,
                         max_tokens=max_tokens, temperature=temperature,
-                        tools=tools,
+                        tools=tools, tool_calls_out=sink,
                     ):
                         full += delta
                         got_delta = True
                         last_partial = full
                         if on_delta:
                             await on_delta(delta)
+
+                    # Native tool calls travelled off-wire (see stream()'s
+                    # tool_calls_out): they join `full` for validation as the
+                    # JSON-in-text dialect, but never reached `on_delta` —
+                    # tool calls are not prose.
+                    if sink:
+                        full = full + ("\n" if full else "") + "\n".join(sink)
 
                     if not full:
                         raise LLMResponseError("stream completed with no content")

@@ -88,13 +88,18 @@ class OpenAICompatibleClient:
         api_key: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
         kind: str = "openai_compatible",
+        transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
+        # ``transport`` is a test seam (httpx.MockTransport), the same shape
+        # ``tools/fetch.py`` uses: adapter request/response behaviour must be
+        # provable without a live endpoint or a network.
         self.base_url = base_url.rstrip("/")
         self.kind = kind
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout,
             headers=self._headers(api_key),
+            transport=transport,
         )
 
     @staticmethod
@@ -162,17 +167,27 @@ class OpenAICompatibleClient:
         temperature: float = 0.7,
         tools: Optional[List[Dict[str, Any]]] = None,
         stop: Optional[List[str]] = None,
+        tool_calls_out: Optional[List[str]] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a completion as text deltas.
 
         Yields only text. Tool calls arrive as structured deltas on some
-        endpoints; those are accumulated into a final message rather than
-        streamed as text, because a JSON blob arriving character by character is
-        exactly the bug the agent engine's "tool calls are not prose" rule exists
-        to prevent.
+        endpoints; those are accumulated and rendered into ``tool_calls_out``
+        as JSON-in-text dialect lines rather than streamed as text, because a
+        JSON blob arriving character by character is exactly the bug the agent
+        engine's "tool calls are not prose" rule exists to prevent — and the
+        rendered call must still reach the validator, so it joins the caller's
+        accumulated text *after* the stream, off the wire.
+
+        OpenAI-shaped servers fragment a native call across chunks (name in
+        one, ``arguments`` pieces in the rest), so entries are merged by
+        ``index`` before rendering. With no ``tool_calls_out`` the rendered
+        call is yielded as a final delta instead — losing it would turn a
+        model's tool call into an empty completion.
         """
         payload = self._payload(messages, model, max_tokens, temperature, tools, stop)
         payload["stream"] = True
+        pending: Dict[int, Dict[str, str]] = {}
         try:
             async with self._client.stream(
                 "POST", "/v1/chat/completions", json=payload, timeout=None
@@ -202,6 +217,38 @@ class OpenAICompatibleClient:
                         text = delta.get("content")
                         if text:
                             yield text
+                        for call in delta.get("tool_calls") or []:
+                            if not isinstance(call, dict):
+                                continue
+                            index = call.get("index")
+                            slot = pending.setdefault(
+                                index if isinstance(index, int) else len(pending),
+                                {"name": "", "arguments": ""},
+                            )
+                            function = call.get("function") or {}
+                            name = function.get("name")
+                            if name and not slot["name"]:
+                                slot["name"] = str(name)
+                            arguments = function.get("arguments")
+                            if isinstance(arguments, str):
+                                slot["arguments"] += arguments
+                            elif arguments is not None:
+                                slot["arguments"] = json.dumps(
+                                    arguments, ensure_ascii=False
+                                )
+
+                # The stream closed normally — render what was accumulated.
+                rendered = [
+                    _render_call(slot["name"].strip(), slot["arguments"])
+                    for index in sorted(pending)
+                    if (slot := pending[index])["name"].strip()
+                ]
+                if rendered:
+                    if tool_calls_out is not None:
+                        tool_calls_out.extend(rendered)
+                    else:
+                        for line in rendered:
+                            yield "\n" + line
         except httpx.HTTPError as exc:
             raise ProviderTransportError(
                 f"Transport error while streaming: {type(exc).__name__}",
@@ -312,6 +359,46 @@ def _json(response) -> Dict[str, Any]:
         ) from exc
 
 
+def _render_call(name: str, arguments: Any) -> str:
+    """One native tool call -> one line of the engine's JSON-in-text dialect.
+
+    ``{"action": name, "params": args}`` is the documented dialect
+    ``agents.engine.extract_tool_calls`` parses, so a native OpenAI
+    ``tool_calls`` entry and a model that types the JSON itself become the
+    *same* text for the validator, the contract check and the tool gate.
+    ``function.arguments`` is a stringified JSON object per the OpenAI spec
+    (Ollama's native shape gives a dict); anything unparseable becomes
+    ``params._raw`` rather than being dropped, so the contract reports bad
+    arguments instead of silently losing the call.
+    """
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments) if arguments.strip() else {}
+        except ValueError:
+            parsed = {"_raw": arguments}
+    elif isinstance(arguments, dict):
+        parsed = arguments
+    else:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {"_raw": json.dumps(parsed, ensure_ascii=False)}
+    return json.dumps({"action": name, "params": parsed}, ensure_ascii=False)
+
+
+def _render_tool_calls(message: Dict[str, Any]) -> str:
+    """Every native ``tool_calls`` entry on a message, rendered as dialect text."""
+    lines: List[str] = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        lines.append(_render_call(name, function.get("arguments")))
+    return "\n".join(lines)
+
+
 def _extract_text(payload: Dict[str, Any]) -> str:
     choices = payload.get("choices") or []
     if not choices:
@@ -325,7 +412,14 @@ def _extract_text(payload: Dict[str, Any]) -> str:
         content = "".join(
             part.get("text", "") for part in content if isinstance(part, dict)
         )
-    return str(content or "")
+    text = str(content or "")
+    # A model that answers with a *native* tool call and no prose used to come
+    # back as an empty string and burn an attempt; render the call so the
+    # engine sees it exactly as it would see the JSON dialect.
+    native = _render_tool_calls(message)
+    if native:
+        return f"{text}\n{native}" if text else native
+    return text
 
 
 def _parse_openai_models(payload: Dict[str, Any]) -> List[DiscoveredModel]:

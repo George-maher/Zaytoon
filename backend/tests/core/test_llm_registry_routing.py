@@ -92,7 +92,7 @@ def _patch_stream(monkeypatch, script):
     calls: list = []
 
     async def fake(self, messages, model, max_tokens=2048, temperature=0.7,
-                   tools=None, stop=None):
+                   tools=None, stop=None, tool_calls_out=None):
         calls.append(model)
         spec = script(model)
         if isinstance(spec, Exception):
@@ -236,6 +236,44 @@ class TestRegistryStreaming:
 
         assert full == "Hello"
         assert seen == ["Hel", "lo"]
+        assert calls == ["local:7b"]
+
+    async def test_a_native_tool_call_reaches_validation_not_the_screen(
+        self, temp_core_db, temp_secrets, monkeypatch
+    ):
+        """tool_calls accumulated off-wire join `full` but never `on_delta`.
+
+        The client's stream() keeps native tool calls out of the yielded text;
+        this pins the other half: `_stream_registry` folds them into the text
+        that gets validated (so the call is *seen*) without pushing one byte
+        to the screen (so "tool calls are not prose" stays structural).
+        """
+        await _registry(("local:7b", 1))
+        rendered = '{"action": "get_time", "params": {}}'
+        calls: list = []
+
+        async def fake(self, messages, model, max_tokens=2048, temperature=0.7,
+                       tools=None, stop=None, tool_calls_out=None):
+            calls.append(model)
+            if tool_calls_out is not None:
+                tool_calls_out.append(rendered)
+            # No text deltas at all: a pure native-tool response.
+            if False:
+                yield  # makes this an async generator that yields nothing
+
+        monkeypatch.setattr(OpenAICompatibleClient, "stream", fake)
+        seen: list = []
+
+        async def collect(delta):
+            seen.append(delta)
+
+        llm = LLMClient()
+        full = await llm.stream(
+            [{"role": "user", "content": "hi"}], on_delta=collect
+        )
+
+        assert full == rendered
+        assert seen == []          # nothing rendered-as-prose reached the UI
         assert calls == ["local:7b"]
 
     async def test_failure_before_a_delta_falls_through_to_the_chain(
