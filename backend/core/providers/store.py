@@ -184,6 +184,21 @@ def assert_model_allowed(kind: str, model_id: str) -> str:
     return model
 
 
+def policy_verdict(kind: str, model_id: str) -> "tuple[bool, str]":
+    """Would :func:`assert_model_allowed` accept this id? As a verdict, not a raise.
+
+    Discovery needs the answer for *every* model an endpoint reports: a
+    refusal must be stored and shown (disabled, with the reason), not thrown
+    away. The raiser remains the gate on every write that would enable a
+    model, so the policy itself is unchanged — only the visibility is.
+    """
+    try:
+        assert_model_allowed(kind, model_id)
+    except ProviderError as exc:
+        return False, str(exc)
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
@@ -379,11 +394,20 @@ async def save_model(
     enabled: bool = True,
     priority: int = 100,
     validate_policy: bool = True,
+    policy_reason: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Record a model against a provider.
 
     Refuses a model the provider's policy rejects, so a billable id cannot enter
     the table even by hand and later be picked up by the router.
+
+    ``policy_reason`` is how a *refusal* is stored: discovery records what the
+    catalog reported with the reason it is disabled, and the two can never
+    disagree — a row carrying a reason is written disabled whatever ``enabled``
+    says. ``metadata`` (pricing, supported parameters) is discovery detail: a
+    ``None`` keeps whatever a previous refresh recorded, an explicit dict
+    replaces it.
     """
     provider = await get_provider(provider_id)
     if provider is None:
@@ -391,6 +415,11 @@ async def save_model(
     model = model_id.strip() if model_id else ""
     if validate_policy:
         model = assert_model_allowed(provider["kind"], model)
+    reason = (policy_reason or "").strip() or None
+    if reason:
+        # Structural: the refusal text and the enabled flag cannot disagree,
+        # whatever order the arguments arrived in.
+        enabled = False
     try:
         length = int(context_length) if context_length else None
     except (TypeError, ValueError):
@@ -404,19 +433,23 @@ async def save_model(
         """
         INSERT INTO models
             (provider_id, model_id, display_name, capabilities, context_length,
-             enabled, priority, discovered_at)
-        VALUES (?,?,?,?,?,?,?,?)
+             enabled, priority, discovered_at, metadata_json, policy_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(provider_id, model_id) DO UPDATE SET
             display_name = excluded.display_name,
             capabilities = excluded.capabilities,
             context_length = excluded.context_length,
             enabled = excluded.enabled,
-            priority = excluded.priority
+            priority = excluded.priority,
+            metadata_json = COALESCE(excluded.metadata_json, metadata_json),
+            policy_reason = excluded.policy_reason
         """,
         (
             provider_id, model, display_name or model,
             json.dumps(sorted(normalise(capabilities))),
             length, int(bool(enabled)), rank, _now(),
+            json.dumps(metadata) if metadata else None,
+            reason,
         ),
     )
 
@@ -553,6 +586,11 @@ def _model_row(row: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         parsed = None
     capabilities = sorted(normalise(parsed))
+    raw_metadata = row.get("metadata_json")
+    try:
+        metadata = json.loads(raw_metadata) if raw_metadata else {}
+    except (TypeError, ValueError):
+        metadata = {}
     return {
         "provider_id": row.get("provider_id"),
         "id": row.get("model_id"),
@@ -561,6 +599,11 @@ def _model_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "context_length": row.get("context_length"),
         "enabled": bool(row.get("enabled")),
         "priority": int(row.get("priority") or 100),
+        # Discovery detail (pricing, supported parameters) and, when the row
+        # is disabled by policy rather than by the user, the refusal itself —
+        # "why is this off?" must be answerable without reading code.
+        "metadata": metadata,
+        "policy_reason": row.get("policy_reason"),
         "discovered_at": row.get("discovered_at"),
     }
 
@@ -583,6 +626,7 @@ __all__ = [
     "get_tier_assignments",
     "list_models",
     "list_providers",
+    "policy_verdict",
     "resolve_api_key",
     "save_model",
     "save_provider",

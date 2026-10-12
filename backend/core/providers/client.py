@@ -117,6 +117,9 @@ class DiscoveredModel:
     context_length: Optional[int] = None
     display_name: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict)
+    #: Catalog detail with no natural column — pricing, supported parameters,
+    #: modality. Recorded, never acted on: it is what the endpoint *claims*.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -124,6 +127,7 @@ class DiscoveredModel:
             "name": self.display_name or self.id,
             "capabilities": list(self.capabilities),
             "context_length": self.context_length,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -542,15 +546,57 @@ def _parse_openai_models(payload: Dict[str, Any]) -> List[DiscoveredModel]:
         model_id = entry.get("id")
         if not model_id:
             continue
+        capabilities = set(normalise(entry.get("capabilities")))
+
+        # OpenAI-compatible catalogs don't send a "capabilities" field; they
+        # send what the endpoint *supports*, and that is a direct claim about
+        # behaviour — a model whose supported_parameters include "tools" does
+        # tool calling, and routing to it for a tool turn is honest. Names and
+        # vendor folklore are not consulted.
+        parameters = entry.get("supported_parameters")
+        names: set = set()
+        if isinstance(parameters, list):
+            names = {str(p).strip().lower() for p in parameters if str(p).strip()}
+        if "tools" in names:
+            capabilities.add(Capability.TOOLS.value)
+        if "response_format" in names:
+            capabilities.add(Capability.STRUCTURED_OUTPUT.value)
+
+        architecture = entry.get("architecture")
+        inputs: set = set()
+        if isinstance(architecture, dict):
+            modalities = architecture.get("input_modalities")
+            if isinstance(modalities, list):
+                inputs = {str(m).strip().lower() for m in modalities}
+        if "image" in inputs:
+            capabilities.add(Capability.VISION.value)
+
+        # Catalog metadata, recorded as reported — pricing is USD per token
+        # on OpenRouter and is *not* converted into any claim about cost.
+        metadata: Dict[str, Any] = {}
+        pricing = entry.get("pricing")
+        if isinstance(pricing, dict) and pricing:
+            metadata["pricing"] = {
+                str(k): v for k, v in pricing.items() if v not in (None, "")
+            }
+        if names:
+            metadata["supported_parameters"] = sorted(names)
+        if isinstance(architecture, dict):
+            for key in ("modality", "input_modalities", "tokenizer"):
+                value = architecture.get(key)
+                if value:
+                    metadata[key] = value
+
         models.append(DiscoveredModel(
             id=str(model_id),
             display_name=str(entry.get("name") or model_id),
             # An endpoint that reports no capabilities is assumed to do the two
             # the chat-completions contract guarantees. Assuming *less* would
             # make every model unroutable on a freshly added provider.
-            capabilities=sorted(normalise(entry.get("capabilities"))),
+            capabilities=sorted(capabilities),
             context_length=entry.get("context_length") or entry.get("max_context_length"),
             raw=entry,
+            metadata=metadata,
         ))
     return models
 

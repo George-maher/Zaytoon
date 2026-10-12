@@ -41,6 +41,20 @@ async def make_provider(name="Local", kind="ollama", url="http://localhost:11434
     )
 
 
+def test_policy_verdict_is_the_gate_as_a_value():
+    """The same check discovery uses, returned instead of raised."""
+    from core.providers import policy_verdict
+
+    assert policy_verdict("ollama", "qwen3.5:9b") == (True, "")
+    assert policy_verdict("openai_compatible", "whatever") == (True, "")
+
+    allowed, reason = policy_verdict("openrouter", "openai/gpt-4o")
+    assert allowed is False and "free" in reason
+
+    allowed, reason = policy_verdict("openrouter", "openrouter/free")
+    assert allowed is False and "auto-router" in reason
+
+
 class TestCapabilities:
     def test_normalise_defaults_when_nothing_is_declared(self):
         """A model nobody has probed is unprobed, not incapable — assuming less
@@ -748,9 +762,15 @@ class TestDiscovery:
         assert result["discovered"] == 2
         assert {m["id"] for m in await list_models()} == {"qwen3.5:9b", "nomic-embed"}
 
-    async def test_a_discovered_pillaged_model_is_skipped_not_recorded(
+    async def test_a_discovered_billable_model_is_recorded_disabled_with_its_refusal(
         self, temp_core_db, temp_secrets, monkeypatch
     ):
+        """The refusal is stored and shown, not silently dropped.
+
+        A catalog where the refusals are invisible is one the user cannot
+        audit: the model appears with ``enabled=False`` and the policy's own
+        words as its reason, and routing never reaches it.
+        """
         provider = await make_provider(
             "Cloud", kind="openrouter", url="https://openrouter.ai/api/v1",
             requires_key=True, api_key="sk-secret-value-123456",
@@ -770,9 +790,65 @@ class TestDiscovery:
                 return None
 
         monkeypatch.setattr("core.providers.client.OpenAICompatibleClient", FakeClient)
-        await refresh_models(provider["id"])
+        result = await refresh_models(provider["id"])
 
+        # The default listing (routable) holds only the free model...
         assert [m["id"] for m in await list_models()] == ["qwen/qwen3.8-27b:free"]
+        assert result["refused_by_policy"] == 1
+        assert result["added"] == 1
+
+        # ...while the full catalog shows the refusal instead of hiding it.
+        everything = {m["id"]: m for m in await list_models(enabled_only=False)}
+        refused = everything["openai/gpt-4o"]
+        assert refused["enabled"] is False
+        assert refused["policy_reason"] and "free" in refused["policy_reason"]
+
+        # And the router never reaches it: with only the billable model
+        # present, routing says everything is disabled rather than using it.
+        await delete_model(provider["id"], "qwen/qwen3.8-27b:free")
+        decision = await plan(required=["chat"])
+        assert decision.model is None
+        assert "disabled" in decision.error
+
+    async def test_a_policy_refused_model_cannot_be_enabled_by_hand(
+        self, temp_core_db, temp_secrets
+    ):
+        """Storing a refusal is not a way to enable one later."""
+        provider = await make_provider(
+            "Cloud", kind="openrouter", url="https://openrouter.ai/api/v1",
+            requires_key=True, api_key="sk-secret-value-123456",
+        )
+        with pytest.raises(ProviderError, match="free"):
+            await save_model(provider["id"], "openai/gpt-4o", enabled=True)
+
+    async def test_policy_reason_forces_a_row_disabled(
+        self, temp_core_db, temp_secrets
+    ):
+        """The flag and the reason can never disagree, whatever the order."""
+        provider = await make_provider()
+        await save_model(
+            provider["id"], "some-model", enabled=True,
+            policy_reason="refused by policy", validate_policy=False,
+        )
+        row = await list_models(provider_id=provider["id"], enabled_only=False)
+        assert row[0]["enabled"] is False
+        assert row[0]["policy_reason"] == "refused by policy"
+
+    async def test_discovery_metadata_round_trips(self, temp_core_db, temp_secrets):
+        provider = await make_provider()
+        await save_model(
+            provider["id"], "m", validate_policy=False,
+            metadata={"pricing": {"prompt": "0"}, "supported_parameters": ["tools"]},
+        )
+        row = (await list_models(provider_id=provider["id"], enabled_only=False))[0]
+        assert row["metadata"]["pricing"]["prompt"] == "0"
+        assert row["metadata"]["supported_parameters"] == ["tools"]
+
+        # A later hand-save (no metadata) must not wipe what discovery knew.
+        await save_model(provider["id"], "m", display_name="renamed")
+        row = (await list_models(provider_id=provider["id"], enabled_only=False))[0]
+        assert row["metadata"]["pricing"]["prompt"] == "0"
+        assert row["name"] == "renamed"
 
     async def test_refresh_preserves_the_endpoint_order_as_a_tiebreak(
         self, temp_core_db, temp_secrets, monkeypatch

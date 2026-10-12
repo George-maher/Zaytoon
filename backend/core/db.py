@@ -263,6 +263,17 @@ _MIGRATIONS: List[str] = [
     ALTER TABLE providers ADD COLUMN verified_at TEXT;
     ALTER TABLE models ADD COLUMN metadata_json TEXT;
     """,
+
+    # -- 4: why a catalog row is disabled ---------------------------------
+    # Refresh records *every* model an endpoint reports, and a model the
+    # free-only policy refuses is stored disabled with the refusal as its
+    # reason instead of being silently dropped — a catalog where the refusals
+    # are invisible is one the user cannot audit. The column stores the
+    # refusal text; the enforcement stays in the write path (a hand-save
+    # still raises), so a row cannot be enabled around it.
+    """
+    ALTER TABLE models ADD COLUMN policy_reason TEXT;
+    """,
 ]
 
 

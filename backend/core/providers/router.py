@@ -222,10 +222,21 @@ async def plan(
 
     models = await list_models(provider_id=provider["id"], enabled_only=True)
     if not models:
-        decision.error = (
-            f"No models recorded for '{provider['name']}'. "
-            "Refresh the model list, or add one manually."
-        )
+        # "No models" and "every model is off" need different fixes from the
+        # user — and with policy refusals now recorded, the second case is
+        # common: the catalog exists, it is just all disabled.
+        known = await list_models(provider_id=provider["id"], enabled_only=False)
+        if known:
+            decision.error = (
+                f"All {len(known)} model(s) recorded for '{provider['name']}' "
+                "are disabled — some by policy. Re-enable one under Models, "
+                "or refresh the list."
+            )
+        else:
+            decision.error = (
+                f"No models recorded for '{provider['name']}'. "
+                "Refresh the model list, or add one manually."
+            )
         return decision
 
     for entry in models:
@@ -361,45 +372,67 @@ async def refresh_models(provider_id: str) -> Dict[str, Any]:
         await client.aclose()
 
     added = 0
+    refused = 0
+    errors = 0
     for index, model in enumerate(discovered):
         # Priority preserves the endpoint's own ordering as a tie-break, so a
         # user-added provider behaves the way the endpoint ranks its models.
-        saved = await _save_discovered(provider, model, priority=index * 10)
-        added += 1 if saved else 0
+        outcome = await _save_discovered(provider, model, priority=index * 10)
+        added += 1 if outcome == "recorded" else 0
+        refused += 1 if outcome == "refused" else 0
+        errors += 1 if outcome == "error" else 0
 
     logger.info(
-        "Refreshed %d model(s) for %s", len(discovered), provider["name"]
+        "Refreshed %d model(s) for %s (%d refused by policy)",
+        len(discovered), provider["name"], refused,
     )
     return {
         "provider_id": provider_id,
         "provider": provider["name"],
         "discovered": len(discovered),
         "added": added,
-        "skipped": len(discovered) - added,
+        # A refusal is recorded and shown, disabled — this count is the
+        # catalog telling the user which models it may not call and why.
+        "refused_by_policy": refused,
+        # Truly unstoreable rows (a vanished provider, an empty id).
+        "skipped": errors,
         "models": [m.to_dict() for m in discovered],
     }
 
 
-async def _save_discovered(provider: Dict[str, Any], model, priority: int) -> bool:
-    from core.providers.store import save_model
+async def _save_discovered(provider: Dict[str, Any], model, priority: int) -> str:
+    """``"recorded"``, ``"refused"`` or ``"error"``.
 
+    A model the policy refuses is still *recorded* — disabled, with the
+    refusal as its reason — because a catalog where the refusals are invisible
+    is one the user cannot audit. It can never be enabled around the policy:
+    every write that would turn a model on runs the same check as a raiser.
+    """
+    from core.providers.store import policy_verdict, save_model
+
+    allowed, reason = policy_verdict(provider["kind"], model.id)
     try:
-        return await save_model(
+        await save_model(
             provider["id"],
             model.id,
             display_name=model.display_name,
             capabilities=model.capabilities,
             context_length=model.context_length,
             priority=priority,
-            # A discovered model on an OpenRouter provider still has to satisfy
-            # the free-only policy; `validate_policy` is left on so a discovered
-            # billable id is refused rather than recorded and routed to.
+            enabled=allowed,
+            policy_reason=reason or None,
+            metadata=model.metadata or None,
+            # The verdict above IS the policy check (the same function the
+            # write-path gate uses); storing the refusal is this path's job.
+            validate_policy=False,
         )
+        return "recorded" if allowed else "refused"
     except ProviderError as exc:
         logger.info(
-            "Skipping discovered model %s from %s: %s", model.id, provider["name"], exc
+            "Could not record discovered model %s from %s: %s",
+            model.id, provider["name"], exc,
         )
-        return False
+        return "error"
 
 
 async def provider_health(provider_id: Optional[str] = None) -> Dict[str, Any]:

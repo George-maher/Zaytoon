@@ -27,7 +27,7 @@ from core.providers.client import (
     ProviderTransportError,
 )
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode is `auto` (pytest.ini): plain `async def` tests run without a mark.
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 
@@ -503,3 +503,60 @@ async def test_a_redirect_is_not_followed():
     assert len(hits) == 1
     assert "169.254" not in hits[0]
     assert caught.value.kind == "malformed"
+
+
+# ---------------------------------------------------------------------------
+# Catalog parsing: what the endpoint claims (W5)
+# ---------------------------------------------------------------------------
+def test_catalog_capabilities_come_from_what_the_endpoint_reports():
+    """supported_parameters and architecture are claims; names are folklore."""
+    from core.providers.client import _parse_openai_models
+
+    payload = {"data": [
+        {
+            "id": "qwen/qwen3.8-27b:free",
+            "name": "Qwen 3.8 27B",
+            "context_length": 131072,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "supported_parameters": ["tools", "temperature", "response_format"],
+            "architecture": {
+                "modality": "text->text",
+                "input_modalities": ["text"],
+                "tokenizer": "Qwen3",
+            },
+        },
+        {
+            "id": "vendor/vision-model:free",
+            "supported_parameters": ["tools"],
+            "architecture": {
+                "modality": "text+image->text",
+                "input_modalities": ["text", "image"],
+            },
+        },
+        {"id": "vendor/bare:free"},  # no claims at all
+    ]}
+
+    models = {m.id: m for m in _parse_openai_models(payload)}
+
+    first = models["qwen/qwen3.8-27b:free"]
+    assert "tools" in first.capabilities
+    assert "structured_output" in first.capabilities
+    assert "chat" in first.capabilities        # the assumed baseline remains
+    assert first.metadata["pricing"] == {"prompt": "0", "completion": "0"}
+    assert first.metadata["supported_parameters"] == [
+        "response_format", "temperature", "tools",
+    ]
+    assert first.metadata["tokenizer"] == "Qwen3"
+    assert first.context_length == 131072
+
+    vision = models["vendor/vision-model:free"]
+    assert "vision" in vision.capabilities
+    assert "tools" in vision.capabilities
+
+    bare = models["vendor/bare:free"]
+    assert "chat" in bare.capabilities         # assumed, per the parser's rule
+    assert "tools" not in bare.capabilities    # never granted by default
+    assert bare.metadata == {}
+
+    # to_dict carries the metadata for the settings UI.
+    assert models["qwen/qwen3.8-27b:free"].to_dict()["metadata"]["pricing"]["prompt"] == "0"
