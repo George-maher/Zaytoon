@@ -42,6 +42,7 @@ budget so the loop is provably finite.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import itertools
 import json
 import logging
@@ -50,6 +51,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Sequence
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -129,7 +131,7 @@ class AllModelsUnavailableError(LLMError):
     ) -> None:
         super().__init__(message, attempts)
         #: provider_unreachable | model_missing | provider_unconfigured |
-        #: local_model_failed | pool_exhausted
+        #: local_model_failed | pool_exhausted | local_default_blocked
         self.kind = kind
 
 
@@ -741,6 +743,39 @@ class LLMClient:
             )
             return None
         return decision
+
+    async def _local_default_refuses_hosted(self) -> Optional[str]:
+        """Why a hosted chain must not run when the default provider is local.
+
+        The registry default is the user's statement about where this
+        install's traffic belongs. When it is *local* and could not answer,
+        handing the turn to a cloud model would send data out of the machine
+        the user never chose to send — a fallback that is silent by
+        definition. Hosted→local and within-provider fallbacks are unchanged:
+        those are visible in Settings and in the attempt log.
+
+        Returns the reason to refuse, or ``None`` when the hosted chain may
+        proceed: no registry, no enabled default, a hosted default, or an
+        unreadable registry (the guard must never be the *reason* a request
+        fails).
+        """
+        try:
+            from core.providers import default_provider
+
+            provider = await default_provider()
+        except Exception:  # noqa: BLE001 - see the docstring
+            return None
+        if not provider or not provider.get("enabled"):
+            return None
+        local = provider.get("kind") == "ollama" or _looks_local(
+            provider.get("base_url")
+        )
+        if not local:
+            return None
+        return (
+            f"The default provider '{provider.get('name')}' is local and could "
+            "not answer; not crossing to a hosted model without being asked."
+        )
 
     def _registry_outcome(self, exc: Any) -> str:
         """Map a transport failure onto the chain's attempt vocabulary.
@@ -1496,6 +1531,12 @@ class LLMClient:
                 retries, contract, extract, rid,
                 budget=budget, attempts=attempts,
             )
+        # The local→hosted guard, before the chain is even built.
+        blocked = await self._local_default_refuses_hosted()
+        if blocked:
+            raise AllModelsUnavailableError(
+                blocked, attempts, kind="local_default_blocked"
+            )
         chain = self.build_chain(tier, required)
         retries_allowed = max(1, self.max_retries if retries is None else retries)
 
@@ -1798,6 +1839,12 @@ class LLMClient:
                 retries, contract, extract, rid,
                 budget=budget, attempts=attempts,
             )
+        # The local→hosted guard, before the chain is even built.
+        blocked = await self._local_default_refuses_hosted()
+        if blocked:
+            raise AllModelsUnavailableError(
+                blocked, attempts, kind="local_default_blocked"
+            )
         chain = self.build_chain(tier, required)
         attempts_allowed = max(1, self.max_retries if retries is None else retries)
         client = await self._get_client()
@@ -2018,7 +2065,41 @@ _USER_NOTICES: Dict[str, Dict[str, str]] = {
         "en": "The model is still working on other requests and freed up too late.",
         "ar": "الموديل لسه بيشتغل على طلبات تانية ومفيش غير متأخر.",
     },
+    "local_default_blocked": {
+        "en": (
+            "Your default AI provider is local and it cannot answer right now. "
+            "Zaytoon did not switch to a hosted model on its own — start the "
+            "local provider, or choose a hosted one in Settings."
+        ),
+        "ar": (
+            "مزوّد الذكاء الاصطناعي الافتراضي محلي ومش قادير يرد دلوقتي. "
+            "زيتون مبدّلش لموديل أونلاين لوحده — شغّل المزوّد المحلي، "
+            "أو اختار مزوّد أونلاين من الإعدادات."
+        ),
+    },
 }
+
+
+def _looks_local(base_url: Optional[str]) -> bool:
+    """Does this endpoint address name *this machine* (or the LAN)?
+
+    An ``ollama`` kind is local by construction; a custom OpenAI-compatible
+    provider is local when its host is an address class that cannot leave the
+    machine (loopback or private). A hostname that would need DNS
+    (``my-nas.local``) is treated as hosted — save-time resolution would be
+    slow and re-checkable after the fact, so the honest answer is the address
+    class we can actually see.
+    """
+    host = (urlsplit(base_url or "").hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return bool(address.is_loopback or address.is_private)
 
 
 def user_notice(exc: Optional[BaseException], language: str = "en") -> Optional[str]:

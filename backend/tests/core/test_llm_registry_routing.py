@@ -5,7 +5,8 @@ registry with the transport mocked:
 
 * the registry's answer reaches the caller **before** the configured chain runs;
 * any registry failure falls through to the chain (or the local default),
-  which is unchanged;
+  which is unchanged — **unless the registry default is local**, which refuses
+  the crossing to a hosted model instead (TestTheLocalToHostedGuard);
 * **one** attempt budget spans both paths — router-first cannot double the
   ceiling `_AttemptBudget` exists to protect.
 
@@ -49,9 +50,29 @@ def chain(monkeypatch):
 
 
 async def _registry(*pins):
-    """A provider with models `(model_id, priority)` — lower priority first."""
+    """A **local** provider with models `(model_id, priority)` — lower first."""
     provider = await save_provider(
         None, name="Local", kind="ollama", base_url="http://localhost:11434"
+    )
+    for model_id, priority in pins:
+        await save_model(
+            provider["id"], model_id,
+            capabilities=["chat", "tools", "coding", "streaming"],
+            priority=priority,
+        )
+    return provider
+
+
+async def _hosted_registry(*pins):
+    """A **hosted** default provider with models.
+
+    The fall-through tests use this rather than `_registry`: falling from a
+    hosted registry default to the chain is visible and preserved, while
+    falling from a *local* default is the silent crossing the guard refuses.
+    """
+    provider = await save_provider(
+        None, name="Cloud", kind="openai_compatible",
+        base_url="https://api.example.com",
     )
     for model_id, priority in pins:
         await save_model(
@@ -128,8 +149,12 @@ class TestRegistryFirst:
     async def test_chain_reachable_after_registry_failure(
         self, temp_core_db, temp_secrets, chain, monkeypatch
     ):
-        """A transport failure falls through; the chain then answers."""
-        await _registry(("local:7b", 1))
+        """A transport failure falls through; the chain then answers.
+
+        The registry default is *hosted* here: a local default refuses the
+        crossing instead (TestTheLocalToHostedGuard).
+        """
+        await _hosted_registry(("cloud:7b", 1))
         calls = _patch_complete(
             monkeypatch,
             lambda model: ProviderTransportError("HTTP 500: upstream", status=500),
@@ -140,14 +165,18 @@ class TestRegistryFirst:
         answer = await llm.complete([{"role": "user", "content": "hi"}])
 
         assert answer == "chain answer"
-        assert calls == ["local:7b"]
+        assert calls == ["cloud:7b"]
         assert chain.requests, "the chain should have served the request"
 
     async def test_one_budget_spans_registry_and_chain(
         self, temp_core_db, temp_secrets, chain, monkeypatch
     ):
-        """Registry attempts must consume the same ceiling the chain draws."""
-        await _registry(("aaa:7b", 1), ("bbb:7b", 2))
+        """Registry attempts must consume the same ceiling the chain draws.
+
+        Hosted default: the point is budget sharing, and a local default
+        would refuse the chain fall-through for an unrelated reason.
+        """
+        await _hosted_registry(("aaa:7b", 1), ("bbb:7b", 2))
         calls = _patch_complete(
             monkeypatch,
             lambda model: ProviderTransportError("HTTP 500: upstream", status=500),
@@ -218,6 +247,137 @@ class TestRegistryFirst:
         assert answer == "local answer"
 
 
+class TestTheLocalToHostedGuard:
+    """A local default that cannot answer never crosses to a hosted model.
+
+    The registry default is the user's statement about where this install's
+    traffic belongs. Handing the turn to a cloud model would send data out of
+    the machine the user never chose to send — a fallback that is silent by
+    definition. The fall-through tests above keep their meaning by running
+    with a *hosted* default instead.
+    """
+
+    @pytest.fixture
+    def chain_spy(self, monkeypatch):
+        """Record chain construction and pin the chain to hosted."""
+        calls: list = []
+        original = LLMClient.build_chain
+
+        def spy(self, tier, required=None):
+            calls.append(tier)
+            return original(self, tier, required)
+
+        monkeypatch.setattr(LLMClient, "build_chain", spy)
+        # The ambient env default here is openrouter; pin it so the guard,
+        # not the environment, is what decides.
+        monkeypatch.setattr(config, "PROVIDER", "openrouter")
+        return calls
+
+    async def test_a_local_default_refuses_the_hosted_chain(
+        self, temp_core_db, temp_secrets, chain_spy, monkeypatch
+    ):
+        await _registry(("local:7b", 1))
+        _patch_complete(
+            monkeypatch,
+            lambda model: ProviderTransportError("HTTP 500: upstream", status=500),
+        )
+        llm = LLMClient()
+
+        with pytest.raises(AllModelsUnavailableError) as caught:
+            await llm.complete([{"role": "user", "content": "hi"}])
+
+        assert caught.value.kind == "local_default_blocked"
+        assert chain_spy == []  # the hosted chain was never even built
+
+    async def test_the_streaming_path_refuses_too(
+        self, temp_core_db, temp_secrets, chain_spy, monkeypatch
+    ):
+        await _registry(("local:7b", 1))
+        _patch_stream(
+            monkeypatch,
+            lambda model: ProviderTransportError("Transport error: ConnectError"),
+        )
+        llm = LLMClient()
+
+        with pytest.raises(AllModelsUnavailableError) as caught:
+            await llm.stream([{"role": "user", "content": "hi"}])
+
+        assert caught.value.kind == "local_default_blocked"
+        assert chain_spy == []
+
+    async def test_a_custom_local_endpoint_is_local_too(
+        self, temp_core_db, temp_secrets, chain_spy
+    ):
+        """A NAS-backed OpenAI-compatible provider is local by address class."""
+        await save_provider(
+            None, name="NAS", kind="openai_compatible",
+            base_url="http://192.168.1.10:8080",
+        )
+        llm = LLMClient()
+
+        with pytest.raises(AllModelsUnavailableError) as caught:
+            await llm.complete([{"role": "user", "content": "hi"}])
+
+        assert caught.value.kind == "local_default_blocked"
+        assert chain_spy == []
+
+    async def test_a_hosted_default_still_runs_the_hosted_chain(
+        self, temp_core_db, temp_secrets, chain, chain_spy, monkeypatch
+    ):
+        await _hosted_registry(("cloud:7b", 1))
+        _patch_complete(
+            monkeypatch,
+            lambda model: ProviderTransportError("HTTP 500: upstream", status=500),
+        )
+        llm = LLMClient()
+        llm._client = chain  # noqa: SLF001
+
+        answer = await llm.complete([{"role": "user", "content": "hi"}])
+
+        assert answer == "chain answer"
+        assert chain_spy, "the chain was consulted, not blocked"
+
+    async def test_an_unreadable_registry_never_blocks(
+        self, temp_core_db, temp_secrets, chain, chain_spy, monkeypatch
+    ):
+        """The guard must never be the *reason* a request fails."""
+
+        async def boom():
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr("core.providers.default_provider", boom)
+        llm = LLMClient()
+        llm._client = chain  # noqa: SLF001
+
+        answer = await llm.complete([{"role": "user", "content": "hi"}])
+
+        assert answer == "chain answer"
+        assert chain_spy
+
+    async def test_the_refusal_is_a_real_bilingual_notice(
+        self, temp_core_db, temp_secrets, chain_spy, monkeypatch
+    ):
+        """The user is told in their language, not handed a generic notice."""
+        from services.llm_client import user_notice
+
+        await _registry(("local:7b", 1))
+        _patch_complete(
+            monkeypatch,
+            lambda model: ProviderTransportError("HTTP 500: upstream", status=500),
+        )
+        llm = LLMClient()
+
+        with pytest.raises(AllModelsUnavailableError) as caught:
+            await llm.complete([{"role": "user", "content": "hi"}])
+
+        english = user_notice(caught.value, "en")
+        arabic = user_notice(caught.value, "ar")
+        assert english and arabic and english != arabic  # genuinely translated
+        assert "hosted" in english
+        assert "أونلاين" in arabic
+        assert chain_spy == []
+
+
 class TestRegistryStreaming:
     async def test_deltas_reach_the_caller(
         self, temp_core_db, temp_secrets, monkeypatch
@@ -280,7 +440,7 @@ class TestRegistryStreaming:
         self, temp_core_db, temp_secrets, monkeypatch
     ):
         """Nothing was emitted, so the chain may still stream from scratch."""
-        await _registry(("local:7b", 1))
+        await _hosted_registry(("cloud:7b", 1))
         calls = _patch_stream(
             monkeypatch,
             lambda model: ProviderTransportError("Transport error: ConnectError"),
@@ -292,7 +452,7 @@ class TestRegistryStreaming:
         with pytest.raises(LLMError, match="OPENROUTER_API_KEY"):
             await llm.stream([{"role": "user", "content": "hi"}])
 
-        assert calls == ["local:7b"]
+        assert calls == ["cloud:7b"]
 
     async def test_failure_after_a_delta_recovers_with_a_blocking_call(
         self, temp_core_db, temp_secrets, monkeypatch
