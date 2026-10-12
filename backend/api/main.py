@@ -47,6 +47,7 @@ from services.provider_health import provider_health
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
 from core.api.routers import (
     files_router,
+    security_router,
     git_router,
     projects_router,
     providers_router,
@@ -424,6 +425,7 @@ app.include_router(terminal_router)
 app.include_router(skills_router)
 app.include_router(providers_router)
 app.include_router(system_router)
+app.include_router(security_router)
 
 
 app.add_middleware(

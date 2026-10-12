@@ -36,6 +36,7 @@ export const VIEWS = Object.freeze({
   WORKSPACE: "workspace",
   TASKS: "tasks",
   SKILLS: "skills",
+  SECURITY: "security",
   MODELS: "models",
   SETTINGS: "settings",
 });
@@ -48,6 +49,7 @@ export const VIEW_LIST = Object.freeze([
   VIEWS.WORKSPACE,
   VIEWS.TASKS,
   VIEWS.SKILLS,
+  VIEWS.SECURITY,
   VIEWS.MODELS,
   VIEWS.SETTINGS,
 ]);
@@ -106,6 +108,16 @@ const META = Object.freeze({
     en: "Skills",
     ar: "المهارات",
     glyph: "✦",
+  }),
+  [VIEWS.SECURITY]: Object.freeze({
+    kind: "screen",
+    // SecurityView: target authorisations + the non-destructive probe. It is
+    // `ready` because it mounts — the page manages authorisations and runs
+    // probes; it is not a placeholder for a scanner that does not exist.
+    ready: true,
+    en: "Security",
+    ar: "الأمان",
+    glyph: "⛨",
   }),
   [VIEWS.MODELS]: Object.freeze({
     kind: "screen",

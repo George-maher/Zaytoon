@@ -218,6 +218,20 @@ describe("App runtime", () => {
     );
 
     await act(async () => {
+      fireEvent.click(within(nav).getByRole("button", { name: "Security" }));
+    });
+    // The Security Workspace mounts its own screen. It is in the nav because
+    // `ready` is true, so this asserts the other half of that promise: the
+    // screen behind the entry exists, rather than falling through App's
+    // ternary chain to the workspace shell.
+    expect(screen.getByRole("heading", { name: "SECURITY WORKSPACE" })).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: /workspace/i })).not.toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: "Security" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+
+    await act(async () => {
       fireEvent.click(within(nav).getByRole("button", { name: "Home" }));
     });
     expect(screen.queryByRole("navigation", { name: /workspace/i })).not.toBeInTheDocument();

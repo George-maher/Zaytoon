@@ -29,7 +29,17 @@ import {
 describe("view vocabulary", () => {
   it("declares the destinations, in product order", () => {
     expect(Object.values(VIEWS).sort()).toEqual(
-      ["home", "chat", "computer", "workspace", "tasks", "skills", "models", "settings"].sort(),
+      [
+        "home",
+        "chat",
+        "computer",
+        "workspace",
+        "tasks",
+        "skills",
+        "security",
+        "models",
+        "settings",
+      ].sort(),
     );
     expect(VIEW_LIST).toEqual([
       VIEWS.HOME,
@@ -38,6 +48,7 @@ describe("view vocabulary", () => {
       VIEWS.WORKSPACE,
       VIEWS.TASKS,
       VIEWS.SKILLS,
+      VIEWS.SECURITY,
       VIEWS.MODELS,
       VIEWS.SETTINGS,
     ]);

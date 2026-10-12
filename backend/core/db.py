@@ -172,6 +172,26 @@ _MIGRATIONS: List[str] = [
         updated_at TEXT
     );
 
+    -- Target authorizations for active security assessment.
+    --
+    -- A migration, not an edit to an earlier one: `_MIGRATIONS` is applied in
+    -- order and the schema_version row records how many have run, so appending
+    -- is the only change an existing database can absorb. Adding this to an
+    -- earlier entry would leave every already-migrated database without the
+    -- table, because that entry is not re-run.
+    CREATE TABLE IF NOT EXISTS security_authorizations (
+        id          TEXT PRIMARY KEY,
+        target      TEXT NOT NULL,
+        operations  TEXT NOT NULL,
+        note        TEXT,
+        created_at  TEXT,
+        expires_at  TEXT,
+        revoked_at  TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_security_auth_target
+        ON security_authorizations(target);
+
     CREATE INDEX IF NOT EXISTS idx_task_steps_task ON task_steps(task_id, seq);
     CREATE INDEX IF NOT EXISTS idx_task_logs_task  ON task_logs(task_id, id);
     CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks(status, id DESC);

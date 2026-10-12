@@ -1082,3 +1082,80 @@ export async function getProcessLogs(id, tail = 40) {
     lines: Array.isArray(data.lines) ? data.lines : [],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Security workspace — target authorisations and the authorised probe
+// ---------------------------------------------------------------------------
+export async function getSecurityAuthorizations() {
+  const res = await fetch(`${API_BASE}/security/authorizations`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return { authorizations: [], operations: [], active_count: 0, error: data.error || `HTTP ${res.status}` };
+  }
+  return data;
+}
+
+/**
+ * Record a target authorisation.
+ *
+ * A 422 means the pattern was refused — a whole-internet wildcard, a public
+ * suffix, a single label. The message names the reason and is shown verbatim.
+ */
+export async function authorizeSecurityTarget({ targets, operations, ttl_days = null, note = "" }) {
+  const res = await fetch(`${API_BASE}/security/authorizations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ targets, operations, ttl_days, note }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+export async function revokeSecurityAuthorization(id) {
+  const res = await fetch(`${API_BASE}/security/authorizations/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Run one non-destructive probe.
+ *
+ * Two steps, because `security_probe` is a `confirm`-tier tool and the approval
+ * has to be real. The first call opens no socket at all and returns a token
+ * plus what the probe *would* do; the second carries the user's answer. Scope
+ * refusal comes back as `{refused: true, message}` rather than an error, since
+ * that is the control working as intended and not a failure.
+ */
+export async function runSecurityProbe(url, { includeBody = false } = {}) {
+  const first = await fetch(`${API_BASE}/security/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, include_body: includeBody }),
+  });
+  const preview = await first.json().catch(() => ({}));
+  if (!first.ok) return { error: preview.error || `HTTP ${first.status}` };
+  if (preview.refused) return preview;
+  if (!preview.confirm) return { error: "The backend did not return a confirmation token." };
+
+  const second = await fetch(`${API_BASE}/security/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, include_body: includeBody, confirm: preview.confirm }),
+  });
+  const result = await second.json().catch(() => ({}));
+  if (!second.ok) return { error: result.error || `HTTP ${second.status}` };
+  if (result.success === false && result.error && !result.data) return { error: result.error };
+  const data = result.data || {};
+  return {
+    output: result.output || "",
+    status: data.status,
+    findings: data.findings || [],
+    authorization_id: data.authorization_id || preview.authorization_id,
+    authorized_target: data.authorized_target || preview.authorized_target,
+    error: result.error,
+  };
+}

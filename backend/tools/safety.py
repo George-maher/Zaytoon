@@ -560,14 +560,64 @@ class ConfirmationManager:
         return self._last_outcome
 
     # -- request/resolve -------------------------------------------------
+    async def request_with_assessment(
+        self,
+        assessment: RiskAssessment,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: str = "",
+    ) -> bool:
+        """Ask for approval of an action **already judged** to need it.
+
+        This exists because :meth:`request` used to re-derive the tier, and it
+        derived it wrongly.
+
+        The tier came from a bare :class:`RiskAssessor`, whose tables are keyed
+        on *name*. A tool that declares its own tier rather than appearing in
+        those tables — ``play_media``, ``security_probe``, and **every tool a
+        skill registers** — was therefore assessed ``safe`` inside this class
+        and :meth:`request` returned ``True`` *without ever showing a prompt*.
+        ``ToolRegistry`` had already reconciled the declaration and correctly
+        decided that approval was required, then handed the decision to
+        something that silently said yes. The registry's own docstring records
+        fixing exactly this bug for ``play_media``; the fix landed on the
+        registry's side of the seam and this side kept guessing.
+
+        So the reconciled assessment is passed *in*, rather than recomputed.
+        The prompt then shows the real reasons — ``'play_media' is declared
+        confirm-level`` — instead of an empty list.
+
+        A separate method rather than an extra keyword on :meth:`request`
+        because the confirmation channel is duck-typed: test doubles and
+        embedders implement ``request(action, params, session_id)`` and nothing
+        else, and widening that signature broke nineteen of them. Callers use
+        :meth:`request` unless this one exists; see
+        ``ToolRegistry._request_approval``.
+        """
+        return await self._request(assessment, action, params, session_id)
+
     async def request(
         self,
         action: str,
         params: Optional[Dict[str, Any]] = None,
         session_id: str = "",
     ) -> bool:
-        """Ask the user to approve ``action``. Returns True only if approved."""
+        """Ask the user to approve ``action``. Returns True only if approved.
+
+        Assesses the action itself. Prefer :meth:`request_with_assessment` when
+        the caller has already judged the call — this one's tier table cannot
+        see a tool's own declaration.
+        """
         assessment = self.assessor.assess(action, params)
+        return await self._request(assessment, action, params, session_id)
+
+    async def _request(
+        self,
+        assessment: RiskAssessment,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: str = "",
+    ) -> bool:
         if not assessment.requires_confirmation:
             self._last_outcome = self.OUTCOME_APPROVED
             return True

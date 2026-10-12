@@ -5,6 +5,7 @@ from core.api.git_api import router as git_router
 from core.api.projects_api import router as projects_router
 from core.api.registry_api import (
     providers_router,
+    security_router,
     skills_router,
     system_router,
     terminal_router,
@@ -16,6 +17,7 @@ __all__ = [
     "git_router",
     "projects_router",
     "providers_router",
+    "security_router",
     "skills_router",
     "system_router",
     "tasks_router",

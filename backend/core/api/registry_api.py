@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -578,3 +580,215 @@ async def system_info() -> Dict[str, Any]:
         "workspace": str(config.workspace_path),
         "paths": paths.describe(),
     }
+
+# ===========================================================================
+# Security workspace — target authorisation
+# ===========================================================================
+security_router = APIRouter()
+
+
+@security_router.get("/security/authorizations")
+async def security_authorizations() -> Dict[str, Any]:
+    """Every target authorisation, active and lapsed, with the operation list."""
+    from core.security import scope
+
+    return await scope.describe()
+
+
+@security_router.post("/security/authorizations", status_code=201)
+async def security_authorize(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Record an authorisation for user-stated targets.
+
+    This is the **only** way an active assessment becomes permitted. There is
+    deliberately no tool that reaches it: a model must not be able to widen its
+    own scope, and a test asserts no registered tool imports this module.
+
+    ``targets`` takes a host, an address, a CIDR, or a ``*.domain`` wildcard. A
+    pattern covering every host is refused by the validator — an authorisation
+    for everything is not an authorisation, and storing one would make the
+    record a lie the UI then displays as a real scope.
+    """
+    from core.security import scope
+
+    targets = data.get("targets")
+    if isinstance(targets, str):
+        targets = [targets]
+    if not targets:
+        single = data.get("target")
+        targets = [single] if single else []
+    operations = data.get("operations")
+    if isinstance(operations, str):
+        operations = [operations]
+    if not operations:
+        operations = [scope.OP_HTTP_PROBE]
+
+    ttl = data.get("ttl_days")
+    try:
+        ttl_days = None if ttl in (None, "") else float(ttl)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "ttl_days must be a number") from None
+
+    try:
+        created = await scope.create(
+            targets,
+            operations,
+            note=str(data.get("note") or ""),
+            ttl_days=ttl_days,
+        )
+    except scope.ScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return created.to_dict()
+
+
+@security_router.delete("/security/authorizations/{authorization_id}")
+async def security_revoke(authorization_id: str) -> Dict[str, Any]:
+    """Revoke an authorisation.
+
+    The row is kept with a ``revoked_at`` stamp rather than deleted: a report
+    that says which authorisation permitted a probe has to stay true afterwards,
+    which it cannot if the record is gone.
+    """
+    from core.security import scope
+
+    if not await scope.revoke(authorization_id):
+        raise HTTPException(404, f"No active authorisation: {authorization_id}")
+    return {"id": authorization_id, "revoked": True}
+
+
+# ===========================================================================
+# The probe endpoint: a real approval, in two steps
+# ===========================================================================
+# `security_probe` is a `confirm`-tier tool, so a single REST call that ran it
+# would have to either bypass the gate (never) or invent an approval (also
+# never). The WebSocket path solves this by asking the user and awaiting the
+# answer; REST has no channel to ask on. So the ask is split across two requests
+# that the Security Workspace performs as two clicks:
+#
+#   1. `{url}`                 → scope check only; no socket is opened. Returns
+#                                what the probe *would* do, plus a token.
+#   2. `{url, confirm: token}` → the same call, carrying the user's answer.
+#
+# The gate still runs on step 2. It is answered by calling
+# `ConfirmationManager.resolve()` on the one request this endpoint caused —
+# which is the same call the WebSocket handler makes when the user clicks
+# Approve, except the click happened on this page. Nothing is skipped:
+# validation, scope authorisation, the tier gate and the audit record all run
+# in order, and the approval is recorded against a request the manager itself
+# issued.
+#
+# A token is single-use and short-lived. Tokens are held in memory rather than
+# the database: an approval is a gesture in the moment, and a durable one that
+# outlived the page it was given on would be a standing permission, which is
+# what the authorisation record is for.
+_PROBE_TOKENS: Dict[str, float] = {}
+_PROBE_TOKEN_TTL_S = 120.0
+_PROBE_TOKEN_MAX = 256
+
+
+def _prune_probe_tokens(now: float) -> None:
+    for key, stamp in list(_PROBE_TOKENS.items()):
+        if now - stamp > _PROBE_TOKEN_TTL_S:
+            _PROBE_TOKENS.pop(key, None)
+    if len(_PROBE_TOKENS) > _PROBE_TOKEN_MAX:
+        # Oldest first, so the cap cannot evict the token being used right now.
+        for key, _ in sorted(_PROBE_TOKENS.items(), key=lambda kv: kv[1])[
+            : len(_PROBE_TOKENS) - _PROBE_TOKEN_MAX
+        ]:
+            _PROBE_TOKENS.pop(key, None)
+
+
+@security_router.post("/security/probe")
+async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """A non-destructive HTTP probe against a target the user authorised.
+
+    Two-step. Step 1 opens no socket at all, so a preview can never have a side
+    effect on the target.
+    """
+    from core.security import scope
+    from tools.safety import ConfirmationManager
+
+    url = (data.get("url") or "").strip()
+    if not url:
+        raise HTTPException(422, "'url' is required")
+    include_body = bool(data.get("include_body", False))
+    confirm = (data.get("confirm") or "").strip()
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not host:
+        raise HTTPException(422, "'url' must be an absolute http(s) URL")
+
+    # -- Scope, before anything else. The same call the tool will make, so the
+    #    preview cannot disagree with the attempt.
+    try:
+        authorization = await scope.require_authorized(host, scope.OP_HTTP_PROBE)
+    except scope.OutOfScope as exc:
+        return {"refused": True, "reason": "out_of_scope", "message": str(exc)}
+    except scope.ScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    if not confirm:
+        now = time.monotonic()
+        _prune_probe_tokens(now)
+        token = f"probe_{uuid.uuid4().hex[:12]}"
+        _PROBE_TOKENS[token] = now
+        return {
+            "requires_confirmation": True,
+            "confirm": token,
+            "url": url,
+            "host": host,
+            "authorization_id": authorization.id,
+            "authorized_target": authorization.target,
+            "message": (
+                f"Sends one non-destructive GET to {host}, under authorisation "
+                f"{authorization.id}. Nothing is written on the target."
+            ),
+        }
+
+    # The TTL is checked *here*, at use, not only when the table is next
+    # pruned. Pruning happens on the next preview, so enforcing age solely by
+    # pruning means a token survives for as long as nobody asks for another
+    # one: take a token, go to lunch, come back, and it still probes. Ageing
+    # is a property of the token, so it is tested on the token.
+    issued_at = _PROBE_TOKENS.pop(confirm, None)
+    if issued_at is None or time.monotonic() - issued_at > _PROBE_TOKEN_TTL_S:
+        raise HTTPException(
+            409, "Unknown or expired confirmation token. Request the probe again."
+        )
+
+    # -- Step 2: the user answered. Run it through the process's real registry.
+    from api import main as api_main
+
+    # A manager for *this* approval. Its notifier resolves the request it is
+    # handed with `approved=True`, which is the same `resolve()` call the
+    # WebSocket transport makes — the answer is real, it is just already known.
+    answered: Dict[str, Any] = {}
+
+    async def _auto_answer(pending) -> None:
+        answered["request_id"] = pending.request_id
+        answered["action"] = pending.action
+        # Resolve asynchronously: `request()` is awaiting the future, and the
+        # notify callback runs before that await. Resolving inline is safe, but
+        # deferring keeps this identical in shape to the WS path.
+        asyncio.get_running_loop().call_soon(
+            manager.resolve, pending.request_id, True
+        )
+
+    manager = ConfirmationManager(notify=_auto_answer, timeout=15.0)
+
+    # `registry.execute`, not `tool_executor.execute`: the latter would supply
+    # the process-wide confirmation manager, which has no channel to answer on
+    # and would therefore refuse. Passing `manager` explicitly is the same call
+    # the WebSocket handler makes when a user approves — same registry, same
+    # gate, same audit record, different answer.
+    result = await api_main.tool_executor.registry.execute(
+        "security_probe",
+        {"url": url, "include_body": include_body},
+        confirmation_manager=manager,
+    )
+    if isinstance(result, dict):
+        result.setdefault("authorization_id", authorization.id)
+        result.setdefault("authorized_target", authorization.target)
+        if answered.get("request_id"):
+            result["approved_request_id"] = answered["request_id"]
+    return result
