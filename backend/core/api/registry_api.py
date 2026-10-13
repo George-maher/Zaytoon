@@ -990,3 +990,115 @@ async def security_probe_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]
         result.setdefault("authorization_id", authorization.id)
         result.setdefault("authorized_target", authorization.target)
     return result
+
+
+@security_router.post("/security/scan")
+async def security_scan_run(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """A bounded TCP connect scan against a target the user authorised.
+
+    The same two-step shape as ``/security/probe``, for the same reason:
+    step 1 opens no socket, so a preview can never touch the target.
+    """
+    from core.security import scope
+    from tools.security import MAX_SCAN_PORTS, PortScan
+
+    host = (data.get("host") or "").strip()
+    ports = data.get("ports")
+    confirm = (data.get("confirm") or "").strip()
+    read_banner = bool(data.get("read_banner", True))
+    if not host:
+        raise HTTPException(422, "'host' is required")
+
+    # Validation happens here too, so a malformed request gets its precise
+    # error on the *preview* rather than after the user has clicked approve.
+    probe = PortScan()
+    try:
+        probe.validate({"host": host, "ports": ports})
+    except Exception as exc:  # ToolValidationError, but no import cycle at top
+        raise HTTPException(422, str(exc)) from exc
+    expanded = probe._expand_ports(ports)
+
+    try:
+        authorization = await scope.require_authorized(host, scope.OP_PORT_PROBE)
+    except scope.OutOfScope as exc:
+        return {"refused": True, "reason": "out_of_scope", "message": str(exc)}
+    except scope.ScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    if not confirm:
+        token = _PROBE_APPROVALS.issue()
+        return {
+            "requires_confirmation": True,
+            "confirm": token,
+            "host": host,
+            "ports": expanded,
+            "authorization_id": authorization.id,
+            "authorized_target": authorization.target,
+            "message": (
+                f"Opens up to {len(expanded)} TCP connection(s) to {host} "
+                f"(max {MAX_SCAN_PORTS} ports per scan), under authorisation "
+                f"{authorization.id}. Nothing is written on the target."
+            ),
+        }
+
+    if not _PROBE_APPROVALS.consume(confirm):
+        raise HTTPException(
+            409, "Unknown or expired confirmation token. Request the scan again."
+        )
+
+    result = await run_approved_tool(
+        "port_scan", {"host": host, "ports": expanded, "read_banner": read_banner}
+    )
+    if isinstance(result, dict):
+        result.setdefault("authorization_id", authorization.id)
+        result.setdefault("authorized_target", authorization.target)
+    return result
+
+
+# ===========================================================================
+# Evidence: what the assessment tools actually observed
+# ===========================================================================
+@security_router.get("/security/findings")
+async def security_findings(
+    target: Optional[str] = Query(default=None),
+    severity: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> Dict[str, Any]:
+    """Recorded findings, newest first.
+
+    An empty list is a real answer ("nothing has been observed yet"), not an
+    error — the store is read defensively and a failure also answers ``[]``
+    with a logged line, because a missing evidence page must not take the
+    workspace down with it.
+    """
+    from core.security import findings
+
+    items = await findings.list_findings(target=target, severity=severity, limit=limit)
+    return {"findings": items, "count": len(items)}
+
+
+@security_router.delete("/security/findings")
+async def security_findings_clear(
+    target: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    """Delete recorded findings (all, or one target's)."""
+    from core.security import findings
+
+    removed = await findings.clear(target=target)
+    return {"removed": removed, "target": target}
+
+
+@security_router.get("/security/report")
+async def security_report(format: str = Query(default="json")) -> Dict[str, Any]:
+    """The assembled assessment report: scope, methodology, findings, limits.
+
+    Deterministic — built from stored rows plus fixed text, with no model in
+    the path, so the same observations always produce the same document.
+    ``format=markdown`` returns the rendered document instead of the dict.
+    """
+    from core.security import findings
+
+    report = await findings.build_report()
+    if format.strip().lower() == "markdown":
+        return {"markdown": findings.render_markdown(report), **report}
+    return report

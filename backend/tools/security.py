@@ -1,13 +1,15 @@
-"""Authorised, non-destructive HTTP assessment.
+"""Authorised, non-destructive assessment: HTTP configuration checks and port probes.
 
 This is the tool section 9 of the brief describes: configuration security checks
 and HTTP/API assessment that distinguish a *confirmed* finding from a
-*hypothesis*, and that refuse an out-of-scope target.
+*hypothesis*, and that refuse an out-of-scope target. Two tools share it —
+:class:`SecurityProbe` (one HTTP request, header/configuration findings) and
+:class:`PortScan` (bounded TCP connects, open/closed/filtered with evidence).
 
-The order of operations in :meth:`SecurityProbe.execute` is the whole point, and
-it is deliberate:
+Both follow the same order of operations, and it is deliberate:
 
-1. **Validation** — the URL must parse. No socket is opened.
+1. **Validation** — the argument must parse (a URL for the probe, a single
+   host and a bounded port list for the scan). No socket is opened.
 2. **Authorisation** — :func:`core.security.scope.require_authorized` consults the
    store and raises :class:`OutOfScope` unless *this host* is authorised for
    *this operation*. This happens **before** any connection, so a refused target
@@ -21,16 +23,17 @@ What it will not do
 -------------------
 
 * **No payloads.** No injection strings, no fuzzing, no auth-bypass attempts, no
-  parameter mutation. It issues one plain request per URL and reads the answer.
-  Everything it reports is something the server said unprompted — which is what
-  makes its findings *confirmed* rather than speculative, and why it is safe to
-  run against a target the user has authorised but not fully understood.
-* **No destructive verbs.** ``GET`` and ``HEAD`` only.
+  parameter mutation, nothing written after a handshake. Everything reported is
+  something the target said unprompted — which is what makes the findings
+  *confirmed* rather than speculative, and why it is safe to run against a
+  target the user has authorised but not fully understood.
+* **No destructive verbs.** ``GET`` and ``HEAD`` only; TCP connects that change
+  nothing on the target.
 * **No guessing.** A missing security header is reported as "absent" with the
-  evidence (the status line and the headers actually received). It is never
-  upgraded to a vulnerability. The module has no vocabulary for "probably
-  vulnerable", because the brief's requirement is that hypotheses are not
-  dressed as findings.
+  evidence (the status line and the headers actually received); a port that did
+  not answer is reported as "filtered", never as closed. Nothing is upgraded to
+  a vulnerability. The module has no vocabulary for "probably vulnerable",
+  because the brief's requirement is that hypotheses are not dressed as findings.
 
 Findings carry ``confidence: "confirmed"`` only where the response itself proves
 the statement — ``Server: nginx/1.18.0`` is a confirmed banner; "an outdated
@@ -42,10 +45,11 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from common.reporting import safe_error
+from core.security import findings as findings_module
 from core.security import scope as scope_module
 from core.security.scope import OutOfScope
 from tools.base import BaseTool, ToolResult, ToolValidationError, _prop
@@ -57,6 +61,34 @@ logger = logging.getLogger("Zaytoon.Tools.Security")
 #: denial of service.
 REQUEST_TIMEOUT_S = 10.0
 MAX_BODY_CHARS = 6000
+
+#: Port-scan bounds. A scan the user authorised must still be *bounded*: 32
+#: ports per call keeps one turn's work auditable and a mistyped range
+#: ("1-65535") a validation error rather than an evening.
+MAX_SCAN_PORTS = 32
+#: Per-port connect timeout. Short: a filtered port answers by not answering,
+#: and waiting longer than this per port only makes the honest "filtered"
+#: verdict slower to reach.
+CONNECT_TIMEOUT_S = 1.5
+#: Concurrent connects. Bounded so an authorised scan of a lab host is a
+#: handful of parallel sockets, not a flood.
+SCAN_CONCURRENCY = 8
+#: Banner bytes we will read — only what the *server* sends first. Zaytoon
+#: sends nothing after the handshake, so this is a read of unprompted data,
+#: never a payload.
+BANNER_BYTES = 256
+BANNER_WAIT_S = 1.0
+
+#: Ports whose number has a well-known service. The name is offered as
+#: context ("22 is commonly ssh") and never as a claim about what is
+#: actually running — only a banner or an application-layer response could
+#: prove that, and this tool makes no such request.
+COMMON_SERVICES = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+    80: "http", 110: "pop3", 143: "imap", 443: "https", 445: "smb",
+    3306: "mysql", 3389: "rdp", 5432: "postgresql", 6379: "redis",
+    8080: "http-alt", 9200: "elasticsearch", 11434: "ollama",
+}
 
 #: Headers whose absence is worth reporting, with the reason and the fix.
 #: A report that lists twenty missing headers is noise; these are the ones with
@@ -226,6 +258,17 @@ class SecurityProbe(BaseTool):
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         headers = {key.lower(): value for key, value in response.headers.items()}
         findings = self._findings(headers, response, parsed)
+
+        # Evidence outlives the turn. `record` never raises and runs *after*
+        # the observation exists — a persistence failure must not cost the
+        # user the probe's answer, only the later review of it.
+        await findings_module.record(
+            "security_probe",
+            host,
+            findings,
+            authorization_id=authorization.id,
+            operation=scope_module.OP_HTTP_PROBE,
+        )
 
         body_excerpt = ""
         if include_body:
@@ -438,5 +481,390 @@ class SecurityProbe(BaseTool):
         return "\n".join(lines)
 
 
+class PortScan(BaseTool):
+    """A bounded TCP connect scan against an authorised target.
+
+    Same three-step order as :class:`SecurityProbe`, and for the same reason:
+    validation (no socket), authorisation (``require_authorized`` for
+    ``port.probe`` — a refused host is never contacted at all), then the
+    registry's ``confirm`` gate.
+
+    What it will not do
+    -------------------
+
+    * **No payloads.** A TCP handshake and, optionally, a read of what the
+      *server* sends first. Zaytoon writes nothing after connecting, so a
+      banner grab here is a read of unprompted data, not a probe payload.
+    * **No service fingerprinting.** An open port's number is reported with
+      its common service name as context ("22 is commonly ssh"), never as a
+      claim about what is running.
+    * **No breadth.** ``MAX_SCAN_PORTS`` ports per call. A scan is a question
+      about named services, not a sweep.
+
+    States, and what each one *means*:
+    ``open`` — the handshake completed: a service answered. ``closed`` — the
+    host actively refused: nothing is listening (or a firewall rejects
+    locally). ``filtered`` — no answer within the timeout: inconclusive by
+    definition; it is never reported as "closed" or as a finding.
+    """
+
+    #: `confirm`, same reasoning as SecurityProbe: the user is told before any
+    #: socket opens, even for a target they authorised in the workspace.
+    permission = "confirm"
+
+    def name(self) -> str:
+        return "port_scan"
+
+    def aliases(self) -> List[str]:
+        return ["port_probe", "scan_ports", "tcp_scan"]
+
+    def description(self) -> str:
+        return (
+            "Run a bounded TCP connect scan (with an optional server-first "
+            "banner read) against a target the user has explicitly authorised. "
+            "Reports each named port as open, closed or filtered with evidence. "
+            "Sends no payloads and changes nothing on the target. Refuses any "
+            "host not authorised for 'port.probe' — authorise targets in the "
+            "Security Workspace first."
+        )
+
+    def schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "host": _prop(
+                    "string",
+                    "The hostname or IP address to scan. Must be covered by an "
+                    "active authorization for 'port.probe'.",
+                ),
+                "ports": _prop(
+                    "array",
+                    f"Ports to check: integers and/or 'start-end' range strings. "
+                    f"At most {MAX_SCAN_PORTS} ports after expansion, e.g. "
+                    f"[22, 80, \"8000-8005\"].",
+                    items={"type": ["integer", "string"]},
+                ),
+                "read_banner": _prop(
+                    "boolean",
+                    "Also read up to a few hundred bytes of what an open service "
+                    "sends first, without sending anything (default true).",
+                    default=True,
+                ),
+            },
+            "required": ["host", "ports"],
+            "additionalProperties": False,
+        }
+
+    def validate(self, params: Dict[str, Any]) -> None:
+        host = params.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ToolValidationError("'host' is required")
+        host = host.strip()
+        if any(ch.isspace() for ch in host) or "/" in host or ":" in host and not self._looks_like_ipv6(host):
+            # A URL, a CIDR or a scheme is a different tool's argument. The
+            # scope store accepts CIDR patterns for *authorizations*; a scan
+            # target is one host, and accepting a network here would make the
+            # per-host scope check meaningless.
+            raise ToolValidationError(
+                "'host' must be a single hostname or IP address — a URL or a "
+                "CIDR network is not a scan target."
+            )
+        ports = params.get("ports")
+        if not isinstance(ports, (list, tuple)) or not ports:
+            raise ToolValidationError("'ports' must be a non-empty list")
+        # Pre-check: a single range string that exceeds the cap must give the
+        # precise "at most 32 ports" error, not "no valid ports".
+        for item in ports:
+            if isinstance(item, str) and "-" in item:
+                left, _, right = item.partition("-")
+                try:
+                    start, end = int(left.strip()), int(right.strip())
+                except ValueError:
+                    continue
+                if start > end:
+                    raise ToolValidationError(
+                        f"range '{item}' is backwards (start > end)"
+                    )
+                if end - start + 1 > MAX_SCAN_PORTS:
+                    raise ToolValidationError(
+                        f"at most {MAX_SCAN_PORTS} ports per call (range '{item}' "
+                        f"expands to {end - start + 1}); split the scan."
+                    )
+        expanded = self._expand_ports(ports)
+        if not expanded:
+            raise ToolValidationError("'ports' contains no valid ports")
+        if len(expanded) > MAX_SCAN_PORTS:
+            raise ToolValidationError(
+                f"at most {MAX_SCAN_PORTS} ports per call (got {len(expanded)}); "
+                "split the scan or name the ports you actually mean."
+            )
+
+    @staticmethod
+    def _looks_like_ipv6(value: str) -> bool:
+        return value.count(":") >= 2
+
+    @staticmethod
+    def _expand_ports(ports: Any) -> List[int]:
+        """Ints and 'start-end' strings → a sorted, de-duplicated int list.
+
+        A bare number is never accepted as a range endpoint out of order
+        (``'90-80'``), and port 0 is refused: it is reserved, and no service
+        answers on it. A range larger than the per-call cap is an error,
+        not a silent shrink — ``validate`` checks the cap after expansion
+        and must be able to tell the user *why* the list is too long.
+        """
+        result: List[int] = []
+        for item in ports:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                candidates = [item]
+            elif isinstance(item, str):
+                text = item.strip()
+                if "-" in text:
+                    left, _, right = text.partition("-")
+                    try:
+                        start, end = int(left.strip()), int(right.strip())
+                    except ValueError:
+                        continue
+                    if start > end or end - start + 1 > MAX_SCAN_PORTS:
+                        continue  # validate will catch the oversized count
+                    candidates = list(range(start, end + 1))
+                else:
+                    try:
+                        candidates = [int(text)]
+                    except ValueError:
+                        continue
+            else:
+                continue
+            for port in candidates:
+                if 1 <= port <= 65535 and port not in result:
+                    result.append(port)
+        return sorted(result)
+
+    def risk_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        # Host and the port list only — exactly what the user is agreeing to.
+        return {
+            "host": params.get("host", ""),
+            "ports": params.get("ports", []),
+        }
+
+    async def execute(
+        self, host: str = "", ports: Optional[List[Any]] = None, read_banner: bool = True, **_: Any
+    ) -> ToolResult:
+        target = host.strip()
+        expanded = self._expand_ports(ports or [])
+
+        # ---- 2. Authorisation, before any socket exists ------------------
+        try:
+            authorization = await scope_module.require_authorized(
+                target, scope_module.OP_PORT_PROBE
+            )
+        except OutOfScope as exc:
+            return ToolResult(
+                success=False,
+                output="",
+                error=str(exc),
+                data={
+                    "refused": True,
+                    "reason": "out_of_scope",
+                    "host": target,
+                    "operation": scope_module.OP_PORT_PROBE,
+                },
+            )
+        except scope_module.ScopeError as exc:
+            return ToolResult.fail(f"Scope check failed: {exc}")
+
+        import asyncio
+
+        semaphore = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+        async def _probe(port: int) -> Dict[str, Any]:
+            async with semaphore:
+                started = time.perf_counter()
+                banner = None
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(target, port),
+                        timeout=CONNECT_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    state = "filtered"
+                except ConnectionRefusedError:
+                    state = "closed"
+                except OSError as exc:
+                    # DNS failure, network unreachable, permission error —
+                    # none of which is "closed". Named, never swallowed.
+                    return {
+                        "port": port,
+                        "state": "filtered",
+                        "detail": type(exc).__name__,
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                        "banner": None,
+                    }
+                else:
+                    state = "open"
+                    banner = None
+                    try:
+                        if read_banner:
+                            raw = await asyncio.wait_for(
+                                reader.read(BANNER_BYTES), timeout=BANNER_WAIT_S
+                            )
+                            banner = raw.decode("utf-8", "replace").strip() or None
+                    except (asyncio.TimeoutError, OSError):
+                        # No banner is the common case (HTTP services wait to
+                        # be spoken to, and Zaytoon sends nothing).
+                        banner = None
+                    finally:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except OSError:
+                            pass
+                return {
+                    "port": port,
+                    "state": state,
+                    "detail": None,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                    "banner": banner,
+                }
+
+        # `gather` without return_exceptions: every failure mode inside
+        # `_probe` is already converted to a structured result, so nothing
+        # here can raise and cancel its siblings — the same reasoning as
+        # `AgentEngine._run_batch`. The semaphore inside `_probe` is what
+        # bounds the simultaneous sockets; gathering is what makes them
+        # actually simultaneous.
+        results = await asyncio.gather(*(_probe(port) for port in expanded))
+        results = list(results)
+        open_ports = [r for r in results if r["state"] == "open"]
+
+        findings: List[Dict[str, Any]] = []
+        for entry in open_ports:
+            port = entry["port"]
+            service = COMMON_SERVICES.get(port)
+            findings.append(
+                {
+                    "id": f"port.open.{port}",
+                    "title": f"Port {port} accepted a TCP connection"
+                    + (f" ({service})" if service else ""),
+                    "severity": "info",
+                    "confidence": "confirmed",
+                    "category": "Exposure",
+                    "evidence": (
+                        f"TCP connect to {target}:{port} completed in "
+                        f"{entry['elapsed_ms']:.0f} ms"
+                        + (f"; server-first banner: {entry['banner']!r}" if entry["banner"] else "")
+                    ),
+                    "consequence": (
+                        f"A service is reachable on port {port} from this machine."
+                        + (
+                            f" Port {port} is commonly {service}, but the service "
+                            "itself was not identified — no application-layer "
+                            "request was made."
+                            if service
+                            else ""
+                        )
+                    ),
+                    "remediation": (
+                        "Confirm this service is meant to be reachable from "
+                        "here; firewall or close it otherwise."
+                    ),
+                    "data": entry,
+                }
+            )
+            banner = entry.get("banner") or ""
+            if banner and any(ch.isdigit() for ch in banner):
+                findings.append(
+                    {
+                        "id": f"disclosure.port.{port}",
+                        "title": f"The service on port {port} discloses a software version",
+                        "severity": "info",
+                        "confidence": "confirmed",
+                        "category": "Disclosure",
+                        "evidence": f"{target}:{port} sent: {banner!r}",
+                        "consequence": (
+                            "A version string lets an attacker match the service "
+                            "against public advisories without touching it. It is "
+                            "not a vulnerability on its own — whether this build "
+                            "is affected was not tested."
+                        ),
+                        "remediation": (
+                            "Suppress or genericise the banner, and keep the "
+                            "component patched."
+                        ),
+                    }
+                )
+
+        await findings_module.record(
+            "port_scan",
+            target,
+            findings,
+            authorization_id=authorization.id,
+            operation=scope_module.OP_PORT_PROBE,
+        )
+
+        report = self._render(target, results, findings, authorization)
+        return ToolResult.ok(
+            report,
+            {
+                "host": target,
+                "authorization_id": authorization.id,
+                "authorized_target": authorization.target,
+                "results": results,
+                "findings": findings,
+                "open": [entry["port"] for entry in open_ports],
+                "closed": [r["port"] for r in results if r["state"] == "closed"],
+                "filtered": [r["port"] for r in results if r["state"] == "filtered"],
+            },
+        )
+
+    @staticmethod
+    def _render(
+        target: str,
+        results: List[Dict[str, Any]],
+        findings: List[Dict[str, Any]],
+        authorization: Any,
+    ) -> str:
+        lines = [
+            f"Authorised port scan of {target}",
+            f"Authorisation: {authorization.id} (target pattern '{authorization.target}')",
+            "",
+        ]
+        for entry in results:
+            port = entry["port"]
+            service = COMMON_SERVICES.get(port)
+            suffix = f" (commonly {service})" if service else ""
+            if entry["state"] == "open":
+                extra = f" — banner: {entry['banner']!r}" if entry.get("banner") else ""
+                lines.append(
+                    f"  {port}/tcp OPEN{suffix} in {entry['elapsed_ms']:.0f} ms{extra}"
+                )
+            elif entry["state"] == "closed":
+                lines.append(f"  {port}/tcp closed (host refused the connection)")
+            else:
+                detail = f" ({entry['detail']})" if entry.get("detail") else ""
+                lines.append(
+                    f"  {port}/tcp filtered or no answer within "
+                    f"{CONNECT_TIMEOUT_S:.1f}s{detail} — inconclusive"
+                )
+        if findings:
+            lines += ["", "Observations:"]
+            for index, finding in enumerate(findings, 1):
+                lines += [
+                    f"{index}. [{finding['severity'].upper()}] {finding['title']}",
+                    f"   Evidence   : {finding['evidence']}",
+                    f"   Consequence: {finding['consequence']}",
+                    f"   Remediation: {finding['remediation']}",
+                ]
+        lines += [
+            "",
+            "Note: a TCP handshake and an optional read of server-first bytes.",
+            "Nothing was sent after connecting. 'Filtered' means the host did",
+            "not answer in time — it is not evidence that nothing is there.",
+        ]
+        return "\n".join(lines)
+
+
 def build_tools() -> List[BaseTool]:
-    return [SecurityProbe()]
+    return [SecurityProbe(), PortScan()]

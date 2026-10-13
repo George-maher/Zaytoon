@@ -299,6 +299,43 @@ _MIGRATIONS: List[str] = [
     # stay unverified until a completion actually happens.
     "ALTER TABLE providers ADD COLUMN chat_verified_at TEXT;\n"
     + SETUP_STAMP_SQL,
+
+    # -- 6: evidence — what the assessment tools actually observed --------
+    # A finding that lives only in a transcript is a finding nobody can
+    # review later: the report (§11C) needs the observation, its evidence
+    # and its authorization to outlive the turn that produced it. Written
+    # by the security tools themselves, after a *successful* probe — a
+    # refused or failed probe records nothing, because there was no
+    # observation to keep.
+    #
+    # `confidence` is a closed vocabulary enforced in findings.py, not by a
+    # CHECK constraint: the tools are the only writers, they construct the
+    # value, and a constraint would turn a future vocabulary change into a
+    # migration that silently drops rows the moment an unknown value is
+    # written by a never-raise helper. The index is on (target, created_at)
+    # because the report reads per-target in time order.
+    """
+    CREATE TABLE IF NOT EXISTS security_findings (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        authorization_id TEXT,
+        tool         TEXT NOT NULL,
+        operation    TEXT,
+        target       TEXT NOT NULL,
+        finding_id   TEXT,
+        title        TEXT NOT NULL,
+        severity     TEXT NOT NULL,
+        confidence   TEXT NOT NULL,
+        category     TEXT,
+        evidence     TEXT,
+        consequence  TEXT,
+        remediation  TEXT,
+        data_json    TEXT,
+        created_at   TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_security_findings_target
+        ON security_findings(target, created_at);
+    """,
 ]
 
 
