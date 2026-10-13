@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,7 @@ from core.providers import (
 )
 from config import config
 from core import paths
+from core.events import CoreEventType, bus as core_bus
 from core.skills import (
     MAX_ENABLED,
     ManifestError,
@@ -42,9 +44,12 @@ from core.skills import (
     create,
     install,
     list_skills,
+    load,
+    read_instructions,
     remove,
     set_enabled,
     skill_detail,
+    skills_root,
     sync_to_db,
 )
 
@@ -54,6 +59,29 @@ skills_router = APIRouter()
 providers_router = APIRouter()
 terminal_router = APIRouter()
 system_router = APIRouter()
+
+
+def _announce_skill_change(manifest: Dict[str, Any]) -> None:
+    """Notify the live registry that a skill's *tools* may have changed.
+
+    ``create`` and ``install`` write to disk and then ``sync_to_db`` mirrors the
+    row, but neither reaches the live ``ToolRegistry`` — the subscriber in
+    ``api/main.py`` reloads skill tools only on ``SKILL_CHANGED``. Without this
+    an enabled skill's ``tools/*.py`` would not be callable until a restart,
+    which is the exact gap the resync subscriber exists to close for
+    enable/disable/delete.
+
+    Only an **enabled** skill is announced: a disabled one contributes no tools,
+    so there is nothing to reload, and firing the event anyway would make every
+    create/install pay a full resync for a no-op.
+    """
+    if not manifest.get("enabled"):
+        return
+    core_bus.publish(
+        CoreEventType.SKILL_CHANGED,
+        skill=manifest.get("name"),
+        enabled=True,
+    )
 
 
 # ===========================================================================
@@ -98,6 +126,98 @@ async def skill_get(name: str) -> Dict[str, Any]:
     return detail
 
 
+@skills_router.post("/skills/{name}/test")
+async def skill_test(name: str) -> Dict[str, Any]:
+    """Dry-run a skill: validate its manifest and load its tool modules.
+
+    A skill is not a command — it contributes *instructions* plus zero or more
+    *tools* — so there is no single "execute" to run. What a user actually
+    needs after editing one is the answer to three questions, and all of them
+    are answerable without side effects:
+
+    1. **Does it still validate?** The manifest is re-read from disk, so an
+       edit that broke the schema is reported before the next turn discovers it.
+    2. **Do its tool modules still import?** Each ``tools/*.py`` is imported
+       and its ``build_tools()`` is called in a **scratch registry**, never the
+       live one — a skill must not gain callable status by being tested. A
+       build_tools() that raises, a bad return type or a name colliding with a
+       built-in each show up here as a per-file error.
+    3. **Does it declare what it needs?** The policy gap check runs exactly as
+       it does at load time (``test_skill`` reuses the loader's own helpers),
+       so "the dry run passed" and "startup would load it" cannot disagree.
+
+    A skill with no tool modules is *ok*, not a failure — that is the common
+    case. The route answers 200 with ``ok: false`` rather than an HTTP error:
+    a skill that fails its test is a *result to display*, not a broken request.
+    """
+    directory = os.path.join(skills_root(), name)
+    if not os.path.isdir(directory):
+        raise HTTPException(404, f"No such skill: {name}")
+
+    errors: List[Any] = []
+    warnings: List[Any] = []
+
+    # 1. Manifest — the headline. Everything below depends on it.
+    try:
+        manifest = load(directory)
+        manifest_ok = True
+    except ManifestError as exc:
+        return {
+            "skill": name,
+            "ok": False,
+            "manifest_ok": False,
+            "instructions_ok": False,
+            "tools_ok": False,
+            "enabled": None,
+            "modules": [],
+            "tools": [],
+            "policy": [],
+            "errors": [{"skill": name, "file": "skill.json", "error": str(exc)}],
+            "warnings": [],
+        }
+
+    # 2. Instructions. Empty is a *warning*, not a failure:
+    #    `build_skill_context` silently skips an empty instruction set, so the
+    #    skill still loads and its tools still run — it just contributes
+    #    nothing to the prompt, which the user should see but is not "broken".
+    try:
+        text = read_instructions(manifest)
+        instructions_ok = bool(text and text.strip())
+    except Exception as exc:  # unreadable file, bad encoding
+        instructions_ok = False
+        errors.append(
+            {"skill": name, "file": "INSTRUCTIONS.md", "error": type(exc).__name__}
+        )
+    if not instructions_ok and not errors:
+        warnings.append(
+            {
+                "skill": name,
+                "file": "INSTRUCTIONS.md",
+                "error": "file is missing or empty; the skill contributes no instructions",
+            }
+        )
+
+    # 3. Tool modules — loaded into a scratch registry, enabled or not.
+    from core.skills.tool_loader import test_skill
+
+    tool_report = await test_skill(name)
+    errors.extend(tool_report["errors"])
+
+    return {
+        "skill": name,
+        "ok": manifest_ok and not errors,
+        "manifest_ok": manifest_ok,
+        "instructions_ok": instructions_ok,
+        "tools_ok": not tool_report["errors"],
+        "enabled": manifest.enabled,
+        "modules": tool_report["modules"],
+        "tools": tool_report["tools"],
+        "policy": tool_report["policy"],
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
 @skills_router.post("/skills", status_code=201)
 async def skill_create(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """Create a skill from a name and a description.
@@ -136,6 +256,7 @@ async def skill_create(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     except ManifestError as exc:
         raise HTTPException(422, str(exc)) from exc
     await sync_to_db()
+    _announce_skill_change(created)
     return created
 
 
@@ -152,6 +273,7 @@ async def skill_install(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     except ManifestError as exc:
         raise HTTPException(422, str(exc)) from exc
     await sync_to_db()
+    _announce_skill_change(installed)
     return {"status": "installed", "skill": installed}
 
 

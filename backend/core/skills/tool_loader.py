@@ -358,4 +358,107 @@ async def load_skill_tools(
     return report
 
 
-__all__ = ["load_skill_tools"]
+async def test_skill(name: str, root: Optional[str] = None) -> Dict[str, Any]:
+    """Dry-run ONE skill's tool modules without touching the live registry.
+
+    Reuses the exact helpers :func:`load_skill_tools` uses — containment,
+    the ``build_tools()`` contract, the permission floor, the policy gap
+    check — so "the test passed" and "startup would load it" cannot drift.
+
+    Differences from a real load, both deliberate:
+
+    * The skill is loaded **whether or not it is enabled** — testing a skill
+      you have not switched on yet is the whole point of a dry run.
+    * It goes into a **fresh scratch registry**. A skill must never gain
+      callable status by being *tested*; the live registry is untouched.
+
+    Returns ``{"modules": [{file, ok, tools, error}], "tools": [names],
+    "policy": [...], "errors": [...]}`` — per-module, because the question
+    after an edit is *which file* broke, not merely whether something did.
+    """
+    from tools.registry import ToolRegistry
+    from config import config
+    from core.skills.registry import skills_root
+
+    base = root or skills_root()
+    skill_dir = os.path.join(base, name)
+    report: Dict[str, Any] = {
+        "modules": [],
+        "tools": [],
+        "policy": [],
+        "errors": [],
+    }
+    if not os.path.isdir(skill_dir):
+        report["errors"].append(
+            {"skill": name, "file": "", "error": "skill directory not found"}
+        )
+        return report
+
+    try:
+        from core.skills.manifest import ManifestError, load as load_manifest
+
+        declared = list(load_manifest(skill_dir).permissions)
+    except (ManifestError, OSError) as exc:
+        report["errors"].append(
+            {"skill": name, "file": "skill.json", "error": redact(str(exc))[:200]}
+        )
+        return report
+
+    scratch = ToolRegistry()
+    strict = bool(getattr(config, "SKILL_STRICT_PERMISSIONS", False))
+
+    for path in _tool_files(skill_dir):
+        entry: Dict[str, Any] = {
+            "file": os.path.basename(path),
+            "ok": False,
+            "tools": [],
+            "error": None,
+        }
+        try:
+            tools = _build(_load_module(name, path))
+        except Exception as e:  # noqa: BLE001 — one bad file is the report
+            safe_error(
+                e, operation=f"skill.{name}.test", component="core.skills.loader"
+            )
+            entry["error"] = redact(str(e))[:200]
+            report["errors"].append(
+                {"skill": name, "file": entry["file"], "error": entry["error"]}
+            )
+            report["modules"].append(entry)
+            continue
+        for tool in tools:
+            try:
+                _raise_floor(tool)
+                gap = sorted(
+                    gaps_for(tool.name(), _declared_permissions(tool), declared)
+                )
+                if gap and strict:
+                    raise ValueError(
+                        "needs " + ", ".join(gap)
+                        + " which this skill's manifest does not declare"
+                    )
+                if gap:
+                    report["policy"].append(
+                        {
+                            "skill": name,
+                            "tool": tool.name(),
+                            "undeclared": gap,
+                            "note": "would load; set SKILL_STRICT_PERMISSIONS to refuse",
+                        }
+                    )
+                scratch.register(tool, replace=False, floor=PERMISSION_CONFIRM)
+            except Exception as e:  # noqa: BLE001 — one bad tool, not one bad skill
+                message = redact(str(e))[:200]
+                entry["error"] = entry["error"] or message
+                report["errors"].append(
+                    {"skill": name, "file": entry["file"], "error": message}
+                )
+            else:
+                entry["tools"].append(tool.name())
+                report["tools"].append(tool.name())
+        entry["ok"] = entry["error"] is None
+        report["modules"].append(entry)
+    return report
+
+
+__all__ = ["load_skill_tools", "test_skill"]

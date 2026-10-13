@@ -574,6 +574,90 @@ class TestSkills:
         entry = next(s for s in listing["skills"] if s["name"] == "laravel-security")
         assert entry["enabled"] is False
 
+    def test_creating_an_enabled_skill_makes_its_tools_callable(
+        self, client, temp_skills_dir, tmp_path
+    ):
+        """Create and install of an *enabled* skill must reach the live registry.
+
+        `create`/`install` write the files and `sync_to_db` mirrors the row, but
+        neither touched the running `ToolRegistry` — the resync subscriber only
+        fires on `SKILL_CHANGED`. So a skill created or installed already-enabled
+        had its `tools/*.py` on disk and in the DB yet uncallable until a restart,
+        which is the exact gap §9C ("changes take effect without an unnecessary
+        full restart") exists to close. A disabled skill must *not* leak tools in.
+        """
+        from api.main import tool_executor
+
+        def _poll(predicate, timeout=2.0):
+            """Wait for the fire-and-forget resync task on the app loop."""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return predicate()
+
+        _TOOL_SRC = (
+            "from tools.base import BaseTool, ToolResult\n\n"
+            "class Probe(BaseTool):\n"
+            "    def name(self):\n"
+            "        return '{tool_name}'\n"
+            "    def description(self):\n"
+            "        return 'A canary that the skill loader ran'\n"
+            "    async def execute(self, **kwargs):\n"
+            "        return ToolResult.ok('probe')\n\n"
+            "def build_tools():\n"
+            "    return [Probe()]\n"
+        )
+
+        def _stage(name, enabled, tool_name):
+            """A complete installable skill directory staged *outside* the root.
+
+            ``install`` copies a source dir into the skills root, so the source
+            must not already live there — copying a directory onto itself would
+            fail before the behaviour under test is reached.
+            """
+            import json as _json
+            src = tmp_path / "staging" / name
+            (src / "tools").mkdir(parents=True, exist_ok=True)
+            (src / "skill.json").write_text(
+                _json.dumps({"name": name, "enabled": enabled}), encoding="utf-8"
+            )
+            (src / "tools" / "probe.py").write_text(
+                _TOOL_SRC.format(tool_name=tool_name), encoding="utf-8"
+            )
+            return str(src)
+
+        # INSTALL an already-enabled skill. The resync runs on the app's loop
+        # thread (fire-and-forget task), so we poll the live registry rather
+        # than assert on the request that scheduled it.
+        installed = client.post("/skills/install", json={
+            "source": _stage("enabled-skill", True, "skill_probe_tool"),
+        })
+        assert installed.status_code in (200, 201)
+        assert _poll(lambda: "skill_probe_tool" in tool_executor.list_tools()), (
+            "an enabled skill's tools never reached the live registry"
+        )
+
+        # A disabled skill must not leak its tool in. Poll past the point the
+        # enabled one registered, so a late resync cannot fake a pass.
+        client.post("/skills/install", json={
+            "source": _stage("disabled-skill", False, "disabled_probe_tool"),
+        })
+        _poll(lambda: "disabled_probe_tool" in tool_executor.list_tools(), timeout=0.3)
+        assert "disabled_probe_tool" not in tool_executor.list_tools(), (
+            "a disabled skill leaked a tool into the live registry"
+        )
+
+        # CREATE an already-enabled skill, then confirm it is listed enabled.
+        created = client.post("/skills", json={
+            "name": "created-skill", "enabled": True,
+        })
+        assert created.status_code == 201
+        listing = client.get("/skills").json()
+        entry = next(s for s in listing["skills"] if s["name"] == "created-skill")
+        assert entry["enabled"] is True
+
     def test_inspect_shows_the_instructions(self, client, temp_skills_dir):
         client.post("/skills", json={
             "name": "laravel", "instructions": "Check for SQL injection.",
@@ -584,6 +668,85 @@ class TestSkills:
     def test_an_unknown_skill_is_a_404(self, client):
         assert client.get("/skills/absent").status_code == 404
         assert client.delete("/skills/absent").status_code == 404
+
+    def test_dry_run_passes_for_a_plain_created_skill(self, client, temp_skills_dir):
+        """`/skills/{name}/test` on a stub skill: everything ok, no tools.
+
+        The common case must be a clean pass, not an error about missing
+        tool modules — a skill with no tools is normal.
+        """
+        client.post("/skills", json={"name": "laravel"})
+        result = client.post("/skills/laravel/test").json()
+        assert result["ok"] is True
+        assert result["manifest_ok"] is True
+        assert result["instructions_ok"] is True
+        assert result["tools_ok"] is True
+        assert result["modules"] == []
+        assert result["tools"] == []
+        assert result["errors"] == []
+        # `create` writes a stub, so a fresh skill has nothing to warn about.
+        assert result["warnings"] == []
+
+    def test_dry_run_loads_a_disabled_skills_tools_without_enabling(
+        self, client, temp_skills_dir, tmp_path
+    ):
+        """Testing is not enabling: a disabled skill's tools load in the
+        scratch registry only — the live registry must not gain them."""
+        from api.main import tool_executor
+
+        src = tmp_path / "staging" / "dry-skill"
+        (src / "tools").mkdir(parents=True)
+        (src / "skill.json").write_text(
+            json.dumps({"name": "dry-skill", "enabled": False}), encoding="utf-8"
+        )
+        (src / "tools" / "probe.py").write_text(
+            "from tools.base import BaseTool, ToolResult\n\n"
+            "class Probe(BaseTool):\n"
+            "    def name(self):\n"
+            "        return 'dry_run_probe'\n"
+            "    def description(self):\n"
+            "        return 'loads only in the scratch registry'\n"
+            "    async def execute(self, **kwargs):\n"
+            "        return ToolResult.ok('probe')\n\n"
+            "def build_tools():\n"
+            "    return [Probe()]\n",
+            encoding="utf-8",
+        )
+        client.post("/skills/install", json={"source": str(src)})
+
+        result = client.post("/skills/dry-skill/test").json()
+        assert result["ok"] is True, result["errors"]
+        assert result["enabled"] is False
+        assert result["tools"] == ["dry_run_probe"]
+        assert result["modules"][0]["file"] == "probe.py"
+        assert result["modules"][0]["ok"] is True
+        # No INSTRUCTIONS.md was staged: a warning, never a failure.
+        assert result["instructions_ok"] is False
+        assert any("INSTRUCTIONS.md" in w["file"] for w in result["warnings"])
+        # The whole point of the scratch registry.
+        assert "dry_run_probe" not in tool_executor.list_tools()
+
+    def test_dry_run_names_the_broken_module(self, client, temp_skills_dir, tmp_path):
+        """A module that fails to import is reported per-file, and ok=false."""
+        src = tmp_path / "staging" / "broken-skill"
+        (src / "tools").mkdir(parents=True)
+        (src / "skill.json").write_text(
+            json.dumps({"name": "broken-skill"}), encoding="utf-8"
+        )
+        (src / "tools" / "boom.py").write_text(
+            "raise RuntimeError('deliberate failure')\n", encoding="utf-8"
+        )
+        client.post("/skills/install", json={"source": str(src)})
+
+        result = client.post("/skills/broken-skill/test").json()
+        assert result["ok"] is False
+        assert result["tools_ok"] is False
+        failed = [m for m in result["modules"] if m["file"] == "boom.py"]
+        assert failed and failed[0]["ok"] is False
+        assert "deliberate failure" in failed[0]["error"]
+
+    def test_dry_run_on_an_unknown_skill_is_a_404(self, client):
+        assert client.post("/skills/absent/test").status_code == 404
 
     def test_install_needs_a_source(self, client):
         assert client.post("/skills/install", json={}).status_code == 422
