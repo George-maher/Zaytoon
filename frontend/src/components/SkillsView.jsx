@@ -40,6 +40,9 @@ function SkillsView({ language = "en" }) {
   // Transient success feedback — create/save/delete used to succeed silently,
   // which reads the same as doing nothing.
   const [notice, setNotice] = useState(null);
+  // Dry-run test result for the currently inspected skill
+  const [testResult, setTestResult] = useState(null);
+  const [testing, setTesting] = useState(false);
   //: The declared permissions. Fetched, never hard-coded: the manifest
   //: validator rejects an unknown name, so a list duplicated in the client
   //: inevitably offers something the backend will refuse.
@@ -77,6 +80,7 @@ function SkillsView({ language = "en" }) {
       setErrors(result.errors || []);
     }
     setLoading(false);
+    setTestResult(null); // Clear stale test result on reload
   }, []);
 
   useEffect(() => {
@@ -141,6 +145,7 @@ function SkillsView({ language = "en" }) {
     setSelected(name);
     setEditing(false);
     setConfirmingDelete(null);
+    setTestResult(null); // Clear previous test result
     const result = await api.getSkill(name);
     if (result.error) {
       setError(result.error);
@@ -186,12 +191,27 @@ function SkillsView({ language = "en" }) {
         if (selected === name) {
           setSelected(null);
           setDetail(null);
+          setTestResult(null);
         }
         await load();
       }
     },
     [selected, load, ar],
   );
+
+  const runTest = useCallback(async () => {
+    if (!selected) return;
+    setTesting(true);
+    setTestResult(null);
+    setError(null);
+    const result = await api.testSkill(selected);
+    setTesting(false);
+    if (result.error) {
+      setError(result.error);
+    } else {
+      setTestResult(result);
+    }
+  }, [selected]);
 
   if (loading) {
     return (
@@ -478,6 +498,16 @@ function SkillsView({ language = "en" }) {
                   {saving ? "…" : (ar ? "حفظ" : "SAVE")}
                 </button>
               )}
+              {!editing && (
+                <button
+                  onClick={runTest}
+                  disabled={testing}
+                  className="hud-micro"
+                  style={{ padding: "var(--space-1) var(--space-2)", cursor: "pointer", background: testing ? "color-mix(in srgb, var(--hud-cyan) 8%, transparent)" : "color-mix(in srgb, var(--hud-amber) 8%, transparent)", border: "var(--border-w) solid color-mix(in srgb, var(--hud-amber) 25%, transparent)", color: testing ? "var(--hud-cyan)" : "var(--hud-amber)" }}
+                >
+                  {testing ? "…" : (ar ? "اختبار" : "TEST")}
+                </button>
+              )}
             </header>
 
             {/* Metadata */}
@@ -503,6 +533,101 @@ function SkillsView({ language = "en" }) {
                 </p>
               )}
             </div>
+
+            {/* Dry-run test results */}
+            {testResult && !editing && (
+              <div
+                style={{
+                  padding: "var(--space-3)",
+                  borderBottom: "var(--border-w) solid var(--hud-edge-faint)",
+                  background: testResult.ok
+                    ? "color-mix(in srgb, var(--hud-green) 4%, transparent)"
+                    : "color-mix(in srgb, var(--hud-amber) 4%, transparent)",
+                }}
+              >
+                <div className="flex items-center" style={{ gap: "var(--space-2)", marginBottom: "var(--space-2)" }}>
+                  <span
+                    aria-hidden="true"
+                    className={testResult.ok ? "hud-hex hud-hex--ok" : "hud-hex hud-hex--hollow hud-hex--warn"}
+                  />
+                  <span className="hud-micro" style={{ color: testResult.ok ? "var(--hud-green)" : "var(--hud-amber)" }}>
+                    {testResult.ok ? (ar ? "اجتاز الاختبار" : "TEST PASSED") : (ar ? "فشل الاختبار" : "TEST FAILED")}
+                  </span>
+                  <span className="hud-micro ml-auto" style={{ color: "var(--hud-text-mute)" }}>
+                    {ar ? "النتيجة" : "RESULT"}
+                  </span>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "var(--space-2)", fontSize: "var(--font-xs)" }}>
+                  <div style={{ color: testResult.manifest_ok ? "var(--hud-green)" : "var(--hud-red)" }}>
+                    📋 {ar ? "البيان" : "MANIFEST"}: {testResult.manifest_ok ? (ar ? "صالح" : "OK") : (ar ? "خطأ" : "ERROR")}
+                  </div>
+                  <div style={{ color: testResult.instructions_ok ? "var(--hud-green)" : "var(--hud-amber)" }}>
+                    📝 {ar ? "التعليمات" : "INSTRUCTIONS"}: {testResult.instructions_ok ? (ar ? "موجودة" : "OK") : (testResult.warnings?.some(w => w.file === "INSTRUCTIONS.md") ? (ar ? "فارغة" : "EMPTY") : (ar ? "خطأ" : "ERROR"))}
+                  </div>
+                  <div style={{ color: testResult.tools_ok ? "var(--hud-green)" : "var(--hud-red)" }}>
+                    🔧 {ar ? "الأدوات" : "TOOLS"}: {testResult.tools_ok ? (ar ? "سليمة" : "OK") : (ar ? "خطأ" : "ERROR")}
+                  </div>
+                </div>
+                {testResult.modules?.length > 0 && (
+                  <details style={{ marginTop: "var(--space-2)" }}>
+                    <summary className="hud-micro" style={{ cursor: "pointer", color: "var(--hud-text-dim)" }}>
+                      {ar ? "وحدات الأدوات" : "TOOL MODULES"} ({testResult.modules.length})
+                    </summary>
+                    <ul style={{ margin: "var(--space-2) 0 0", paddingLeft: "var(--space-4)", fontSize: "var(--font-xs)", color: "var(--hud-text-dim)" }}>
+                      {testResult.modules.map((m) => (
+                        <li key={m.file} style={{ display: "flex", gap: "var(--space-2)", alignItems: "center" }}>
+                          <span className={m.ok ? "hud-hex hud-hex--ok" : "hud-hex hud-hex--hollow hud-hex--warn"} style={{ minWidth: "12px" }} />
+                          <code dir="ltr" style={{ color: m.ok ? "var(--hud-green)" : "var(--hud-red)" }}>{m.file}</code>
+                          {m.tools?.length > 0 && <span style={{ color: "var(--hud-text-mute)" }}>{m.tools.join(", ")}</span>}
+                          {m.error && <span style={{ color: "var(--hud-red)" }}>: {m.error}</span>}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+                {testResult.tools?.length > 0 && (
+                  <p className="hud-micro" style={{ marginTop: "var(--space-2)", color: "var(--hud-cyan)" }}>
+                    {ar ? "أدوات مكتشفة" : "DISCOVERED TOOLS"}: {testResult.tools.join(", ")}
+                  </p>
+                )}
+                {testResult.policy?.length > 0 && (
+                  <div style={{ marginTop: "var(--space-2)" }}>
+                    <p className="hud-micro" style={{ color: "var(--hud-amber)" }}>
+                      {ar ? "فجوات السياسة" : "POLICY GAPS"}:
+                    </p>
+                    <ul style={{ margin: 0, paddingLeft: "var(--space-4)", fontSize: "var(--font-xs)", color: "var(--hud-amber)" }}>
+                      {testResult.policy.map((g, i) => (
+                        <li key={i}>{g.tool} needs {g.undeclared.join(", ")} — {g.note}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {testResult.errors?.length > 0 && (
+                  <div style={{ marginTop: "var(--space-2)" }}>
+                    <p className="hud-micro" style={{ color: "var(--hud-red)" }}>
+                      {ar ? "الأخطاء" : "ERRORS"}:
+                    </p>
+                    <ul style={{ margin: 0, paddingLeft: "var(--space-4)", fontSize: "var(--font-xs)", color: "var(--hud-red)" }}>
+                      {testResult.errors.map((e, i) => (
+                        <li key={i}>{e.file ? `${e.file}: ` : ""}{e.error}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {testResult.warnings?.length > 0 && (
+                  <div style={{ marginTop: "var(--space-2)" }}>
+                    <p className="hud-micro" style={{ color: "var(--hud-amber)" }}>
+                      {ar ? "تحذيرات" : "WARNINGS"}:
+                    </p>
+                    <ul style={{ margin: 0, paddingLeft: "var(--space-4)", fontSize: "var(--font-xs)", color: "var(--hud-amber)" }}>
+                      {testResult.warnings.map((w, i) => (
+                        <li key={i}>{w.file}: {w.error}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Instructions editor / viewer */}
             <div className="flex-1 overflow-y-auto" style={{ padding: "var(--space-3)" }}>

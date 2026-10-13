@@ -606,6 +606,26 @@ export async function removeSkill(name) {
   return data;
 }
 
+/**
+ * Dry-run a skill: validate manifest, import tool modules, run policy check.
+ *
+ * The skill does not need to be enabled — testing a skill you haven't switched
+ * on is the point. The route answers 200 with `ok: false` rather than an
+ * HTTP error: a skill that fails its test is a *result to display*, not a
+ * broken request. The response shape mirrors the backend's `test_skill`:
+ * {ok, manifest_ok, instructions_ok, tools_ok, enabled, modules, tools,
+ *  policy, errors, warnings}.
+ */
+export async function testSkill(name) {
+  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(name)}/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Providers and models
 // ---------------------------------------------------------------------------
