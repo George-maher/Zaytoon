@@ -736,6 +736,49 @@ export async function setTierAssignment(tier, providerId, modelId) {
   return data;
 }
 
+/**
+ * Generate one real completion — the only acceptable proof of setup.
+ *
+ * `POST /test` proves an endpoint answers; this proves a model can actually
+ * be asked something and reply, which is why the first-run wizard completes
+ * on this and nothing else. A wrong key scope, a missing model and an
+ * exhausted balance each look exactly like success until a completion is
+ * attempted.
+ *
+ * A failure is a 200 with `ok: false` and the reason — the endpoint being
+ * broken is the answer, not a server error. The 409 ("no models recorded,
+ * refresh first") and 404 ("no such provider") cases carry their own text in
+ * `{ error }`; both come through verbatim so the UI can show the instruction
+ * rather than a status code.
+ */
+export async function testChatProvider(id, { message = "", model = "" } = {}) {
+  const res = await fetch(`${API_BASE}/providers/${encodeURIComponent(id)}/test-chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, model }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, connected: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/**
+ * Is first-run setup done? Answered only by a real chat test.
+ *
+ * `setup_required: null` on failure, never `true`: this status is read on
+ * every boot, and a backend that predates the route (404) or is simply down
+ * must not be rendered as "setup required" — an unreadable status is not
+ * evidence that setup is missing. The wizard and the setup banner both skip
+ * entirely on `null` and let the user discover the real problem where it is
+ * reported.
+ */
+export async function getSetupStatus() {
+  const res = await fetch(`${API_BASE}/setup/status`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { setup_required: null, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Permissions and system
 // ---------------------------------------------------------------------------

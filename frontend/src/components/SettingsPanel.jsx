@@ -9,6 +9,9 @@ import {
 } from "../lib/api";
 import { enterOverlay } from "../lib/motion";
 import ExecutionHistory from "./ExecutionHistory";
+// The provider registry (W6) lives in its own directory: it is the only card
+// here that talks to /providers rather than /settings/ai.
+import ProvidersSection from "./providers/ProvidersSection";
 
 /**
  * Configuration panel.
@@ -46,6 +49,10 @@ import ExecutionHistory from "./ExecutionHistory";
  *   rewrites both drafts only while they are untouched; once a field has been
  *   edited the refresh updates the *status* around it, not the text under the
  *   user's cursor.
+ *
+ * Added in W6: `ProvidersSection` (`./providers/ProvidersSection`) renders as
+ * the first card on SYSTEM — the full `/providers` registry, above the
+ * `/settings/ai` view this panel was originally built around.
  */
 
 const AI_POLL_MS = 15000;
@@ -430,6 +437,12 @@ function SettingsPanel({ open, onClose, language = "en" }) {
 
           {section === "system" && (
           <>
+          {/* The provider registry sits above everything else on SYSTEM: it
+              is the answer to "what can this thing talk to at all", and the
+              card below it only reports the one provider the legacy client
+              happens to be using. */}
+          <ProvidersSection language={language} />
+
           {/* AI provider */}
           <Card title={ar ? "مزود الذكاء الاصطناعي" : "AI PROVIDER"}>
             {aiError && (

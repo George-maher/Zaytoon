@@ -16,6 +16,7 @@ import ChatTranscript from "./components/Chat/ChatTranscript";
 import ConfirmationDialog from "./components/ConfirmationDialog";
 import ReminderPanel from "./components/ReminderPanel";
 import SettingsPanel from "./components/SettingsPanel";
+import SetupWizard from "./components/providers/SetupWizard";
 import WorkspaceShell from "./components/workspace/WorkspaceShell";
 import HomeScreen from "./components/HomeScreen";
 import ComputerView from "./components/ComputerView";
@@ -677,6 +678,12 @@ export default memo(function App() {
         onRespond={respondToConfirmation}
         language={language}
       />
+
+      {/* First-run setup. Rendered unconditionally — the wizard itself reads
+          GET /setup/status and returns null unless setup is genuinely
+          required and not yet skipped, so nothing here has to know the
+          backend's verdict. */}
+      <SetupWizard language={language} />
 
       <SettingsPanel
         open={settingsOpen}
