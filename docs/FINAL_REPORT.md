@@ -116,7 +116,7 @@ plus the numbers below.
 | Model routing events (new) | `tests/test_model_routing_events.py` | **5 passed** |
 | Write verification, engine observation, tools | `tests/test_tool_registry.py` + 3 others | **248 passed** |
 | Frontend | `cd frontend && npm run verify` (vitest + eslint + build) | **704 passed, 42 files, EXIT 0** |
-| Desktop shell | `cd desktop && ../backend/.venv/bin/python -m pytest tests/ -q` | **370 passed, 2 skipped** (Tk-dependent modules collect-skipped: `customtkinter` is not installed here) |
+| Desktop shell | `cd desktop && ../backend/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider` | **376 passed, 2 skipped** (Tk-dependent modules collect-skipped here: `customtkinter` needs a `tkinter` this sandbox does not have) |
 
 Baseline for comparison: Stage A recorded `2 failed, 3057 passed, 5 skipped`.
 
@@ -130,6 +130,28 @@ also pass (84 in 33.57 s). This is a test-isolation problem in the protocol
 suite (a leaked thread or a shared event loop between files), not a product
 defect — but it is a real defect in the suite and it is **open**, deferred by
 budget rather than judged unimportant.
+
+**A second failure, one that only CI could see — found there, fixed here.** The
+first CI run on this branch (run `38706399455`) failed all three desktop legs in
+under two minutes, each with exactly one failure:
+`tests/test_app_wiring.py::TestTurnScopedAudio::test_only_anchor_frames_move_the_current_turn`,
+`AttributeError: 'ZaytoonApp' object has no attribute 'client'`, raised from
+`app/app.py:608` (`_finish_stream` reads `self.client.connected`). The cause was
+not in the product: that class built its *own* copy of the shell double, and the
+copy omitted four attributes the real constructor always sets (`client`,
+`events`, `mode`, `shutting_down`). The local suite could not see it —
+`customtkinter` needs a `tkinter` this sandbox does not have, the module is
+collect-skipped, and the same commit reported `370 passed, 2 skipped` here. A
+double that is a copy of another double drifts from it exactly the way a copy of
+a schema drifts from the schema. Closed two ways: the two builders are now one
+`make_shell()` (so what the object is missing is missing everywhere, visibly),
+and `desktop/tests/test_shell_doubles.py` checks the double against the class's
+own source with `ast` — no Tk, no display, so it runs on the hosts where the
+module that needs them does not. It asserts attribute *presence*, not
+correctness: it derives the constructor's assignments and the class's `self.*`
+reads from `app/app.py`, exempts five display- or process-bound names with a
+written reason each, and one of its six tests proves the check can fail by
+parsing the builder with `client` removed.
 
 ---
 

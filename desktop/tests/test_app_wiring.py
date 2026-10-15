@@ -95,9 +95,17 @@ class FakeClient:
         self.sent.append(("confirm", request_id, approved))
 
 
-@pytest.fixture
-def app():
-    """A ZaytoonApp with its constructor skipped and its collaborators faked."""
+def make_shell():
+    """A ZaytoonApp with its constructor skipped and its collaborators faked.
+
+    One builder, called by the `app` fixture and directly by the tests that need
+    an attribute changed. It used to exist twice — here and again inside
+    `TestTurnScopedAudio` — and the copy omitted `client`, `events`, `mode` and
+    `shutting_down`, which the constructor always sets. Nothing local caught it
+    (`customtkinter` is absent, so this module is collect-skipped) and CI, where
+    the module does run, failed on `'ZaytoonApp' object has no attribute
+    'client'`.
+    """
     shell = object.__new__(ZaytoonApp)
     shell.events = __import__("queue").Queue()
     shell.mode = None
@@ -116,7 +124,24 @@ def app():
     shell.client = FakeClient()
     shell.telemetry = Recorder()
     shell._ids = __import__("itertools").count(1)
+    # Turn-scoped state, at the values the constructor uses. Here rather than
+    # in each test because the audio branches read them on *every* inbound
+    # frame; `tests/test_shell_doubles.py` fails if this list falls behind
+    # `__init__` again.
+    shell._latest_response_id = None
+    shell._ignore_audio = False
+    # Set when the side panel is placed; only the geometry code reads them.
+    shell._panel_saved_geometry = None
+    shell._panel_saved_state = None
+    # Set by a voice command that changed the status, so the connection frame
+    # that follows does not overwrite it.
+    shell._status_from_voice = None
     return shell
+
+
+@pytest.fixture
+def app():
+    return make_shell()
 
 
 def deliver(shell, *events) -> None:
@@ -395,22 +420,20 @@ class TestTurnScopedAudio:
     """
 
     def _shell(self):
-        shell = object.__new__(ZaytoonApp)
-        shell.player = RecorderPlayer()
-        shell.language = "en"
+        """The module's `app` fixture, with a recording player.
+
+        Deliberately **not** a second copy of the fixture: the copy that used to
+        live here omitted `client`, `events`, `mode` and `shutting_down`, which
+        the real `__init__` always sets. Nothing caught it on the machine where
+        it was written — `customtkinter` is absent there, so this module is
+        collect-skipped — and CI, where the module does run, failed on
+        `'ZaytoonApp' object has no attribute 'client'`. A double that is a copy
+        of another double drifts from it the same way a copy of a schema drifts
+        from the schema.
+        """
+        shell = make_shell()
         shell.status = "connected"
-        shell.tracker = states.StateTracker()
-        shell.ui_state = states.UiState.OFFLINE
-        shell.recent_actions = []
-        shell.model_name = ""
-        shell.mic = None
-        shell.tray = Recorder()
-        shell.panel = Recorder()
-        shell.orb = Recorder()
-        shell.telemetry = Recorder()
-        shell._ids = __import__("itertools").count(1)
-        shell._latest_response_id = None
-        shell._ignore_audio = False
+        shell.player = RecorderPlayer()
         return shell, shell.player
 
     def test_a_current_turn_plays(self):
