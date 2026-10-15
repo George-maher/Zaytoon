@@ -658,4 +658,90 @@ describe('stop control', () => {
       URL.revokeObjectURL = prevRevoke
     }
   })
+
+  describe('speech is bound to the turn that produced it', () => {
+    /** Install a fake player and hand back the players it created. */
+    const withFakeAudio = (fn) => {
+      const players = []
+      class FakeAudio {
+        constructor(url) {
+          this.url = url
+          this.paused = true
+          this.onended = null
+          this.onerror = null
+          players.push(this)
+        }
+        play() { this.paused = false; return Promise.resolve() }
+        pause() { this.paused = true }
+      }
+      vi.stubGlobal('Audio', FakeAudio)
+      const prevCreate = URL.createObjectURL
+      const prevRevoke = URL.revokeObjectURL
+      URL.createObjectURL = vi.fn(() => 'blob:utt')
+      URL.revokeObjectURL = vi.fn()
+      try {
+        return fn(players)
+      } finally {
+        URL.createObjectURL = prevCreate
+        URL.revokeObjectURL = prevRevoke
+      }
+    }
+
+    it('plays the audio of the newest turn', async () => {
+      const { socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'message', content: 'hi', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('MP3'), response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r2' }))
+        expect(players).toHaveLength(1)
+      })
+    })
+
+    it('never plays the audio of a turn that was superseded', async () => {
+      // The server stops synthesising at the next chunk boundary, but frames
+      // already on the socket still arrive. Playing them means the previous
+      // answer is spoken over the one the user is waiting for.
+      const { socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'message', content: 'second answer', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('STALE'), response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r1' }))
+        expect(players).toHaveLength(0)
+      })
+    })
+
+    it('does not start a stale utterance when the stop control was used', async () => {
+      const { result, socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r1' }))
+        act(() => result.current.stopAudio())
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('LATE'), response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r1' }))
+        expect(players).toHaveLength(0)
+      })
+    })
+
+    it('closes a superseded bubble instead of merging the next answer into it', async () => {
+      // The frames are in the order the backend emits them: `intent` anchors a
+      // turn before any of its tokens, and the stale token after the new turn's
+      // `intent` is the case that used to interleave two answers into one
+      // bubble. The half-sentence already on screen is *kept* — the user read it
+      // — but it stops streaming, so the second turn opens its own.
+      const { result, socket } = await mount()
+      act(() => {
+        socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1' })
+        socket.emit({ type: 'token', content: 'old ', response_id: 'r1' })
+        socket.emit({ type: 'intent', intent: 'chat', response_id: 'r2' })
+        socket.emit({ type: 'token', content: 'new ', response_id: 'r2' })
+        socket.emit({ type: 'token', content: 'answer', response_id: 'r2' })
+        socket.emit({ type: 'token', content: ' left over', response_id: 'r1' })
+      })
+      const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+      expect(assistant.map((m) => m.content)).toEqual(['old ', 'new answer'])
+      expect(assistant[0].streaming).toBe(false)
+      expect(assistant[1].streaming).toBe(true)
+    })
+  })
 })

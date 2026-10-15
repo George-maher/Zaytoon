@@ -74,6 +74,40 @@ export function normalizeStatus(status) {
   return KNOWN_STATUSES.has(status) ? status : FALLBACK_STATUS;
 }
 
+/**
+ * Frames that establish which turn is the current one.
+ *
+ * `intent` opens a turn, `message` closes it, and `status`/`subtitle` are
+ * emitted inside it. Payload frames (`token`, `audio_start`, `audio_chunk`,
+ * `audio_end`) are deliberately absent: they can carry a superseded turn's
+ * data, and treating one as an anchor would make the staleness guards compare a
+ * turn against itself.
+ */
+const ANCHOR_FRAMES = new Set(["intent", "message", "status", "subtitle"]);
+
+/**
+ * One assistant bubble, in the shape the token and message branches both build.
+ *
+ * Factored out because a turn's tokens and its final `message` have to agree on
+ * every field: when they were built separately a field added to one was missed
+ * in the other, and the mismatch showed up as a bubble that changed shape (and
+ * lost its timestamp) the moment the authoritative text arrived.
+ *
+ * `ts` is the receipt time of the first token — a real clock reading, not an
+ * invented one — so a reply is never stamped with a time nobody observed (see
+ * `clockTime`).
+ */
+function newAssistantBubble(data) {
+  return {
+    id: ++_msgId,
+    role: "assistant",
+    content: data.content,
+    streaming: true,
+    trace_id: data.trace_id,
+    ts: clockTime(),
+  };
+}
+
 export default function useWebSocket() {
   const [messages, setMessages] = useState([]);
   const [isListening, setIsListening] = useState(false);
@@ -147,6 +181,17 @@ export default function useWebSocket() {
   //: backstop for the server-side guard: the two agree because the server
   //: stamps the id on the first frame of each turn.
   const activeResponseIdRef = useRef(null);
+  //: The newest turn this client has seen *any* frame for. Audio is checked
+  //: against it, not against `activeResponseIdRef`: a reply's audio arrives
+  //: after its `message` frame (the transport streams speech while it writes
+  //: the text, and the drain finishes last), so by the time `audio_start`
+  //: lands the transcript has already finished the turn and the "active" ref
+  //: is deliberately cleared.
+  const latestResponseIdRef = useRef(null);
+  //: Which turn's audio is currently being collected. Three states: a
+  //: response id (collecting), `IGNORED` (a superseded turn's audio — dropped
+  //: whole), or null (nothing in flight).
+  const audioTurnRef = useRef(null);
   const renderedContentHashes = useRef(new Set());
   // Sources for the turn in flight: set by the `sources` frame (which the
   // backend sends *before* the final `message`) and consumed when that
@@ -183,6 +228,10 @@ export default function useWebSocket() {
   }, []);
 
   const stopAudio = useCallback(() => {
+    // A stop must also discard whatever utterance is mid-collection, otherwise
+    // its `audio_end` would start playing a voice the user just silenced.
+    audioTurnRef.current = null;
+    audioChunksRef.current = [];
     // Silence the playing utterance itself, not just the flags. Releasing the
     // blob URL here matters: once the handlers are detached the browser will
     // never call onended, so nothing else would revoke it.
@@ -251,6 +300,23 @@ export default function useWebSocket() {
         setCurrentTraceId(data.trace_id);
       }
       
+      // Anchor frames update what "the newest turn" is. Everything else that
+      // carries a `response_id` — a token, an audio frame, `audio_start` — can
+      // belong to a turn that has already been superseded, so using one as the
+      // anchor would drag the reference *back* to the turn the client is trying
+      // to ignore and quietly defeat the two guards below.
+      //
+      // A list of anchors rather than a list of exceptions, because the next
+      // frame type somebody adds is far more likely to be a payload than an
+      // anchor, and a missed exclusion fails silently.
+      //
+      // The server makes this reliable: every turn emits `intent`, and every
+      // reply ends with `message`/`status`, all carrying that turn's own
+      // `response_id`, and `intent` precedes any token of the turn.
+      if (data.response_id && ANCHOR_FRAMES.has(data.type)) {
+        latestResponseIdRef.current = data.response_id;
+      }
+
       switch (data.type) {
         case "status":
           setStatus(normalizeStatus(data.content));
@@ -352,7 +418,23 @@ export default function useWebSocket() {
             if (!activeResponseIdRef.current) {
               activeResponseIdRef.current = data.response_id;
             } else if (activeResponseIdRef.current !== data.response_id) {
-              break;
+              if (data.response_id !== latestResponseIdRef.current) {
+                // A superseded turn still draining its buffer.
+                break;
+              }
+              // A new turn: its `intent` frame already named it, so this is the
+              // turn the user is waiting for. The previous bubble has to stop
+              // being the streaming one, or this turn's tokens append to it and
+              // two answers merge into one bubble — which is the very thing
+              // this guard exists to prevent.
+              activeResponseIdRef.current = data.response_id;
+              // A new turn: the streaming bubble belongs to the turn that just
+              // ended, so it must stop being the one this turn appends to.
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (!last || last.role !== "assistant" || !last.streaming) return prev;
+                return [...prev.slice(0, -1), { ...last, streaming: false }];
+              });
             }
           }
           setIsTyping(true);
@@ -361,19 +443,7 @@ export default function useWebSocket() {
             if (last && last.role === "assistant" && last.streaming) {
               return [...prev.slice(0, -1), { ...last, content: last.content + data.content, trace_id: data.trace_id }];
             }
-            return [
-              ...prev,
-              {
-                id: ++_msgId,
-                role: "assistant",
-                content: data.content,
-                streaming: true,
-                trace_id: data.trace_id,
-                // Stamp on the first token of the turn: the receipt time of
-                // the reply, not an invented one (see clockTime).
-                ts: clockTime(),
-              },
-            ];
+            return [...prev, newAssistantBubble(data)];
           });
           break;
         case "message": {
@@ -480,9 +550,21 @@ export default function useWebSocket() {
           });
           break;
         }
-        case "audio_start":
+        case "audio_start": {
+          // Speech for a superseded turn is dropped entire: the server stops
+          // synthesising at the next chunk boundary, but sentences already
+          // queued (or frames already on the socket) would otherwise play
+          // over the answer the user is actually waiting for. Comparing to the
+          // newest id is what makes this a *turn* check rather than a guess.
+          const turn = data.response_id || null;
+          if (turn && latestResponseIdRef.current && turn !== latestResponseIdRef.current) {
+            audioTurnRef.current = null;
+            audioChunksRef.current = [];
+            break;
+          }
+          audioTurnRef.current = turn || latestResponseIdRef.current || "current";
           audioChunksRef.current = [];
-          audioChunksRef.format = data.format || "mpeg";
+          audioChunksRef.current.format = data.format || "mpeg";
           // Server-side voice selection, surfaced so the HUD can show which
           // locale is being spoken.
           activeVoiceRef.current = data.voice || null;
@@ -490,10 +572,17 @@ export default function useWebSocket() {
           setIsSpeaking(true);
           isSpeakingRef.current = true;
           break;
+        }
         case "audio_chunk":
+          if (audioTurnRef.current === null) break;  // dropped utterance
           audioChunksRef.current.push(data.data);
           break;
         case "audio_end": {
+          if (audioTurnRef.current === null) {
+            audioChunksRef.current = [];
+            break;
+          }
+          audioTurnRef.current = null;
           const chunks = audioChunksRef.current;
           if (chunks.length > 0) {
             const decoded = [];

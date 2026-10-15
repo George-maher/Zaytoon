@@ -152,16 +152,30 @@ OUTBOUND: Dict[str, FrameSpec] = _specs(
     FrameSpec("error", "out", required=("content",), optional=("code", "detail")),
 )
 
+def _core_event_names() -> FrozenSet[str]:
+    """Every frame name the core bus can put on the wire.
+
+    Derived from :class:`core.events.CoreEventType` rather than listed here.
+    The list used to be a hand-written copy, which meant an event added to the
+    bus was a frame the schema did not know about — and the *desktop* shell,
+    which compares its own vocabulary against this set, would then have been
+    told to expect a subset that never matched reality in either direction.
+
+    Falls back to an empty set if the import fails, which makes every core event
+    an unknown frame: a warning, never a dropped frame (`validate_outbound`
+    returns before the lookup only for known passthroughs, and an unknown type
+    is reported, not refused).
+    """
+    try:
+        from core.events import CoreEventType
+
+        return frozenset(member.value for member in CoreEventType)
+    except Exception:  # pragma: no cover - only if `core` is missing entirely
+        return frozenset()
+
+
 #: Frame types that arrive from the core bus and keep their dotted names.
-CORE_EVENT_PASSTHROUGH: FrozenSet[str] = frozenset({
-    "task.created", "task.updated", "task.step", "task.log", "task.completed",
-    "file.changed", "terminal.output",
-    "tool.started", "tool.output", "tool.completed", "tool.failed",
-    "model.started", "model.token", "model.completed", "model.failed",
-    "permission.requested", "permission.resolved", "error",
-    "skill.installed", "skill.removed", "provider.changed", "reminder.fired",
-    "memory.compacted", "session.cleaned",
-})
+CORE_EVENT_PASSTHROUGH: FrozenSet[str] = _core_event_names()
 
 #: Frames that exist for exactly one direction. Guards against the classic
 #: copy-paste where the server starts emitting a client's frame type.

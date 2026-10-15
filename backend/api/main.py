@@ -1703,6 +1703,16 @@ async def stop_process(process_id: str):
     return {"stopped": True, "status": result.get("status"), "process": result}
 
 
+def _tts_reason(tts) -> str:
+    """Why speech is (or is not) usable, in one sentence a UI can show."""
+    if not tts.available:
+        return "edge-tts is not installed"
+    last = getattr(tts, "last_stream_error", None)
+    if isinstance(last, str) and last:
+        return f"the last synthesis failed: {last}"
+    return ""
+
+
 @app.get("/voice/status")
 async def voice_status():
     """What the voice pipeline can actually do right now, and why not.
@@ -1734,11 +1744,15 @@ async def voice_status():
             "reason": stt_reason,
         },
         "tts": {
-            "ready": tts.available,
-            "reason": None if tts.available else "edge-tts is not installed",
+            "ready": bool(tts.available),
+            "reason": _tts_reason(tts),
+            # The last real failure, by exception class only. Distinguishes the
+            # three states a user cannot otherwise tell apart — the package is
+            # missing, the service is unreachable, the voice was refused — and
+            # does it without putting an exception's text on the wire.
             "last_stream_error": getattr(tts, "last_stream_error", None),
-            # edge-tts is an online service; say so where a UI can read it
-            # instead of implying the whole voice path is local.
+            # edge-tts is an online service; saying so here is the difference
+            # between "voice is broken" and "this machine is offline".
             "network": True,
         },
         "voices": routing.describe(),

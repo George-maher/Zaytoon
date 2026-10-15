@@ -138,6 +138,12 @@ class ZaytoonApp:
         self.language = "en"
         self._ids = itertools.count(1)
         self._status_from_voice: str | None = None
+        #: The turn the shell is following and whether its audio is being
+        #: suppressed. Declared here rather than created on first use: a shell
+        #: that receives `audio_chunk` before any anchor frame would otherwise
+        #: be reading an attribute that does not exist yet.
+        self._latest_response_id: str | None = None
+        self._ignore_audio = False
 
         #: One state machine feeding the header pill, the core and the status
         #: line (see ``app/states.py``).
@@ -437,6 +443,11 @@ class ZaytoonApp:
         status string and they drifted apart.
         """
         self.tracker.on_event(event)
+        # Which turn the shell is following. Updated only by the frames that
+        # *establish* a turn, so a superseded turn's tail cannot move it back
+        # and the audio guard below compares against the right id.
+        if event.is_anchor:
+            self._latest_response_id = event.response_id
         try:
             self._route_event(event)
         finally:
@@ -523,15 +534,30 @@ class ZaytoonApp:
                 self.language = detected
             return
         if etype is protocol.EventType.AUDIO_START:
+            # Speech belonging to a turn that has been replaced is dropped
+            # whole. The server stops synthesising at the next chunk boundary,
+            # but chunks already on the socket still arrive, and the shell plays
+            # them as they land — so without this the previous answer is spoken
+            # over the one the user is waiting for.
+            turn = event.response_id
+            latest = getattr(self, "_latest_response_id", None)
+            self._ignore_audio = bool(turn and latest and turn != latest)
             return
         if etype is protocol.EventType.AUDIO_CHUNK:
             import base64
 
+            if getattr(self, "_ignore_audio", False):
+                return
             try:
                 if self.player is not None:
                     self.player.play(base64.b64decode(event.data.get("data", "")))
             except Exception as exc:  # pragma: no cover
                 logger.debug("bad audio chunk: %s", exc)
+            return
+        if etype is protocol.EventType.AUDIO_END:
+            # The utterance is over either way: a dropped one must not leave the
+            # next turn's audio ignored.
+            self._ignore_audio = False
             return
         if etype is protocol.EventType.WAKE_WORD:
             if event.data.get("detected"):
