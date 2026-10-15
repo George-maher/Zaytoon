@@ -264,6 +264,81 @@ describe('inbound: streaming tokens', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('inbound: model routing', () => {
+  // `model.completed` is emitted per *attempt*, so a turn that fell back
+  // produces several. It carries the turn's trace id, which is what makes the
+  // per-message badge a report rather than a guess.
+  it('stamps the turn the attempt names, not whatever is streaming', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'answer', response_id: 'r1', trace_id: 't1' })
+      socket.emit({
+        type: 'model.completed',
+        trace_id: 't1',
+        model: 'qwen/qwen3-30b-a3b:free',
+        provider: 'openrouter',
+        attempt: 2,
+        latency_ms: 812,
+      })
+    })
+
+    const [bubble] = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubble.model).toBe('qwen/qwen3-30b-a3b:free')
+    expect(bubble.provider).toBe('openrouter')
+    expect(bubble.attempt).toBe(2)
+    expect(bubble.latencyMs).toBe(812)
+    // The answer is untouched: this is provenance, not generation.
+    expect(bubble.content).toBe('answer')
+  })
+
+  it('does not relabel a live answer when a replaced turn reports late', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'old ', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r2', trace_id: 't2' })
+      socket.emit({ type: 'token', content: 'new answer', response_id: 'r2', trace_id: 't2' })
+      // Arrives after the client moved on, as a fallback chain would.
+      socket.emit({
+        type: 'model.completed',
+        trace_id: 't1',
+        model: 'stale/model:free',
+        provider: 'openrouter',
+        attempt: 1,
+        latency_ms: 4000,
+      })
+    })
+
+    const bubbles = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubbles.map((m) => m.content)).toEqual(['old ', 'new answer'])
+    expect(bubbles[0].model).toBe('stale/model:free')
+    expect(bubbles[1].model).toBeUndefined()
+  })
+
+  it('leaves a badge off an attempt that names no turn', async () => {
+    // A model event outside any turn (a REST call, a health probe) has no
+    // trace. Attributing it to the last answer would be the client inventing
+    // provenance the backend did not report.
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'answer', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'model.completed', model: 'some/model:free', provider: 'openrouter' })
+    })
+
+    const [bubble] = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubble.model).toBeUndefined()
+    // The global banner still reports it, which is where an unattributed
+    // attempt belongs.
+    expect(result.current.modelInfo.model).toBe('some/model:free')
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('inbound: sources', () => {
   // The `sources` frame carries no response_id, so association is by wire
   // order: it lands after the prose and before the final `message`.

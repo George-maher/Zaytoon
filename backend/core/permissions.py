@@ -79,6 +79,15 @@ _PERMISSION_LABELS: Dict[Permission, str] = {
 
 ALL_PERMISSIONS: FrozenSet[Permission] = frozenset(Permission)
 
+#: Ordered so "the stricter of two tiers" is a comparison rather than a table
+#: lookup at every call site. Unknown tiers rank lowest, which is the safe
+#: direction only because :func:`floor_for` returns nothing for them.
+_TIER_RANK: Dict[str, int] = {
+    PERMISSION_SAFE: 0,
+    PERMISSION_CONFIRM: 1,
+    PERMISSION_DANGEROUS: 2,
+}
+
 
 # ---------------------------------------------------------------------------
 # Tier → baseline permissions
@@ -112,19 +121,48 @@ def _tier_for(action: str) -> str:
     return RiskAssessor.permission_for(action)
 
 
-def required_for(action: str, extra: Optional[Iterable[str]] = None) -> FrozenSet[Permission]:
+def floor_for(tier: str) -> FrozenSet[Permission]:
+    """The permissions a tier implies on its own.
+
+    Public because two other places need it and neither should reach into
+    ``_TIER_FLOOR``: the tool gate, which reconciles the tier a tool *declares*
+    with the tier its *name* implies before asking what it may do, and the
+    skill loader, which already subtracts this set when reporting gaps.
+    """
+    return _TIER_FLOOR.get((tier or "").strip().lower(), frozenset())
+
+
+def required_for(
+    action: str,
+    extra: Optional[Iterable[str]] = None,
+    tier: Optional[str] = None,
+) -> FrozenSet[Permission]:
     """The permissions a tool action needs.
 
-    Three inputs, unioned: the tier's floor, the capability table keyed on the
-    action name (including aliases, because ``permission_for`` can be handed
-    one), and whatever the tool itself declares.
+    Inputs, unioned: the tier's floor, the capability table keyed on the action
+    name (including aliases, because ``permission_for`` can be handed one), and
+    whatever the tool itself declares.
+
+    ``tier`` is for callers that already know the effective tier — the tool gate
+    does, because it reconciled the tool's ``permission`` attribute with the
+    name table before asking. Passing it matters: a tool whose *name* is in no
+    table but which declares ``confirm`` gets the confirm floor only this way,
+    and that is exactly the shape of the ``play_media`` bug (declared
+    ``confirm``, absent from every table, so the tables said ``safe``). Omitted,
+    the answer is derived from the name alone and is unchanged.
     """
     name = (action or "").strip().lower()
     if not name:
         return frozenset()
 
-    tier = _tier_for(name)
-    perms = set(_TIER_FLOOR.get(tier, frozenset()))
+    effective = _tier_for(name)
+    if tier:
+        # Never *lower* the tier: a caller may report a stricter tier than the
+        # name implies, and nothing may report a looser one.
+        declared = tier.strip().lower()
+        if _TIER_RANK.get(declared, 0) > _TIER_RANK.get(effective, 0):
+            effective = declared
+    perms = set(floor_for(effective))
     perms |= _capabilities_for(name)
 
     for value in extra or ():
@@ -294,6 +332,7 @@ def describe() -> List[Dict[str, str]]:
 __all__ = [
     "ALL_PERMISSIONS",
     "SKILL_FLOOR_GRANTS",
+    "floor_for",
     "gaps_for",
     "DECISION_ALLOW",
     "DECISION_ASK",

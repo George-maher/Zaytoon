@@ -153,18 +153,109 @@ detection is at construction time, not at run time.
 
 ### Permission vocabulary (§37)
 
-Ten named permissions, derived from the existing tier so the two cannot drift:
+Thirteen named permissions, derived from the existing tier so the two cannot
+drift:
 
 ```text
 filesystem.read    filesystem.write   filesystem.delete
 process.execute    process.manage     network.request
 browser.control    git.write          git.destructive
-system.modify
+system.modify      vm.discover        vm.manage        vm.guest.exec
 ```
 
-`permissions.required_for(tool)` is a pure function of the tool's declared
-tier and name. A tool may *add* permissions beyond its tier (a `run_code` tool
-that also writes needs both) but never remove one.
+`permissions.required_for(action, extra, tier)` is a pure function of the
+tool's name, whatever it declares, and the tier the gate already reconciled.
+A tool may *add* permissions beyond its tier (a `run_code` tool that also
+writes needs both) but never remove one, and the `tier` argument can only ever
+raise the requirement — never lower it.
+
+### Permission *decisions*, and where they are enforced
+
+The vocabulary above is what a tool *needs*. A user's answer to each one is a
+separate thing, and the interesting question is not where it is stored but
+where it is read.
+
+**One store.** `permission_grants` in the core database, written by
+`POST /permissions/{permission}` (`core/api/registry_api.py`) and read by
+`core/grants.py`. There is exactly one table; the API and the gate cannot
+disagree about what the user chose.
+
+**One enforcement point.** `tools/registry.py` is the only path to a tool's
+`execute`, and the check sits there, in this order:
+
+```text
+validate()            malformed input, unconditional sandbox blocks
+assess()              the tool's declared tier reconciled with the tables,
+                      taking the stricter of the two
+denied()              the user's own decisions — refuse here, before asking
+approval gate         confirm/dangerous tiers prompt; read-only runs
+execute()
+```
+
+**`deny` before the prompt, on purpose.** Asking a user to approve something
+they have already forbidden invites them to overrule themselves, and the
+result is indistinguishable from the setting not existing. A denial is also
+reported as `denied: true` with the permission names, so the agent loop can
+tell "the user turned this off" from "this failed" — a model told *failed*
+retries, or reaches the same capability through another tool
+(`agents/engine.py:render_observation`).
+
+**`allow` does not skip the prompt.** It is stored and displayed, and a
+`confirm`-tier action still asks. A pre-approval that suppresses the human
+decision removes an authorisation control; that trade is not made here, and a
+test asserts the negative case so a future edit cannot make it silently.
+
+**A storage failure degrades to the previous policy, never to more access.**
+An unreadable database means "no decisions" — the tier gate still runs, and
+nothing above read-only happens without an approval prompt.
+
+### Turn identity: one turn, one id, on every client
+
+A turn is the unit of an answer, and three things are scoped to it: which
+websocket frames may touch it, which audio may be spoken, and which model
+attempt is reported as having served it.
+
+**Minted once.** `api/websocket.py:_begin_turn` cancels whatever was running,
+resets the session state and returns the new `response_id`. Everything that
+runs afterwards is handed that id rather than reading
+`state.current_response_id` again — the earlier code read the id at the
+transport *before* the turn reset the state, so a turn's own frames came out
+labelled with the *previous* turn's id, and the client's guard against stale
+frames was pointed at the wrong target.
+
+**Anchors, not guesses.** Both clients update "the newest turn" only from
+frames that begin one — `intent`, `message`, `status`, `subtitle` in the
+browser (`ANCHOR_FRAMES`), the same four in the shell
+(`ANCHOR_EVENT_TYPES`). An allow-list rather than a subtraction: a frame that
+carries a payload *and* a stale id (`audio_start`, above all) must not drag the
+pointer back to the turn being discarded, and a missed exclusion fails
+silently.
+
+**Audio follows the turn.** A superseded turn's `audio_start` marks the client
+to ignore that utterance's chunks and end frame, so a previous answer is never
+spoken over the one the user is waiting for.
+
+**Provenance follows the turn.** `model.started`/`model.completed`/
+`model.failed` carry the turn's `trace_id`, bound per turn by the transport
+(`common/tracing.py`). The browser stamps the model that answered onto *that*
+turn's bubble, so a late attempt from a replaced turn cannot relabel the answer
+on screen. Outside a turn the field is empty rather than invented.
+
+### WebSocket contract
+
+`api/ws_protocol.py` declares every frame — direction, required fields,
+optional fields, size ceiling — and the tests are what enforce it: a frame
+type that nobody declared fails the suite. The desktop shell keeps its own
+copy of the vocabulary (`desktop/app/protocol.py`) and
+`desktop/tests/test_wire_protocol.py` compares the two, so the shell cannot
+drift into rendering `unknown` for a frame the backend started sending.
+
+Two rules that came out of the audit:
+
+* **A frame is validated before it is parsed.** Oversized audio is refused
+  before base64 decoding, not after.
+* **A replayed frame is not a second turn.** `client_msg_id` is the dedupe
+  key; a message without one is a new message even if its text is identical.
 
 ### Provider registry (§17–§20)
 

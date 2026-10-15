@@ -691,6 +691,14 @@ class LLMClient:
             "request_id": record.request_id,
             "attempt": record.attempt,
             "latency_ms": record.latency_ms,
+            # The turn this attempt belongs to, when one is bound (the transport
+            # sets it in `_run_turn`, so every model call made inside a turn sees
+            # it). Without it a client can only guess which of two overlapping
+            # turns an attempt served, and a badge on the wrong answer is worse
+            # than no badge: it is a claim about routing that happens to be
+            # false. `request_id` alone cannot do this — a request may contain
+            # several attempts, and nothing maps a request id back to a turn.
+            "trace_id": get_trace_id(),
         }
         if record.outcome == "ok":
             bus.publish(
@@ -1504,6 +1512,10 @@ class LLMClient:
         bus.publish(
             CoreEventType.MODEL_STARTED,
             request_id=rid, tier=tier, provider=config.PROVIDER,
+            # Same join key as the outcome events below, so a client can tell
+            # "an attempt is starting for the turn I am showing" from "for the
+            # turn I just replaced".
+            trace_id=get_trace_id(),
         )
         required = list(contract.required_capabilities)
         # One budget for the whole request. The registry path and the
@@ -1815,6 +1827,7 @@ class LLMClient:
         bus.publish(
             CoreEventType.MODEL_STARTED,
             request_id=rid, tier=tier, provider=config.PROVIDER,
+            trace_id=get_trace_id(),
         )
         required = list(contract.required_capabilities)
         # Shared across the registry pass and the chain, as in `complete()`:

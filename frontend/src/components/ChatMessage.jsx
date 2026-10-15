@@ -17,6 +17,11 @@ function isArabic(text) {
  * - **Streaming** shows a live cursor and a STREAM marker, and gets one
  *   entrance animation on mount (`hud-msg-enter`) — no per-token animation,
  *   so a long reply does not flicker as it grows.
+ * - **Routing badge** names the model the backend reported serving this
+ *   answer (`model.completed` on the core bus, joined to the turn by trace
+ *   id). Absent when the backend named nothing: an answer that came from a
+ *   non-LLM path has no model, and showing the configured default would be a
+ *   claim about routing nobody made.
  * - **System notices** (errors, reminders, confirmations) are centred,
  *   monospace and non-destructive: an error is a strip with a red spine and
  *   `role="alert"`, not a modal or a red panel that hides the transcript.
@@ -185,6 +190,37 @@ export default memo(function ChatMessage({ msg, language }) {
               style={{ color: "var(--hud-text-mute)", fontSize: "var(--font-xs)", letterSpacing: "0.16em" }}
             >
               ▍STREAM
+            </span>
+          )}
+          {!isUser && (msg.model || msg.provider) && (
+            // Which model actually answered *this* answer, as observed by the
+            // backend's own routing events. `dir="ltr"` because a model id is
+            // latin and identifier-like: inside an Arabic bubble it would
+            // otherwise be reordered against the punctuation around it.
+            //
+            // Rendered only when the backend named a model — never a
+            // placeholder, and never the configured default, which is a
+            // different claim from "this is what served the reply".
+            <span
+              dir="ltr"
+              className="font-mono"
+              title={[
+                msg.provider ? `${language === "ar" ? "المزود" : "provider"}: ${msg.provider}` : null,
+                msg.attempt ? `${language === "ar" ? "المحاولة" : "attempt"} ${msg.attempt}` : null,
+                typeof msg.latencyMs === "number" ? `${Math.round(msg.latencyMs)} ms` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              style={{
+                color: "var(--hud-text-faint, var(--hud-text-mute))",
+                fontSize: "var(--font-xs)",
+                maxWidth: "16ch",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {msg.model || msg.provider}
             </span>
           )}
           {msg.ts ? (

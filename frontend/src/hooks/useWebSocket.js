@@ -108,6 +108,49 @@ function newAssistantBubble(data) {
   };
 }
 
+/**
+ * Stamp the turn a `model.completed` frame belongs to.
+ *
+ * Joined on `trace_id` rather than "whatever is streaming right now": the
+ * backend tags each attempt with the turn's trace, so a late attempt from a
+ * turn the user has already replaced cannot relabel the answer on screen. A
+ * badge that names the wrong model is worse than no badge — it is a claim
+ * about routing that happens to be false, and it is exactly the claim a user
+ * checks when a reply looks wrong.
+ *
+ * Returns `prev` unchanged when nothing matches or nothing changed, so a
+ * fallback chain that produced four attempts does not re-render four times.
+ */
+function modelBadgeFor(prev, data) {
+  const trace = data.trace_id;
+  if (!trace) return prev;
+  for (let i = prev.length - 1; i >= 0; i -= 1) {
+    const msg = prev[i];
+    if (msg.role !== "assistant" || msg.trace_id !== trace) continue;
+    const next = {
+      ...msg,
+      model: data.model || msg.model || null,
+      provider: data.provider || msg.provider || null,
+      latencyMs: typeof data.latency_ms === "number" ? data.latency_ms : msg.latencyMs ?? null,
+      attempt: data.attempt || msg.attempt || null,
+      toolCalled: typeof data.tool_called === "boolean" ? data.tool_called : msg.toolCalled ?? null,
+    };
+    if (
+      next.model === msg.model &&
+      next.provider === msg.provider &&
+      next.latencyMs === msg.latencyMs &&
+      next.attempt === msg.attempt &&
+      next.toolCalled === msg.toolCalled
+    ) {
+      return prev;
+    }
+    const out = [...prev];
+    out[i] = next;
+    return out;
+  }
+  return prev;
+}
+
 export default function useWebSocket() {
   const [messages, setMessages] = useState([]);
   const [isListening, setIsListening] = useState(false);
@@ -793,6 +836,10 @@ export default function useWebSocket() {
             ok: true,
             pending: false,
           }));
+          // …and on the bubble itself, when this attempt names a turn we are
+          // showing. The banner says "the last thing that ran"; the badge says
+          // "this answer".
+          if (data.trace_id) setMessages((prev) => modelBadgeFor(prev, data));
           break;
         case "model.failed":
           setModelInfo((prev) => ({
