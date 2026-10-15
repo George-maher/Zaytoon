@@ -3,11 +3,12 @@ import re
 import time
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, UploadFile, File
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -32,6 +33,8 @@ from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
 from tools.metrics import get_tool_metrics
 from common.reporting import client_error, redact, safe_error
+from common.audit import record as audit_record
+from api.ws_security import is_loopback
 from common.tracing import new_trace_id, reset_trace_id, set_trace_id
 
 from api.websocket import (
@@ -291,10 +294,15 @@ async def lifespan(app):
     loop = asyncio.get_running_loop()
 
     async def _load_stt():
-        available = await loop.run_in_executor(None, lambda: stt.available)
+        # `ensure_loaded`, not `available`: the property is a non-blocking fact
+        # now (`voice/stt.py`), so the one place that *wants* to spend the time
+        # on a worker thread has to say so. Reading the property here would
+        # always report False and the model would never be loaded until the
+        # first utterance asked for it.
+        available = await loop.run_in_executor(None, stt.ensure_loaded)
         if available:
             logger.info("STT (Whisper %s) loaded at startup", config.WHISPER_MODEL)
-        elif stt._load_error:
+        elif stt.load_error:
             logger.warning("STT unavailable - voice input disabled")
 
     asyncio.create_task(_load_stt())
@@ -648,7 +656,16 @@ async def health():
             "confirm_timeout": config.TOOL_CONFIRM_TIMEOUT,
             "always_confirm": sorted(risk_assessor.always_confirm),
         },
-        "voice": {"stt": stt.available, "tts": tts._available},
+        # Facts, not probes: `stt.loaded` is a plain attribute read, so a
+        # health poll can no longer start a Whisper model load (which used to
+        # be what `stt.available` did, on the event loop, on every poll).
+        "voice": {
+            "stt": stt.loaded,
+            "stt_loading": stt.loading,
+            "stt_error": stt.load_error,
+            "tts": tts.available,
+            "tts_error": getattr(tts, "last_stream_error", None),
+        },
         "workspace": config.describe_workspace(),
         "tools_loaded": len(tool_executor.list_tools()),
         "tools_by_tier": tool_executor.tools_by_tier(),
@@ -1294,11 +1311,32 @@ async def probe_model(data: dict):
 # ---------------------------------------------------------------------------
 
 @app.post("/devices/pair")
-async def pair_device(data: dict):
-    """Pair a new remote device. Returns a one-time token."""
+async def pair_device(data: dict, request: Request):
+    """Pair a device. Returns a one-time token.
+
+    This route used to take ``scope`` straight from the body with no caller
+    check at all, which meant anything that could reach the port could mint
+    itself a ``full_control`` credential: a page in the user's browser is not
+    subject to CORS for a *form-encoded* POST it can send cross-origin, and the
+    server bound to ``127.0.0.1`` is reachable from every tab on the machine.
+    Device pairing is where the whole authorisation model starts, so an
+    unauthenticated caller must not be able to start it.
+
+    The policy, in the order it is applied:
+
+    * the machine's own user (loopback) may pair, because they already have the
+      desktop and the filesystem — asking them for a secret they would have to
+      read out of their own environment is a step that only inconveniences the
+      owner;
+    * anyone else must present ``ZAYTOON_PAIRING_SECRET``, and with no secret
+      configured *remote pairing is refused entirely* rather than left open;
+    * ``full_control`` is reserved for the local machine: no token, secret or
+      argument can grant remote control of the desktop;
+    * the default scope stays ``chat`` when the request does not ask for more.
+    """
     device_id = (data.get("device_id") or "").strip()
     device_name = (data.get("device_name") or "").strip()
-    scope_str = (data.get("scope") or "chat").strip()
+    scope_str = (data.get("scope") or PermissionScope.CHAT.value).strip()
 
     if not device_id:
         raise HTTPException(400, "device_id is required")
@@ -1311,8 +1349,56 @@ async def pair_device(data: dict):
         valid = [s.value for s in PermissionScope]
         raise HTTPException(400, f"Invalid scope. Valid: {valid}")
 
+    requester = request.client.host if request.client else ""
+    local = is_loopback(requester)
+    configured_secret = str(config.PAIRING_SECRET or "")
+    supplied = (
+        str(data.get("pairing_secret") or "").strip()
+        or (request.headers.get("x-pairing-secret") or "").strip()
+    )
+
+    if not local:
+        if not configured_secret:
+            logger.warning(
+                "Refused device pairing from %s: no ZAYTOON_PAIRING_SECRET is "
+                "configured, so only this machine may pair a device", requester
+            )
+            raise HTTPException(
+                403,
+                "Pairing is limited to this machine. Set ZAYTOON_PAIRING_SECRET "
+                "to allow a remote device to pair.",
+            )
+        if not secrets.compare_digest(supplied, configured_secret):
+            logger.warning("Refused device pairing from %s: wrong pairing secret", requester)
+            raise HTTPException(403, "Invalid pairing secret")
+
+    if scope is PermissionScope.FULL_CONTROL and not local:
+        logger.warning(
+            "Refused full_control pairing from %s: that scope is local-only", requester
+        )
+        raise HTTPException(
+            403, "full_control can only be granted to a device on this machine."
+        )
+
     auth = get_device_auth()
     token, permission = auth.pair_device(device_id, device_name, scope)
+    logger.info(
+        "Paired device %s (%s) scope=%s local=%s",
+        device_id, device_name, scope.value, local,
+    )
+    # A credential being created is an auditable event, whatever the scope —
+    # and the record deliberately carries no token material.
+    try:
+        await audit_record(
+            tool="devices.pair",
+            user_request=f"pair {device_name}",
+            command={"device_id": device_id, "scope": scope.value, "local": local},
+            risk="high" if scope is not PermissionScope.CHAT else "medium",
+            approved=local,
+            success=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - auditing never blocks pairing
+        safe_error(exc, operation="devices.pair.audit", component="api")
 
     return {
         "token": token,  # Only returned once - client must store it
@@ -1615,6 +1701,49 @@ async def stop_process(process_id: str):
                      "Only processes Zaytoon started can be stopped.",
         }
     return {"stopped": True, "status": result.get("status"), "process": result}
+
+
+@app.get("/voice/status")
+async def voice_status():
+    """What the voice pipeline can actually do right now, and why not.
+
+    The honest-capability probe: three booleans a UI can trust (``stt_ready``,
+    ``tts_ready``, ``tts_streaming``), a human-readable reason for each thing
+    that is missing, and the voices that would be used. It exists because the
+    alternative is a microphone button that looks identical whether Whisper
+    loaded, failed to import, or is still downloading — the user's only signal
+    was that nothing happened.
+
+    Deliberately *not* a live probe: it reports state, it does not start a load
+    or open a connection to the speech service. Owning a button that silently
+    blocks a request for thirty seconds is how a settings page becomes a
+    support ticket.
+    """
+    from voice import routing
+
+    stt_reason = stt.load_error
+    if not stt.loaded and not stt.loading and not stt_reason:
+        stt_reason = "not loaded yet"
+    return {
+        "stt": {
+            "ready": stt.loaded,
+            "loading": stt.loading,
+            "model": config.WHISPER_MODEL,
+            "device": config.WHISPER_DEVICE,
+            "compute_type": config.WHISPER_COMPUTE,
+            "reason": stt_reason,
+        },
+        "tts": {
+            "ready": tts.available,
+            "reason": None if tts.available else "edge-tts is not installed",
+            "last_stream_error": getattr(tts, "last_stream_error", None),
+            # edge-tts is an online service; say so where a UI can read it
+            # instead of implying the whole voice path is local.
+            "network": True,
+        },
+        "voices": routing.describe(),
+        "languages": ["ar", "en"],
+    }
 
 
 @app.get("/audit")

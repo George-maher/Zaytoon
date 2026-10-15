@@ -115,6 +115,12 @@ export default function useWebSocket() {
   // `api/websocket.py`. They live here rather than in a second hook because
   // they arrive on the *same* frames: a socket per concern would double the
   // connections and let the two disagree about ordering.
+  // What the backend actually used for the reply in flight (the `model.*`
+  // core events). Held per turn and attached to the assistant bubble, because
+  // "which model answered this" is a property of the answer, not of the
+  // session: a fallback mid-conversation moves it, and a settings page that
+  // showed one global value would be describing a different request.
+  const [modelInfo, setModelInfo] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [activeTask, setActiveTask] = useState(null);
   const [terminalLines, setTerminalLines] = useState({});
@@ -135,6 +141,12 @@ export default function useWebSocket() {
   const isSpeakingRef = useRef(false);
   const isProcessingRef = useRef(false);
   const renderedResponseIds = useRef(new Set());
+  //: The turn the transcript is currently showing. Every frame that carries a
+  //: `response_id` is checked against it, so a superseded turn's tokens or
+  //: audio cannot be appended to the reply the user is actually reading. The
+  //: backstop for the server-side guard: the two agree because the server
+  //: stamps the id on the first frame of each turn.
+  const activeResponseIdRef = useRef(null);
   const renderedContentHashes = useRef(new Set());
   // Sources for the turn in flight: set by the `sources` frame (which the
   // backend sends *before* the final `message`) and consumed when that
@@ -331,6 +343,18 @@ export default function useWebSocket() {
           setStatus("thinking");
           break;
         case "token":
+          // A token from a turn this client is no longer showing is dropped.
+          // It happens when a second message supersedes the first: the server
+          // stops the old turn, but frames already in flight on the socket
+          // arrive after the new turn's first token, and appending them
+          // interleaves two answers into one bubble.
+          if (data.response_id) {
+            if (!activeResponseIdRef.current) {
+              activeResponseIdRef.current = data.response_id;
+            } else if (activeResponseIdRef.current !== data.response_id) {
+              break;
+            }
+          }
           setIsTyping(true);
           setMessages((prev) => {
             const last = prev[prev.length - 1];
@@ -353,8 +377,29 @@ export default function useWebSocket() {
           });
           break;
         case "message": {
+          // A *final* reply ends its turn. Two cases must be told apart, and
+          // the turn's own state is what distinguishes them:
+          //
+          //   * a different id arriving while this client is still streaming
+          //     another turn is that other turn's late reply — the server
+          //     stops a superseded turn, but frames already on the socket
+          //     arrive afterwards, and rendering one would print an answer to
+          //     a question the user has moved past;
+          //   * a different id arriving while nothing is streaming is simply
+          //     the next turn, which must be rendered. (Comparing ids alone
+          //     cannot tell these apart: ids carry no order, and a client that
+          //     guessed would either drop every second answer or accept every
+          //     stale one.)
+          if (data.response_id && activeResponseIdRef.current
+              && activeResponseIdRef.current !== data.response_id
+              && isProcessingRef.current) {
+            break;
+          }
           setIsTyping(false);
           isProcessingRef.current = false;
+          // The turn is over either way, so nothing is "active" any more; the
+          // per-turn dedupe set below is what remembers the id.
+          activeResponseIdRef.current = null;
           
           // Dual-layer deduplication: response_id (primary) + content hash (fallback)
           const responseId = data.response_id;
@@ -630,6 +675,47 @@ export default function useWebSocket() {
         // alongside it. Unrecognised core events fall through the switch
         // silently, which is the point: a newer backend adding an event must
         // not break an older client.
+        // -- model routing (real, from the core bus) ---------------------
+        // `services/llm_client.py` publishes one `model.started` per call and
+        // one outcome event per *attempt*, so a call that fell back produces
+        // several. The last one to arrive is the attempt that actually served
+        // the reply; a failure is recorded as a failure rather than being
+        // dropped, because "which model answered" is exactly the question a
+        // user asks when the reply looks wrong. This is observation of the
+        // backend's real routing — no provider list is invented here.
+        case "model.started":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            provider: data.provider || (prev && prev.provider) || null,
+            tier: data.tier || (prev && prev.tier) || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            pending: true,
+          }));
+          break;
+        case "model.completed":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            model: data.model || null,
+            provider: data.provider || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            latencyMs: typeof data.latency_ms === "number" ? data.latency_ms : null,
+            attempt: data.attempt || null,
+            toolCalled: data.tool_called || null,
+            ok: true,
+            pending: false,
+          }));
+          break;
+        case "model.failed":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            model: data.model || (prev && prev.model) || null,
+            provider: data.provider || (prev && prev.provider) || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            reason: data.reason || data.outcome || null,
+            ok: false,
+            pending: false,
+          }));
+          break;
         case "task.created":
           setTasks((prev) => [data.task, ...prev.filter((t) => t.id !== data.task?.id)]);
           setActiveTask(data.task);
@@ -1162,6 +1248,7 @@ if (rms > threshold) {
     respondToConfirmation,
     cancelPendingConfirmation,
     currentTraceId,
+    modelInfo,
     // Core runtime
     tasks,
     activeTask,

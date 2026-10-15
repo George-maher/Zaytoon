@@ -30,6 +30,7 @@ import asyncio
 import fnmatch
 import logging
 import os
+import tempfile
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -325,8 +326,14 @@ def write_file(
             logger.warning("Could not back up %s: %s", path, exc)
             backup_path = None
 
-    with open(target, "w", encoding="utf-8", newline="") as handle:
-        handle.write(content or "")
+    # Atomic replace, not a truncated overwrite. `open(target, "w")` empties the
+    # file first, so a crash, a full disk, or any other reader (the file panel,
+    # an editor, the agent's own `file_read` in a parallel turn) between the
+    # truncate and the last `write` sees a partially-written file — and the
+    # original content is already gone. Writing beside the target and renaming
+    # over it makes the swap indivisible: a reader sees either the old file or
+    # the new one, and a failure leaves the old one intact.
+    _atomic_write(target, content or "")
 
     return {
         "path": _relative(target, root),
@@ -335,6 +342,39 @@ def write_file(
         "modified": _iso(os.path.getmtime(target)),
         "language": language_for(target),
     }
+
+
+def _atomic_write(target: str, text: str) -> None:
+    """Write ``text`` to ``target`` so no reader ever sees a partial file.
+
+    Same directory (so ``os.replace`` is a rename on one filesystem, which is
+    what makes it atomic), same mode as the file it replaces, and cleaned up on
+    any failure. ``os.replace`` overwrites on both POSIX and Windows, unlike
+    ``os.rename`` there.
+    """
+    directory = os.path.dirname(target) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.path.isfile(target):
+            try:
+                # Keep the existing permissions rather than the 0600 mkstemp
+                # gives us: a script that loses its +x is a surprising failure.
+                os.chmod(tmp_path, os.stat(target).st_mode & 0o7777)
+            except OSError:
+                pass
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def make_dir(path: str, root: Optional[str] = None, parents: bool = True) -> Dict[str, Any]:

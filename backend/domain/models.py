@@ -131,6 +131,13 @@ class SessionState:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     current_task: Optional[asyncio.Task] = None
     tts_task: Optional[asyncio.Task] = None
+    #: The in-flight microphone utterance (transcribe → dispatch). Its own
+    #: handle, so a stop command reaches work that is sitting inside the STT
+    #: call rather than only the turn it has not created yet.
+    audio_task: Optional[asyncio.Task] = None
+    #: When the socket last sent anything. Read by the heartbeat sweep; it is
+    #: evidence, not a policy input.
+    last_seen_ts: float = 0.0
     is_responding: bool = False
     spoken_tracker: SpokenSentenceTracker = field(default_factory=SpokenSentenceTracker)
     current_response_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
@@ -139,6 +146,22 @@ class SessionState:
     confirmation_manager: Optional[object] = None
     _sent_hashes: set = field(default_factory=set)
     _created_at: float = field(default_factory=time.time)
+
+    def is_current(self, response_id: Optional[str]) -> bool:
+        """Whether ``response_id`` is still the turn this session is running.
+
+        The guard against a *stale* worker — a turn that was cancelled,
+        superseded by a newer utterance, or orphaned by a reconnect — emitting
+        frames after the fact. `reset()` mints a new id at the start of every
+        turn, so anything holding an older one is by definition no longer the
+        current turn: its tokens would append to the wrong bubble and its audio
+        would play over the answer the user actually asked for.
+
+        An unknown/absent id returns False for the same reason: the transport
+        always stamps the id it is running with, so a missing one is a bug in
+        the caller rather than a blanket permission to write.
+        """
+        return bool(response_id) and response_id == self.current_response_id
 
     def cancel(self):
         if self.confirmation_manager is not None:
@@ -157,10 +180,19 @@ class SessionState:
                     "a dead session", type(e).__name__, e,
                 )
         self.cancel_event.set()
-        if self.tts_task and not self.tts_task.done():
-            self.tts_task.cancel()
-        if self.current_task and not self.current_task.done():
-            self.current_task.cancel()
+        # Never cancel the caller. The audio handler calls `cancel()` itself —
+        # it is superseding whatever ran before the recording — and the audio
+        # task *is* `state.audio_task`, so a blanket cancel killed the handler
+        # in the middle of its own sequence: the transcript arrived on the wire
+        # and the turn behind it never started, with nothing logged, because
+        # the cancellation landed between two awaits of the same coroutine.
+        try:
+            caller = asyncio.current_task()
+        except RuntimeError:  # no running loop (a synchronous teardown)
+            caller = None
+        for handle in (self.audio_task, self.tts_task, self.current_task):
+            if handle is not None and handle is not caller and not handle.done():
+                handle.cancel()
 
     def reset(self):
         self.cancel_event.clear()
@@ -169,6 +201,14 @@ class SessionState:
         self.spoken_tracker.clear()
 
     def is_duplicate(self, content: str) -> bool:
+        """Whether this exact reply text was already delivered in this session.
+
+        **Observability only.** It used to gate delivery, and that was a bug
+        twice over: a user who asked "say that again" got a turn whose text was
+        suppressed entirely (no `message`, no `done`), and the identity of a
+        reply is the turn that produced it — `response_id` — not its text. Two
+        legitimate answers that happen to read the same are two answers.
+        """
         h = hashlib.md5(content.strip().encode("utf-8")).hexdigest()
         if h in self._sent_hashes:
             return True

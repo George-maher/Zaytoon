@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 import aiosqlite
 
 from common.concurrency import ReentrantAsyncLock
-from common.reporting import safe_error
+from common.reporting import redact, safe_error
 
 logger = logging.getLogger("Zaytoon.MemoryAgent")
 
@@ -32,6 +32,8 @@ class MemoryAgent:
         os.makedirs(db_dir, exist_ok=True)
         self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        #: Sessions with a compaction in flight — see `summarize_and_prune`.
+        self._compacting: set = set()
         #: Serialises writes. aiosqlite runs each connection on its own thread,
         #: and two coroutines interleaving `execute`/`commit` on one connection
         #: can commit a half-written pair. Every mutation takes this lock. It
@@ -212,6 +214,16 @@ class MemoryAgent:
             row = await cursor.fetchone()
             return row["summary"] if row else None
 
+    #: Sessions with a compaction in flight. The transport fires this as a
+    #: bare `asyncio.create_task` on *every* message, so two quick messages
+    #: started two concurrent runs over the same ten rows: both summarised the
+    #: same batches, both inserted a summary row (the table grew by two
+    #: identical "Previous conversation" lines), and the delete in the second
+    #: run re-read "the ten oldest" *after* the first had removed them — so it
+    #: deleted ten rows that had never been summarised. That is silent history
+    #: loss, which is exactly what a compaction step must not do. Single-flight
+    #: per session fixes both halves: one run at a time, and the delete is by
+    #: the id list the read actually produced.
     async def summarize_and_prune(self, session_id: str = "default"):
         """Roll old turns into one line, then delete them.
 
@@ -219,7 +231,21 @@ class MemoryAgent:
         *outside* the write lock — holding a lock across an LLM call would
         stall every other writer for seconds. Only the INSERT/DELETE pair is
         serialised, which is the part that must not interleave.
+
+        Single-flight per session, and the delete names the exact rows the
+        summary was built from. Both halves were absent, and together they made
+        concurrent compaction destructive rather than merely wasteful.
         """
+        if session_id in self._compacting:
+            logger.debug("Compaction already running for %s; skipping", session_id)
+            return
+        self._compacting.add(session_id)
+        try:
+            await self._summarize_and_prune_once(session_id)
+        finally:
+            self._compacting.discard(session_id)
+
+    async def _summarize_and_prune_once(self, session_id: str = "default") -> None:
         try:
             await self._ensure_initialized()
             db = await self._get_db()
@@ -231,17 +257,32 @@ class MemoryAgent:
                 if not row or row["cnt"] < 20:
                     return
 
+            # The ids are captured with the rows they belong to, and the delete
+            # below uses *these* ids. It used to re-run "the ten oldest" at
+            # delete time, which is a different set whenever another writer (or
+            # the concurrent compaction described above) removed rows in
+            # between — the summary would then describe ten messages while ten
+            # *other* messages were deleted.
             async with db.execute(
-                "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
+                "SELECT id, role, content FROM conversations WHERE session_id = ? "
+                "ORDER BY timestamp ASC, id ASC LIMIT ?",
                 (session_id, 10),
             ) as cursor:
                 old = await cursor.fetchall()
 
             lines = [f"{r['role']}: {r['content'][:100]}" for r in old]
             text = " | ".join(lines)
+            old_ids = [r["id"] for r in old]
 
             summary = await self._summarize(text)
-            logger.info("Summarised %d messages for %s: %r", len(old), session_id, summary)
+            # The summary *is* conversation content (it is a paraphrase of ten
+            # user and assistant turns), so it must not reach a log line at
+            # INFO — that is the same leak as logging a message body, one step
+            # removed. Length is the part the operator can act on.
+            logger.info(
+                "Summarised %d messages for %s (%d chars)",
+                len(old), session_id, len(summary or ""),
+            )
 
             async with self._write_lock:
                 db = await self._get_db()
@@ -249,11 +290,6 @@ class MemoryAgent:
                     "INSERT INTO context_summary (summary, session_id) VALUES (?, ?)",
                     (summary, session_id),
                 )
-                async with db.execute(
-                    "SELECT id FROM conversations WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
-                    (session_id, 10),
-                ) as cursor:
-                    old_ids = [r["id"] for r in await cursor.fetchall()]
                 if old_ids:
                     placeholders = ",".join("?" for _ in old_ids)
                     await db.execute(
@@ -286,7 +322,14 @@ class MemoryAgent:
             summary = await SummarizerAgent().process(text, [])
             if summary and not SummarizerAgent.looks_like_an_error(summary):
                 return summary
-            logger.info("Summariser returned nothing usable: %r", summary[:80])
+            # `summary` here is model output that failed validation, so it can
+            # carry anything the model was shown — including the conversation
+            # being summarised. Redacted, shortened, and still enough to tell
+            # "returned an error object" from "returned nothing".
+            logger.info(
+                "Summariser returned nothing usable: %r",
+                redact(str(summary)[:80]),
+            )
         except Exception as e:
             # `component` carries the word "Summariser" because the regression
             # this reports was a *silent* failure — `test_fallback_is_logged_
