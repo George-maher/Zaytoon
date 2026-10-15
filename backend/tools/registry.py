@@ -29,6 +29,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from tools.base import BaseTool, ToolResult, ToolValidationError
 from common.reporting import safe_error
+from core import grants
+from core import permissions
 from tools.sandbox import SecurityError
 from tools.safety import (
     PERMISSION_CONFIRM,
@@ -40,6 +42,29 @@ from tools.safety import (
 )
 
 logger = logging.getLogger("Zaytoon.ToolRegistry")
+
+
+def _declared_permissions(tool) -> tuple:
+    """The extra permissions a tool declares, or ``()`` if it will not say.
+
+    Read defensively because skill tools are third-party code: ``permissions``
+    may be a method, a list, a string, or a property that raises. Anything
+    unreadable counts as "nothing extra declared" — the tier floor in
+    :func:`core.permissions.required_for` is applied regardless, so a tool
+    cannot escape a permission by misreporting itself.
+    """
+    raw = getattr(tool, "permissions", None)
+    if raw is None:
+        return ()
+    try:
+        value = raw() if callable(raw) else raw
+    except Exception:  # noqa: BLE001 - third-party code
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(str(item) for item in value)
+    return ()
 
 
 class ToolRegistry:
@@ -338,9 +363,48 @@ class ToolRegistry:
                 "data": {"exception": type(e).__name__},
             }
 
-        # 2. The gate. Tier comes from the tool declaration, so the label the
-        #    user sees is the label the executor enforces.
+        # 2. The assessment. Pure and cheap, and it reconciles the tier the tool
+        #    declares with the tier its name implies — so the tier the permission
+        #    check below uses is the same tier the prompt above uses, rather than
+        #    a second opinion derived from the name alone.
         assessment = self.assess(tool.name(), params)
+
+        # 3. The user's own decisions on the *capabilities* this action needs.
+        #    Checked before the approval prompt, because asking a user to
+        #    approve something they have already forbidden invites them to
+        #    override their own instruction — and this is the only place the
+        #    permission vocabulary is enforced, so a `deny` recorded anywhere
+        #    (settings API, a config file, a future UI) reaches every tool call.
+        #
+        #    Only `deny` changes behaviour. `allow` is stored and shown but does
+        #    not skip the prompt: a pre-approval that suppresses the human
+        #    decision removes an authorisation control, and this product does
+        #    not trade that away. See `core/grants.py`.
+        denied = await grants.denied(
+            permissions.required_for(
+                tool.name(),
+                _declared_permissions(tool),
+                tier=assessment.permission,
+            )
+        )
+        if denied:
+            logger.info(
+                "Tool %s refused: permission(s) %s are denied by the user's own settings",
+                tool.name(), ", ".join(denied),
+            )
+            return {
+                "success": False,
+                "denied": True,
+                "error": (
+                    "This action needs "
+                    f"{', '.join(denied)}, which you have turned off for Zaytoon. "
+                    "Enable it in Settings > Permissions to allow it."
+                ),
+                "permissions": denied,
+            }
+
+        # 4. The gate. Tier comes from the tool declaration, so the label the
+        #    user sees is the label the executor enforces.
         if assessment.level is RiskLevel.HIGH:
             if approval is False:
                 return {
@@ -373,7 +437,7 @@ class ToolRegistry:
                         "cancelled": True,
                     }
 
-        # 3. Run.
+        # 5. Run.
         try:
             result = await tool.execute(**params)
         except SecurityError as e:

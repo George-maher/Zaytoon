@@ -4,17 +4,24 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from domain.models import SessionState, TokenBucketRateLimiter, SpokenSentenceTracker
 from arabic import clean_and_detect, detect_language
 from agents.events import AgentEvent, AgentEventType, EventBus
-from common.reporting import client_error, safe_error
+from api.ws_security import (
+    CLOSE_POLICY_VIOLATION,
+    authorize_websocket,
+    new_session_id,
+    peer_host,
+)
+from common.reporting import client_error, safe_error, redact
 from common.tracing import set_trace_id
 from services.wake_word_service import apply_wake_gate
 from tools.safety import ConfirmationManager, PendingConfirmation
+from api.ws_protocol import INBOUND_NAMES, validate_inbound, validate_outbound
 from core.events import bus as core_bus
 from core.orchestrator import Orchestrator
 from core.workspace.terminal import get_manager as get_terminal_manager
@@ -97,6 +104,10 @@ def is_replayed_message(session_id: str, message_id: Optional[str]) -> bool:
 
 
 class ConnectionManager:
+    #: Frame types that already failed validation, so a broken frame in a
+    #: streaming loop reports once instead of a hundred times.
+    _reported: set = set()
+
     def __init__(self):
         self.active: list[WebSocket] = []
 
@@ -110,6 +121,18 @@ class ConnectionManager:
 
     async def _send(self, ws: WebSocket, data: dict):
         try:
+            # Checked here rather than at each of the ~40 call sites: this is
+            # the one place every outbound frame passes through, so a typo in a
+            # frame type or a dropped required field is reported by the code
+            # that owns the wire. It logs and sends anyway — a protocol bug must
+            # not be able to swallow a user's reply (`api/ws_protocol.py` has
+            # the reasoning, and `tests/test_ws_protocol.py` is the gate).
+            problem = validate_outbound(data)
+            if problem:
+                kind = data.get("type") if isinstance(data, dict) else "?"
+                if kind not in ConnectionManager._reported:
+                    ConnectionManager._reported.add(kind)
+                    logger.warning("WS protocol: %s", problem)
             raw = json.dumps(data, default=str)
             # One line per outbound frame, at DEBUG. This used to be
             # `logger.warning`, which meant a streamed answer wrote a
@@ -146,11 +169,29 @@ def _get_complete_sentences(text: str, split_fn) -> list[str]:
     return [s for s in split_fn(text) if s.strip().rstrip().endswith((".", "!", "?", "\u061F"))]
 
 
+def _forget_session(session_id: str) -> None:
+    """Drop every per-session table entry for ``session_id``.
+
+    One function rather than four pops at each call site: the session's state,
+    its turn runner, its replay-dedupe table and its traces are one object
+    graph, and a teardown that removes three of the four leaves a session id
+    that still answers `is_replayed_message` for a socket that no longer
+    exists. Called from the disconnect path *and* from the capacity eviction,
+    so an evicted session cannot leave its orchestrator behind.
+    """
+    session_states.pop(session_id, None)
+    _SESSION_ORCHESTRATORS.pop(session_id, None)
+    _SEEN_MESSAGE_IDS.pop(session_id, None)
+    for trace_id, record in list(_request_traces.items()):
+        if record.get("session_id") == session_id:
+            _request_traces.pop(trace_id, None)
+
+
 def _cleanup_stale_sessions():
     now = time.time()
     stale = [sid for sid, s in session_states.items() if now - s._created_at > 1800]
     for sid in stale:
-        session_states.pop(sid, None)
+        _forget_session(sid)
 
     # Also cleanup old traces
     if len(_request_traces) > _MAX_TRACES:
@@ -179,6 +220,44 @@ def _update_trace(trace_id: str, **updates):
         _request_traces[trace_id].update(updates)
 
 
+def _event_session(data: dict) -> Optional[str]:
+    """The session a core event belongs to, or ``None`` when it belongs to all.
+
+    The relay used to read ``data["session_id"]`` alone. Task events are
+    emitted as ``{"task": {...}}``, where ``Task.to_dict()`` puts the session id
+    *inside* the nested object, so the check never matched and every connected
+    client received every other client's task lifecycle — the comment on the
+    relay claimed per-session filtering that the wire shape made unreachable.
+
+    Model events (``model.completed`` …) carry no session id at all: they are
+    published by ``LLMClient``, which knows only the request id it was handed,
+    and that id *is* the transport's trace id (``rid = request_id or
+    get_trace_id()``). ``_request_traces`` already maps trace → session, so the
+    event is routed by the join key the tracer established instead of being
+    broadcast.
+
+    Returning ``None`` means "session-less": a reminder firing, a skill being
+    installed, a provider changing. Those are genuinely process-wide and are
+    still delivered to every socket.
+    """
+    owner = data.get("session_id")
+    if isinstance(owner, str) and owner:
+        return owner
+    task = data.get("task")
+    if isinstance(task, dict):
+        nested = task.get("session_id")
+        if isinstance(nested, str) and nested:
+            return nested
+    request_id = data.get("request_id")
+    if isinstance(request_id, str) and request_id:
+        record = _request_traces.get(request_id)
+        if record:
+            traced = record.get("session_id")
+            if isinstance(traced, str) and traced:
+                return traced
+    return None
+
+
 async def create_websocket_handler(
     websocket: WebSocket,
     rate_limiter: TokenBucketRateLimiter,
@@ -193,18 +272,34 @@ async def create_websocket_handler(
     reminder_service,
     config,
 ):
-    client_ip = websocket.client.host
+    client_ip = peer_host(websocket)
     if not rate_limiter.is_allowed(client_ip):
         await websocket.close(code=1008, reason="Rate limit exceeded")
         return
 
+    # Handshake policy before anything is registered: origin allow-list, the
+    # device token when one is supplied (a *revoked* token is refused even
+    # where one is not required), and a remote peer without either. The
+    # decision is data; the close code is the one the client can act on.
+    decision = authorize_websocket(websocket, config)
+    if not decision.ok:
+        await websocket.close(code=CLOSE_POLICY_VIOLATION, reason=decision.reason)
+        return
+
     await connection_manager.connect(websocket)
-    session_id = f"sess_{int(time.time())}_{hash(client_ip) % 10000}"
+    # Unique per connection, not per (IP, second): two tabs of one browser are
+    # one client, and the old `time + hash(ip)` id gave them the same session —
+    # so the second handshake overwrote the first's state and orchestrator
+    # (`session_states[...]`, `_SESSION_ORCHESTRATORS[...]`) and closing either
+    # one tore the other down. The peer address is kept for logs, not identity.
+    session_id = new_session_id()
+    while session_id in session_states:  # pragma: no cover - 96 bits of entropy
+        session_id = new_session_id()
 
     _cleanup_stale_sessions()
     if len(session_states) >= MAX_SESSIONS:
         oldest = min(session_states.keys(), key=lambda k: session_states[k]._created_at)
-        session_states.pop(oldest, None)
+        _forget_session(oldest)
     session_states[session_id] = SessionState()
     _SESSION_ORCHESTRATORS[session_id] = Orchestrator(
         agent_service=agent_service,
@@ -220,8 +315,8 @@ async def create_websocket_handler(
     # clients do not receive each other's task progress.
     async def _relay_core(event) -> None:
         data = event.data or {}
-        session_filter = data.get("session_id")
-        if session_filter and session_filter != session_id:
+        owner = _event_session(data)
+        if owner and owner != session_id:
             return
         await connection_manager.send(websocket, event.to_dict())
 
@@ -240,6 +335,12 @@ async def create_websocket_handler(
     try:
         await connection_manager.send(websocket, {
             "type": "status", "content": "connected", "session_id": session_id,
+            # Which principal this socket is, and how strongly it was proven.
+            # Displayed, never trusted: the backend decides what a session may
+            # do, the frame only tells the client what that decision was.
+            "principal": decision.device_id or "local",
+            "scope": decision.scope or ("local" if not decision.authenticated else ""),
+            "authenticated": bool(decision.authenticated),
         })
 
         while True:
@@ -273,6 +374,31 @@ async def create_websocket_handler(
                 continue
             msg_type = data.get("type", "message")
 
+            # The declaration in `api/ws_protocol.py` is checked here, at the
+            # one place frames arrive. Before this, an inbound frame was
+            # interpreted by the `if`/`elif` chain below and *anything* the
+            # chain did not recognise fell off the end in silence — including a
+            # declared frame missing a required field, which then behaved like a
+            # different frame entirely (a `tool_confirm` with no `request_id`
+            # resolved nothing and said nothing). An undeclared *type* is still
+            # ignored rather than refused, because that is how a newer client
+            # and an older server coexist; a malformed one is now reported.
+            # Validated only when the frame *declares* a type: a frame with no
+            # `type` has always been read as a `message` here, and that leniency
+            # is what an older client relies on. Tightening it is a separate
+            # decision, not a side effect of adding validation.
+            declared = isinstance(data.get("type"), str)
+            problem = validate_inbound(data) if declared else None
+            if problem and msg_type in INBOUND_NAMES:
+                logger.warning(
+                    "Session %s: refusing malformed frame (%s)", session_id, problem
+                )
+                await connection_manager.send(websocket, {
+                    "type": "error",
+                    "content": f"Malformed {msg_type} frame ignored: {problem}",
+                })
+                continue
+
             if msg_type == "interrupt":
                 state = session_states.get(session_id)
                 if state:
@@ -301,20 +427,21 @@ async def create_websocket_handler(
                     })
                     continue
                 state = session_states.get(session_id)
-                if state:
-                    state.cancel()
-                
+                # Cancels the running turn and mints this one's id, so the
+                # trace, the frames and the frontend's staleness check all name
+                # the same turn.
+                response_id = _begin_turn(state)
+
                 # Create trace for this user action
                 trace_id = _create_trace(user_message, session_id)
-                response_id = state.current_response_id if state else str(uuid.uuid4())[:8]
                 _update_trace(trace_id, response_id=response_id, status="routing")
-                
+
                 task = asyncio.create_task(
                     _handle_message(
                         websocket, user_message, session_id, connection_manager,
                         stt, tts, memory_agent, short_term_memory,
                         agent_service, router_agent, scheduler, config,
-                        trace_id=trace_id,
+                        trace_id=trace_id, response_id=response_id,
                     )
                 )
                 if state:
@@ -323,7 +450,7 @@ async def create_websocket_handler(
             elif msg_type == "audio":
                 audio_b64 = data.get("audio", "")
                 language = data.get("language", None)
-                # Manual voice mode (user pressed mic button) skips wake-word gate
+                # Manual voice mode (user pressed mic) skips wake-word gate
                 is_manual_voice = data.get("isManualVoice", False)
                 logger.debug(
                     f"Audio msg received: b64_len={len(audio_b64)} "
@@ -331,126 +458,42 @@ async def create_websocket_handler(
                 )
                 if not audio_b64:
                     continue
-                try:
-                    if stt.loading:
-                        logger.warning("STT is still loading, sending error")
-                        await connection_manager.send(websocket, {
-                            "type": "error",
-                            "content": "Voice model is still downloading. Please wait.",
-                        })
-                        continue
-                    if not stt.available:
-                        logger.warning("STT not available, sending error")
-                        await connection_manager.send(websocket, {
-                            "type": "error",
-                            "content": "Speech-to-text not available. Type instead.",
-                        })
-                        continue
-                    audio_bytes = base64.b64decode(audio_b64)
-                    # Length only: the prefixes are the user's audio, and
-                    # a log is not the place for it.
-                    logger.debug(f"Audio received: {len(audio_bytes)} bytes")
-                    await connection_manager.send(websocket, {"type": "status", "content": "transcribing"})
-                    transcription = stt.transcribe_detailed(
-                        audio_bytes, language=language
+                if len(audio_b64) > MAX_AUDIO_FRAME_B64:
+                    # ~5 MB of webm/opus is minutes of speech. Anything larger is
+                    # a bug in the client or an attempt to make the server spend
+                    # its memory on one frame; either way it is refused *before*
+                    # decoding, because `b64decode` is what allocates.
+                    await connection_manager.send(websocket, {
+                        "type": "error",
+                        "content": "Recording is too large. Keep it under a minute.",
+                    })
+                    continue
+                state = session_states.get(session_id)
+                if state is None:
+                    continue
+                # The transcription-and-turn sequence runs as its own task so
+                # the receive loop keeps taking frames while it does. It used
+                # to run inline, which meant that for the whole of a voice turn
+                # — the STT call *and* the agent dispatch — this socket could
+                # not process an `interrupt`, a `ping`, or a `tool_confirm`
+                # reply for a tool that was already blocked on approval. Those
+                # three are exactly the frames a user sends while waiting.
+                if state.audio_task and not state.audio_task.done():
+                    # A newer recording supersedes the one still in flight.
+                    state.audio_task.cancel()
+                audio_task = asyncio.create_task(
+                    _handle_audio(
+                        websocket, audio_b64, language, is_manual_voice,
+                        session_id, connection_manager,
+                        stt, tts, memory_agent, short_term_memory,
+                        agent_service, router_agent, scheduler, config,
                     )
-                    text = transcription.text
-                    if not text:
-                        await connection_manager.send(websocket, {"type": "status", "content": "listening"})
-                        continue
-                    # Whisper's verdict beats the client's hint, so voice
-                    # routing and the agent's language kwarg stay in sync:
-                    # `language` was re-derived from the transcript inside
-                    # `transcribe_detailed`, so it is the language of the audio
-                    # whatever the client guessed.
-                    #
-                    # This frame is emitted unconditionally when a language is
-                    # known, and that is load-bearing. It used to be gated on
-                    # `transcription.detected`, which is False whenever the
-                    # caller supplied a hint — i.e. always, because the browser
-                    # client attaches its current `language` to every audio
-                    # frame (`useWebSocket.js`). `stt_result` is the only frame
-                    # that reaches `setLanguage()` on the client, and
-                    # `setLanguage` is what flips the whole app to RTL and the
-                    # TTS voice to Egyptian Arabic, so that gate made spoken
-                    # Arabic unable to switch the app to Arabic at all.
-                    if transcription.language:
-                        language = transcription.language
-                        await connection_manager.send(websocket, {
-                            "type": "stt_result",
-                            "language": language,
-                            "voice": transcription.voice_hint,
-                            "duration": transcription.duration,
-                        })
-
-                    state = session_states.get(session_id)
-                    # Skip wake-word gate for manual voice mode (user explicitly pressed mic)
-                    wake_enabled = config.WAKE_WORD_REQUIRED and not is_manual_voice
-                    wake = apply_wake_gate(
-                        text,
-                        awaiting_command=bool(state.awaiting_command) if state else False,
-                        last_active_ts=state.last_active_ts if state else 0.0,
-                        timeout_secs=config.WAKE_SESSION_TIMEOUT,
-                        enabled=wake_enabled,
-                    )
-                    if wake.detected and state:
-                        # A wake word was spoken: arm the follow-up window so the
-                        # user does not have to repeat it for the next command.
-                        state.awaiting_command = not wake.acted
-                    if wake.dropped:
-                        # Not addressed to Zaytoon. Say so, otherwise the user
-                        # just sees the app go quiet and assumes it is broken.
-                        if config.WAKE_WORD_HINT:
-                            await connection_manager.send(websocket, {
-                                "type": "wake_word", "detected": False,
-                            })
-                        await connection_manager.send(websocket, {
-                            "type": "status", "content": "listening",
-                        })
-                        continue
-                    if wake.detected:
-                        await connection_manager.send(websocket, {
-                            "type": "wake_word", "detected": True,
-                        })
-                        if not wake.acted:
-                            await connection_manager.send(websocket, {
-                                "type": "status", "content": "listening",
-                            })
-                            continue
-                    if wake.acted:
-                        text = wake.text
-
-                    if state and state.awaiting_command:
-                        state.awaiting_command = False
-                    if state:
-                        state.cancel()
-                    
-                    # Create trace for voice message
-                    trace_id = _create_trace(text, session_id)
-                    response_id = state.current_response_id if state else str(uuid.uuid4())[:8]
-                    _update_trace(trace_id, response_id=response_id, status="routing")
-                    
-                    task = asyncio.create_task(
-                        _handle_message(
-                            websocket, text, session_id, connection_manager,
-                            stt, tts, memory_agent, short_term_memory,
-                            agent_service, router_agent, scheduler, config,
-                            language_hint=language,
-                            trace_id=trace_id,
-                        )
-                    )
-                    if state:
-                        state.current_task = task
-
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-
-                    state = session_states.get(session_id)
-                except Exception as e:
-                    safe_error(e, operation="audio", component="api.websocket")
-                    await connection_manager.send(websocket, {"type": "status", "content": "listening"})
+                )
+                state.audio_task = audio_task
+                _AUDIO_TASKS[session_id] = audio_task
+                audio_task.add_done_callback(
+                    lambda _t, sid=session_id: _AUDIO_TASKS.pop(sid, None)
+                )
 
             # NOTE: there is deliberately no `command` message type. An earlier
             # revision accepted {"type":"command","command":...} and routed it
@@ -531,8 +574,13 @@ async def create_websocket_handler(
         for detach in _TERMINAL_SUBSCRIPTIONS.pop(id(websocket), []):
             detach()
         _TTS_SILENT_SESSIONS.discard(id(websocket))
-        _SESSION_ORCHESTRATORS.pop(session_id, None)
-        state = session_states.pop(session_id, None)
+        # The state object is fetched *before* the tables are cleared, because
+        # `_forget_session` is what removes it and the cancel below is the part
+        # that must still happen: a pending approval outliving its socket is a
+        # security-relevant leak, and a turn still running for a closed socket
+        # keeps writing to a task record nobody is watching.
+        state = session_states.get(session_id)
+        _forget_session(session_id)
         if state:
             if state.confirmation_manager:
                 state.confirmation_manager.cancel_all("websocket closed")
@@ -561,8 +609,18 @@ async def _stream_tts_chunks(
     spoken_tracker: SpokenSentenceTracker | None = None,
     config=None,
     trace_id: str = None,
+    response_id: str = "",
+    is_current: "Callable[[], bool] | None" = None,
 ):
     had_audio = False
+    # A turn that has been superseded (a new message, a new recording, a
+    # reconnect) must not keep speaking over the answer the user is waiting
+    # for. `is_current` is the session's own freshness check; when it says no,
+    # synthesis stops at the next chunk boundary instead of running to the end
+    # of a sentence nobody will hear.
+    def stale() -> bool:
+        return bool(is_current is not None and not is_current())
+
     try:
         if cancel_event and cancel_event.is_set():
             return
@@ -593,6 +651,13 @@ async def _stream_tts_chunks(
         def add_trace(frame: dict) -> dict:
             if trace_id:
                 frame["trace_id"] = trace_id
+            if response_id:
+                # Every audio frame of a turn is keyed by the turn, exactly
+                # like `token` and `message` already are. Without it a client
+                # cannot tell a stale sentence's audio from the current one, and
+                # `audio_end` — which is what releases the player — had no way
+                # to say *which* utterance it terminated.
+                frame["response_id"] = response_id
             return frame
 
         subtitle_text = new_text[:200]
@@ -617,6 +682,9 @@ async def _stream_tts_chunks(
                 rate=config.TTS_RATE, volume=config.TTS_VOLUME,
             ):
                 if cancel_event and cancel_event.is_set():
+                    break
+                if stale():
+                    logger.info("TTS stopped: turn superseded before the sentence finished")
                     break
                 if audio_chunk:
                     b64 = base64.b64encode(audio_chunk).decode()
@@ -784,6 +852,317 @@ class _ProgressRelay:
             return
 
 
+#: Cap on one inbound audio frame, base64-encoded: ~5 MB decoded, which is
+#: minutes of opus speech. Checked before `b64decode`, because the decode is
+#: what allocates.
+MAX_AUDIO_FRAME_B64 = 7_000_000
+
+#: In-flight microphone work, keyed by session. The handle is also on
+#: ``SessionState.audio_task`` (that is what cancellation uses); this table
+#: exists so something *outside* the turn — a test, a diagnostics endpoint —
+#: can wait for the utterance to finish instead of sleeping and hoping.
+_AUDIO_TASKS: dict[str, asyncio.Task] = {}
+
+#: How long a transcription may take before the socket tells the user it is
+#: still working rather than leaving the UI on "Transcribing…" forever. The
+#: worker thread is not killed (a C library has no cancellation); the frame is
+#: what the user needs.
+STT_WARN_AFTER_S = 45.0
+
+
+async def _handle_audio(
+    websocket: WebSocket,
+    audio_b64: str,
+    language,
+    is_manual_voice: bool,
+    session_id: str,
+    connection_manager: ConnectionManager,
+    stt,
+    tts,
+    memory_agent,
+    short_term_memory,
+    agent_service,
+    router_agent,
+    scheduler,
+    config,
+) -> None:
+    """One microphone utterance, from encoded bytes to a running turn.
+
+    Runs as a task (`state.audio_task`) rather than inline in the receive loop.
+    Two things were wrong with the inline version and both are about the
+    *event loop*, not about correctness of the transcript:
+
+    * ``stt.transcribe_detailed`` is synchronous and CPU-bound — faster-whisper
+      decodes the file and runs the model on the calling thread. Awaiting it
+      inline blocked every task in the process for the duration, not just this
+      socket: other sessions' turns, heartbeats, the scheduler, the reminder
+      tick. It now runs on a worker thread via ``asyncio.to_thread``.
+    * ``stt.loading`` / ``stt.available`` were properties that *triggered a
+      synchronous model load* on first read. Since the model is only loaded at
+      startup in a background executor, the first audio frame after a fast
+      restart could sit inside a multi-second (or, with a cold cache,
+      download-attempting) import while holding the event loop. Both reads are
+      non-blocking facts now; loading is an explicit, off-loop operation.
+
+    Everything after the transcript is the same sequence as before: report the
+    language Whisper actually heard, apply the wake-word gate, and hand the text
+    to the normal turn path so voice and typing share one implementation.
+    """
+    state = session_states.get(session_id)
+    if state is None:
+        return
+    try:
+        if stt.loading:
+            logger.warning("STT is still loading, sending error")
+            await connection_manager.send(websocket, {
+                "type": "error",
+                "content": "Voice model is still loading. Please wait.",
+            })
+            return
+        if not stt.loaded:
+            # A fact, not a hint: the model is neither loaded nor being loaded,
+            # so asking it to transcribe would raise. Kick the load off in the
+            # background (it is idempotent and only ever runs once) and be
+            # honest about the delay instead of blocking the loop on it.
+            if not getattr(stt, "_load_error", None):
+                asyncio.create_task(_preload_stt(stt))
+                await connection_manager.send(websocket, {
+                    "type": "error",
+                    "content": "Voice model is starting up. Try again in a moment.",
+                })
+            else:
+                await connection_manager.send(websocket, {
+                    "type": "error",
+                    "content": "Speech-to-text not available. Type instead.",
+                })
+            return
+
+        try:
+            audio_bytes = base64.b64decode(audio_b64, validate=False)
+        except Exception:  # noqa: BLE001 - a client that cannot encode
+            await connection_manager.send(websocket, {
+                "type": "error", "content": "Malformed audio frame.",
+            })
+            return
+        # Length only: the prefixes are the user's audio, and a log is not the
+        # place for it.
+        logger.debug(f"Audio received: {len(audio_bytes)} bytes")
+
+        await connection_manager.send(websocket, {"type": "status", "content": "transcribing"})
+        started = time.perf_counter()
+        try:
+            transcription = await asyncio.to_thread(
+                stt.transcribe_detailed, audio_bytes, language
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - one utterance, not the socket
+            # The user pressed the microphone and spoke. If this fails and only
+            # a log line is written, the UI shows a recording that produced
+            # nothing at all — the exact experience that makes people conclude
+            # voice is broken and stop using it. The wire gets a fixed sentence
+            # in the user's language; the log gets the diagnosis.
+            safe_error(e, operation="stt", component="voice.stt")
+            await connection_manager.send(websocket, {
+                "type": "error",
+                "content": client_error(
+                    e, operation="stt", component="voice.stt",
+                    language=_language_for(language),
+                ),
+            })
+            await connection_manager.send(websocket, {
+                "type": "status", "content": "listening",
+            })
+            return
+        logger.info(
+            "STT took %d ms for %d bytes (lang=%s)",
+            int((time.perf_counter() - started) * 1000),
+            len(audio_bytes),
+            getattr(transcription, "language", None) or language or "auto",
+        )
+        text = transcription.text
+        # `if not text` was not enough: Whisper on a breath, a chair creak or a
+        # background voice commonly returns a string of spaces or newlines, and
+        # `"   "` is truthy. The turn then ran on an empty message — an agent
+        # call, a reply, a spoken answer — for audio that contained no request.
+        # Silence must end here, where it is still recognisable as silence.
+        if not text or not text.strip():
+            logger.info(
+                "STT returned no words for %d bytes (%s); nothing dispatched",
+                len(audio_bytes), getattr(transcription, "language", None) or "auto",
+            )
+            await connection_manager.send(websocket, {"type": "status", "content": "listening"})
+            return
+        # Whisper's verdict beats the client's hint, so voice routing and the
+        # agent's language kwarg stay in sync: `language` was re-derived from
+        # the transcript inside `transcribe_detailed`, so it is the language of
+        # the audio whatever the client guessed.
+        #
+        # This frame is emitted unconditionally when a language is known, and
+        # that is load-bearing. It used to be gated on `transcription.detected`,
+        # which is False whenever the caller supplied a hint — i.e. always,
+        # because the browser client attaches its current `language` to every
+        # audio frame (`useWebSocket.js`). `stt_result` is the only frame that
+        # reaches `setLanguage()` on the client, and `setLanguage` is what flips
+        # the whole app to RTL and the TTS voice to Egyptian Arabic, so that
+        # gate made spoken Arabic unable to switch the app to Arabic at all.
+        if transcription.language:
+            language = transcription.language
+            await connection_manager.send(websocket, {
+                "type": "stt_result",
+                "language": language,
+                "voice": transcription.voice_hint,
+                "duration": transcription.duration,
+            })
+
+        state = session_states.get(session_id)
+        if state is None:
+            return
+        # Skip wake-word gate for manual voice mode (user explicitly pressed mic)
+        wake_enabled = config.WAKE_WORD_REQUIRED and not is_manual_voice
+        wake = apply_wake_gate(
+            text,
+            awaiting_command=bool(state.awaiting_command),
+            last_active_ts=state.last_active_ts,
+            timeout_secs=config.WAKE_SESSION_TIMEOUT,
+            enabled=wake_enabled,
+        )
+        if wake.detected:
+            # A wake word was spoken: arm the follow-up window so the user does
+            # not have to repeat it for the next command.
+            state.awaiting_command = not wake.acted
+        if wake.dropped:
+            # Not addressed to Zaytoon. Say so, otherwise the user just sees the
+            # app go quiet and assumes it is broken.
+            if config.WAKE_WORD_HINT:
+                await connection_manager.send(websocket, {
+                    "type": "wake_word", "detected": False,
+                })
+            await connection_manager.send(websocket, {
+                "type": "status", "content": "listening",
+            })
+            return
+        if wake.detected:
+            await connection_manager.send(websocket, {"type": "wake_word", "detected": True})
+            if not wake.acted:
+                await connection_manager.send(websocket, {
+                    "type": "status", "content": "listening",
+                })
+                return
+        if wake.acted:
+            text = wake.text
+
+        if state.awaiting_command:
+            state.awaiting_command = False
+        # Same helper as the typed path: cancel the previous turn, mint this
+        # one's id, and hand that id to everything downstream. The transcript
+        # frame above already carried the *previous* id (the new one did not
+        # exist yet), which is why the `stt_result` block re-stamps below.
+        response_id = _begin_turn(state)
+
+        # Create trace for voice message
+        trace_id = _create_trace(text, session_id)
+        _update_trace(trace_id, response_id=response_id, status="routing")
+
+        task = asyncio.create_task(
+            _handle_message(
+                websocket, text, session_id, connection_manager,
+                stt, tts, memory_agent, short_term_memory,
+                agent_service, router_agent, scheduler, config,
+                language_hint=language,
+                trace_id=trace_id, response_id=response_id,
+            )
+        )
+        state.current_task = task
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Cancelling a task does not cancel the task *it* is awaiting. This
+            # handler is `state.audio_task`, so a stop command cancels it — and
+            # without this the turn it had just started kept running: an
+            # orphaned agent loop writing to a task record, spending provider
+            # calls, and emitting frames for a turn nobody is listening to. The
+            # child is cancelled explicitly and then the cancellation is
+            # re-raised so the task ends in the cancelled state its callers
+            # (`wait_for_audio_work`, the done-callback that clears
+            # `_AUDIO_TASKS`) expect.
+            task.cancel()
+            raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - one utterance, never the socket
+        safe_error(e, operation="audio", component="api.websocket")
+        await connection_manager.send(websocket, {"type": "status", "content": "listening"})
+
+
+def _begin_turn(state) -> str:
+    """Supersede whatever is running and mint the id for the new turn.
+
+    One function, called at each entry point, so a turn has exactly one
+    ``response_id``: the transport's and the turn's frames used to derive it at
+    different moments (`state.current_response_id` read *before* `_run_turn`
+    reset the session), which left the trace and the `stt_result` frame holding
+    the id of the previous turn. A client that keys on `response_id` — the
+    frontend drops tokens belonging to another turn, and that is what keeps two
+    interleaved answers out of one bubble — was then comparing ids that could
+    never match.
+
+    Order matters: ``cancel()`` stops the running turn, ``reset()`` clears the
+    cancel event it set and mints the new id. Reversed, a new turn would start
+    already cancelled.
+    """
+    if state is None:
+        return str(uuid.uuid4())[:8]
+    state.cancel()
+    state.reset()
+    return state.current_response_id
+
+
+async def wait_for_audio_work(session_id: str, timeout: float = 10.0) -> bool:
+    """Wait for a session's in-flight microphone utterance; True if it settled.
+
+    A diagnostic/test seam, not part of the protocol: the audio path runs as a
+    task so the receive loop stays responsive while Whisper works, and that
+    means "the frame was accepted" and "the utterance was handled" are two
+    different moments. A test that wants the second one has to be able to say
+    so, otherwise it asserts on whatever happened to win a race.
+    """
+    task = _AUDIO_TASKS.get(session_id)
+    if task is None or task.done():
+        return True
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        return True
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        return False
+
+
+def _tts_drain_timeout(config, default: float = 120.0) -> float:
+    """How long the turn may wait for speech to finish, as a real number.
+
+    ``hasattr(config, "TTS_TIMEOUT")`` is not enough: any duck-typed config
+    (a test double, a settings object with a proxy attribute) answers True and
+    hands ``wait_for`` something that is not a number, which raises inside the
+    drain's ``except Exception`` and lets the terminal ``done`` frame go out
+    while the speaker is still talking — the exact ordering the drain exists to
+    prevent. A non-numeric value therefore falls back to the default instead of
+    silently disabling the wait.
+    """
+    value = getattr(config, "TTS_TIMEOUT", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value) if value > 0 else default
+
+
+async def _preload_stt(stt) -> None:
+    """Load the speech model on a worker thread, once, off the event loop."""
+    try:
+        await asyncio.to_thread(stt.ensure_loaded)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        safe_error(exc, operation="stt.preload", component="api.websocket")
+
+
 async def _handle_message(
     websocket: WebSocket,
     user_message: str,
@@ -799,6 +1178,7 @@ async def _handle_message(
     config,
     language_hint: Optional[str] = None,
     trace_id: Optional[str] = None,
+    response_id: Optional[str] = None,
 ):
     """The turn boundary: catch everything, report one line, never leak.
 
@@ -826,6 +1206,7 @@ async def _handle_message(
                 stt, tts, memory_agent, short_term_memory,
                 agent_service, router_agent, scheduler, config,
                 language_hint=language_hint, trace_id=trace_id,
+                response_id=response_id,
             )
             # The turn reports its own failure when it has already told the
             # client (the `error` + `done` frames go out inside `_run_turn`):
@@ -1052,6 +1433,7 @@ async def _run_turn(
     config,
     language_hint: Optional[str] = None,
     trace_id: Optional[str] = None,
+    response_id: Optional[str] = None,
 ) -> Optional[str]:
     """Run one turn. Returns ``"error"`` when the turn failed *after* the
     client was told (the ``error`` + ``done`` frames are sent here), so the
@@ -1059,8 +1441,15 @@ async def _run_turn(
     Every other outcome returns ``None``.
     """
     state = session_states.get(session_id)
-    if state:
-        state.reset()
+    # The id is normally handed in by the transport, which has already called
+    # `_begin_turn` (cancel the old turn, reset, mint the id) and stamped it on
+    # the frames that precede the turn. Calling `reset()` here unconditionally
+    # made the two disagree: the trace and the transcript frame kept the old id
+    # while every frame of the turn carried a new one. A caller that has no id
+    # — a REST turn, a direct call in a test — still gets one, in the same one
+    # place.
+    if not response_id:
+        response_id = _begin_turn(state)
 
     # Bind the trace for everything this turn schedules: the orchestrator's
     # inner task copies this context (asyncio.create_task copies contextvars),
@@ -1073,9 +1462,20 @@ async def _run_turn(
 
     cancel_event = state.cancel_event if state else None
     spoken_tracker = state.spoken_tracker if state else None
-    response_id = state.current_response_id if state else str(uuid.uuid4())[:8]
     final_content: str = ""
     tts_triggered = False
+
+    def is_current() -> bool:
+        """Whether this turn is still the session's turn.
+
+        Read from the live session, not from the copy this function opened
+        with: a superseding message calls `state.reset()`, which mints a new
+        response id, and this closure is how the running turn finds out that it
+        has been superseded. Everything that writes to the client after an
+        `await` checks it, because that is where a stale turn can win a race.
+        """
+        live = session_states.get(session_id)
+        return bool(live) and live.is_current(response_id)
 
     cleaning_result = clean_and_detect(user_message)
     cleaned_message = cleaning_result["text"]
@@ -1089,7 +1489,14 @@ async def _run_turn(
         if hinted != "en" or language == "en":
             language = hinted
 
-    logger.warning(f"[HANDLE_MSG] msg='{cleaned_message[:80]}' lang={language} session={session_id} trace={trace_id}")
+    # Redacted and at INFO: the user's own words are not a log line's business
+    # (a pasted key, a password, a private message all arrive here first), and
+    # this used to be logged at WARNING — a level an operator reads as "the
+    # product is telling me something is wrong".
+    logger.info(
+        "[TURN] lang=%s chars=%d session=%s trace=%s",
+        language, len(cleaned_message), session_id, trace_id,
+    )
 
     await memory_agent.store_message("user", cleaned_message, language=language, session_id=session_id)
     short_term_memory.put("last_query", cleaned_message, {"label": "user_query", "language": language})
@@ -1097,7 +1504,7 @@ async def _run_turn(
     asyncio.create_task(memory_agent.summarize_and_prune(session_id))
 
     if cancel_event and cancel_event.is_set():
-        logger.warning(f"[HANDLE_MSG] CANCELLED before dispatch (msg='{cleaned_message[:40]}')")
+        logger.info("Turn cancelled before dispatch (trace=%s)", trace_id)
         _update_trace(trace_id, status="cancelled")
         return
 
@@ -1110,6 +1517,12 @@ async def _run_turn(
     async def flush_tokens():
         if not token_buffer:
             return
+        if not is_current():
+            # Superseded: the buffer belongs to a turn whose bubble is gone.
+            # Dropping it is what stops a cancelled answer's tail from being
+            # appended to the next one.
+            token_buffer.clear()
+            return
         chunk = "".join(token_buffer)
         token_buffer.clear()
         await connection_manager.send(websocket, {
@@ -1119,6 +1532,8 @@ async def _run_turn(
     async def stream_callback(token: str):
         nonlocal tts_triggered, final_content
         if cancel_event and cancel_event.is_set():
+            return
+        if not is_current():
             return
         if not token.strip():
             return
@@ -1139,7 +1554,8 @@ async def _run_turn(
                     _stream_tts_chunks(
                         websocket, complete[0], detect_language(complete[0]),
                         tts, connection_manager, cancel_event, spoken_tracker, config,
-                        trace_id=trace_id,
+                        trace_id=trace_id, response_id=response_id,
+                        is_current=is_current,
                     )
                 )
                 if state:
@@ -1162,8 +1578,12 @@ async def _run_turn(
         if kind != "intent":
             return
         intent = payload.get("intent", "chat")
-        logger.warning(f"[HANDLE_MSG] intent={intent} for msg='{cleaned_message[:60]}'")
-        logger.info(f"Session {session_id}: intent={intent}, lang={language}")
+        logger.info(
+            "Session %s: intent=%s lang=%s chars=%d trace=%s",
+            session_id, intent, language, len(cleaned_message), trace_id,
+        )
+        if not is_current():
+            return
         await connection_manager.send(websocket, {
             "type": "intent", "intent": intent, "language": language,
             "response_id": response_id, "trace_id": trace_id,
@@ -1243,9 +1663,17 @@ async def _run_turn(
         return
 
     if state and state.is_duplicate(final_content):
-        logger.warning(f"Session {session_id}: duplicate blocked")
-        _update_trace(trace_id, status="duplicate_blocked")
-        return
+        # Noted, not obeyed. This used to `return` here, which dropped the
+        # `message` frame *and* the terminal `done` for a legitimate turn —
+        # asking "say that again" produced a reply that streamed as tokens and
+        # then simply stopped, with the UI latched on "thinking" forever. The
+        # identity of a reply is the turn that produced it (`response_id`, which
+        # the client dedupes on); identical text is a coincidence, not a
+        # duplicate request.
+        logger.info(
+            "Session %s: reply text repeats an earlier one (trace=%s) - delivered anyway",
+            session_id, trace_id,
+        )
 
     response_language = detect_language(final_content) or language
 
@@ -1266,13 +1694,18 @@ async def _run_turn(
             safe_error(e, operation="ws.tts_join", component="WebSocket")
 
     tts_task = None
-    if not tts_triggered:
+    if not is_current():
+        # A newer turn started while this one was finishing. Its text was
+        # already delivered above (the user asked for it), but speaking it now
+        # would talk over the turn that superseded it.
+        logger.info("Session %s: not speaking a superseded reply (trace=%s)", session_id, trace_id)
+    elif not tts_triggered:
         await connection_manager.send(websocket, {"type": "status", "content": "speaking", "trace_id": trace_id})
         tts_task = asyncio.create_task(
             _stream_tts_chunks(
                 websocket, final_content, response_language,
                 tts, connection_manager, cancel_event, spoken_tracker, config,
-                trace_id=trace_id,
+                trace_id=trace_id, response_id=response_id, is_current=is_current,
             )
         )
         if state:
@@ -1285,7 +1718,7 @@ async def _run_turn(
                 _stream_tts_chunks(
                     websocket, " ".join(remaining), response_language,
                     tts, connection_manager, cancel_event, spoken_tracker, config,
-                    trace_id=trace_id,
+                    trace_id=trace_id, response_id=response_id, is_current=is_current,
                 )
             )
             if state:
@@ -1301,7 +1734,7 @@ async def _run_turn(
         try:
             await asyncio.wait_for(
                 asyncio.shield(tts_task),
-                timeout=config.TTS_TIMEOUT if hasattr(config, "TTS_TIMEOUT") else 120.0,
+                timeout=_tts_drain_timeout(config),
             )
         except asyncio.TimeoutError:
             logger.warning("Session %s: TTS drain timed out; sending terminal status", session_id)
@@ -1314,6 +1747,19 @@ async def _run_turn(
         _update_trace(trace_id, status="cancelled")
         return
 
+    if not is_current():
+        # A superseded turn must not send the terminal frames: `done` and
+        # `listening` are not keyed to a turn on the client (they are the
+        # "stop showing a spinner" signal), so a stale pair arriving mid-way
+        # through the *new* turn would clear its typing state and drop the HUD
+        # back to "listening" while the new answer was still being written.
+        _update_trace(trace_id, status="superseded")
+        logger.info(
+            "Session %s: turn superseded before its terminal frames (trace=%s)",
+            session_id, trace_id,
+        )
+        return
+
     await connection_manager.send(websocket, {
         "type": "status", "content": "done", "response_id": response_id, "trace_id": trace_id,
     })
@@ -1321,7 +1767,10 @@ async def _run_turn(
     if state:
         state.last_active_ts = time.time()
 
-    await connection_manager.send(websocket, {"type": "status", "content": "listening", "trace_id": trace_id})
+    await connection_manager.send(websocket, {
+        "type": "status", "content": "listening",
+        "response_id": response_id, "trace_id": trace_id,
+    })
 
     _update_trace(trace_id, status="completed", final_length=len(final_content))
 

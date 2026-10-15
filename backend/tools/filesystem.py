@@ -191,14 +191,63 @@ class FileWrite(BaseTool):
     async def execute(
         self, path: str = "", content: str = "", append: bool = False, **_: Any
     ) -> ToolResult:
+        """Write, then read the file back and compare.
+
+        The read-back is not ceremony. `write()` returning without raising says
+        the call was accepted, not that these bytes are on disk — a full volume,
+        a filesystem that filled between the two syscalls, or a path that turned
+        out to be a special file all produce a "successful" write that the user
+        cannot find. The agent loop is told "never claim an action happened
+        unless an observation confirms it"; the tool that reports the action is
+        the only place that observation can be made.
+
+        Text is compared, not the encoding: the file is read back with the same
+        codec the write used, so a mismatch means the content differs, not that
+        the two calls disagreed about UTF-8.
+        """
         target = _resolve({"path": path}, "path")
         try:
             await _in_executor(_write_file, target, content, bool(append))
         except OSError as e:
             return ToolResult.fail(f"Could not write {path}: {e}")
+
+        try:
+            landed = await _in_executor(_read_back, target, content, bool(append))
+        except OSError as e:
+            return ToolResult.fail(
+                f"Wrote {path} but could not read it back to verify: {e}"
+            )
+        if not landed:
+            return ToolResult.fail(
+                f"{path} does not contain what was written — the write did not "
+                "land. The file was not changed as reported."
+            )
+
         verb = "Appended to" if append else "Wrote"
         size = len(content)
-        return ToolResult.ok(f"{verb} {path} ({size} chars)", {"path": path, "chars": size})
+        return ToolResult.ok(
+            f"{verb} {path} ({size} chars)",
+            {"path": path, "chars": size, "verified": True},
+            verified=True,
+        )
+
+
+def _read_back(target: str, content: str, append: bool) -> bool:
+    """Does the file now end with what was just written?
+
+    Compared as text through the same codec as the write. For an append, only
+    the tail is read and compared, because the point is "these bytes arrived",
+    not "the whole file equals this" — the file had a life before the append.
+    """
+    with open(target, "r", encoding="utf-8", errors="replace") as handle:
+        if not append:
+            return handle.read() == content
+        if not content:
+            return True
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - len(content)))
+        return handle.read() == content
 
 
 def _write_file(target: str, content: str, append: bool) -> None:

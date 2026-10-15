@@ -11,7 +11,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from core.api.approvals import ApprovalTokens, run_approved_tool
-from core.permissions import DECISION_ASK, VALID_DECISIONS, describe as describe_permissions
+from core.permissions import (
+    DECISION_ASK,
+    DECISION_DENY,
+    VALID_DECISIONS,
+    describe as describe_permissions,
+)
 from core.providers import (
     VALID_TIERS,
     Capability,
@@ -648,7 +653,12 @@ async def permissions_list() -> Dict[str, Any]:
         tools.append({
             "name": tool.name(),
             "permission_tier": tool.permission,
-            "permissions": sorted(p.value for p in required_for(tool.name())),
+            # The tool's declared tier is passed so this list is the list the
+            # gate checks, not a second derivation from the name that can be
+            # narrower for a tool the tables have never heard of.
+            "permissions": sorted(
+                p.value for p in required_for(tool.name(), tier=tool.permission)
+            ),
             "description": tool.description(),
         })
 
@@ -664,8 +674,11 @@ async def permissions_list() -> Dict[str, Any]:
 async def permission_set(permission: str, data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """Store a decision for one permission.
 
-    Recorded as a *decision*, not enforced at this layer: the enforcement point
-    is the tool registry's gate, which already exists and already fails closed.
+    Recorded here; enforced at the tool registry's gate, which reads this table
+    through `core.grants` before it runs anything (`deny` refuses, `ask` and
+    `allow` fall through to the tier rules). The cache is invalidated on the way
+    out so the decision is live in this process the moment the request returns —
+    a settings switch that takes effect "eventually" is the defect this fixes.
     """
     from core import db
 
@@ -684,7 +697,19 @@ async def permission_set(permission: str, data: Dict[str, Any] = Body(...)) -> D
     )
     if not ok:
         raise HTTPException(500, "Could not store the decision")
-    return {"permission": permission, "decision": decision}
+    from core import grants as grants_module
+
+    grants_module.invalidate()
+    return {
+        "permission": permission,
+        "decision": decision,
+        "enforced": decision == DECISION_DENY,
+        "note": (
+            "refused at the tool gate"
+            if decision == DECISION_DENY
+            else "no additional restriction: the usual tier rules apply"
+        ),
+    }
 
 
 # ===========================================================================

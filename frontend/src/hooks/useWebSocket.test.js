@@ -264,6 +264,81 @@ describe('inbound: streaming tokens', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('inbound: model routing', () => {
+  // `model.completed` is emitted per *attempt*, so a turn that fell back
+  // produces several. It carries the turn's trace id, which is what makes the
+  // per-message badge a report rather than a guess.
+  it('stamps the turn the attempt names, not whatever is streaming', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'answer', response_id: 'r1', trace_id: 't1' })
+      socket.emit({
+        type: 'model.completed',
+        trace_id: 't1',
+        model: 'qwen/qwen3-30b-a3b:free',
+        provider: 'openrouter',
+        attempt: 2,
+        latency_ms: 812,
+      })
+    })
+
+    const [bubble] = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubble.model).toBe('qwen/qwen3-30b-a3b:free')
+    expect(bubble.provider).toBe('openrouter')
+    expect(bubble.attempt).toBe(2)
+    expect(bubble.latencyMs).toBe(812)
+    // The answer is untouched: this is provenance, not generation.
+    expect(bubble.content).toBe('answer')
+  })
+
+  it('does not relabel a live answer when a replaced turn reports late', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'old ', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r2', trace_id: 't2' })
+      socket.emit({ type: 'token', content: 'new answer', response_id: 'r2', trace_id: 't2' })
+      // Arrives after the client moved on, as a fallback chain would.
+      socket.emit({
+        type: 'model.completed',
+        trace_id: 't1',
+        model: 'stale/model:free',
+        provider: 'openrouter',
+        attempt: 1,
+        latency_ms: 4000,
+      })
+    })
+
+    const bubbles = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubbles.map((m) => m.content)).toEqual(['old ', 'new answer'])
+    expect(bubbles[0].model).toBe('stale/model:free')
+    expect(bubbles[1].model).toBeUndefined()
+  })
+
+  it('leaves a badge off an attempt that names no turn', async () => {
+    // A model event outside any turn (a REST call, a health probe) has no
+    // trace. Attributing it to the last answer would be the client inventing
+    // provenance the backend did not report.
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'token', content: 'answer', response_id: 'r1', trace_id: 't1' })
+      socket.emit({ type: 'model.completed', model: 'some/model:free', provider: 'openrouter' })
+    })
+
+    const [bubble] = result.current.messages.filter((m) => m.role === 'assistant')
+    expect(bubble.model).toBeUndefined()
+    // The global banner still reports it, which is where an unattributed
+    // attempt belongs.
+    expect(result.current.modelInfo.model).toBe('some/model:free')
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('inbound: sources', () => {
   // The `sources` frame carries no response_id, so association is by wire
   // order: it lands after the prose and before the final `message`.
@@ -657,5 +732,91 @@ describe('stop control', () => {
       URL.createObjectURL = prevCreate
       URL.revokeObjectURL = prevRevoke
     }
+  })
+
+  describe('speech is bound to the turn that produced it', () => {
+    /** Install a fake player and hand back the players it created. */
+    const withFakeAudio = (fn) => {
+      const players = []
+      class FakeAudio {
+        constructor(url) {
+          this.url = url
+          this.paused = true
+          this.onended = null
+          this.onerror = null
+          players.push(this)
+        }
+        play() { this.paused = false; return Promise.resolve() }
+        pause() { this.paused = true }
+      }
+      vi.stubGlobal('Audio', FakeAudio)
+      const prevCreate = URL.createObjectURL
+      const prevRevoke = URL.revokeObjectURL
+      URL.createObjectURL = vi.fn(() => 'blob:utt')
+      URL.revokeObjectURL = vi.fn()
+      try {
+        return fn(players)
+      } finally {
+        URL.createObjectURL = prevCreate
+        URL.revokeObjectURL = prevRevoke
+      }
+    }
+
+    it('plays the audio of the newest turn', async () => {
+      const { socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'message', content: 'hi', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('MP3'), response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r2' }))
+        expect(players).toHaveLength(1)
+      })
+    })
+
+    it('never plays the audio of a turn that was superseded', async () => {
+      // The server stops synthesising at the next chunk boundary, but frames
+      // already on the socket still arrive. Playing them means the previous
+      // answer is spoken over the one the user is waiting for.
+      const { socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'message', content: 'second answer', response_id: 'r2' }))
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('STALE'), response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r1' }))
+        expect(players).toHaveLength(0)
+      })
+    })
+
+    it('does not start a stale utterance when the stop control was used', async () => {
+      const { result, socket } = await mount()
+      withFakeAudio((players) => {
+        act(() => socket.emit({ type: 'audio_start', voice: 'v', response_id: 'r1' }))
+        act(() => result.current.stopAudio())
+        act(() => socket.emit({ type: 'audio_chunk', data: btoa('LATE'), response_id: 'r1' }))
+        act(() => socket.emit({ type: 'audio_end', response_id: 'r1' }))
+        expect(players).toHaveLength(0)
+      })
+    })
+
+    it('closes a superseded bubble instead of merging the next answer into it', async () => {
+      // The frames are in the order the backend emits them: `intent` anchors a
+      // turn before any of its tokens, and the stale token after the new turn's
+      // `intent` is the case that used to interleave two answers into one
+      // bubble. The half-sentence already on screen is *kept* — the user read it
+      // — but it stops streaming, so the second turn opens its own.
+      const { result, socket } = await mount()
+      act(() => {
+        socket.emit({ type: 'intent', intent: 'chat', response_id: 'r1' })
+        socket.emit({ type: 'token', content: 'old ', response_id: 'r1' })
+        socket.emit({ type: 'intent', intent: 'chat', response_id: 'r2' })
+        socket.emit({ type: 'token', content: 'new ', response_id: 'r2' })
+        socket.emit({ type: 'token', content: 'answer', response_id: 'r2' })
+        socket.emit({ type: 'token', content: ' left over', response_id: 'r1' })
+      })
+      const assistant = result.current.messages.filter((m) => m.role === 'assistant')
+      expect(assistant.map((m) => m.content)).toEqual(['old ', 'new answer'])
+      expect(assistant[0].streaming).toBe(false)
+      expect(assistant[1].streaming).toBe(true)
+    })
   })
 })

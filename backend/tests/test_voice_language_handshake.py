@@ -33,6 +33,7 @@ from api.websocket import (
     ConnectionManager,
     create_websocket_handler,
     session_states,
+    wait_for_audio_work,
 )
 from domain.models import TokenBucketRateLimiter
 from voice.stt import TranscriptionResult
@@ -52,7 +53,12 @@ class FakeWebSocket:
 
     async def receive_text(self):
         if self.incoming:
-            return self.incoming.pop(0)
+            item = self.incoming.pop(0)
+            # A callable is an inbound frame the test wants to *produce* after
+            # something else has happened; see `_settle`.
+            if callable(item):
+                return await item()
+            return item
         await asyncio.sleep(self.idle_grace)
         raise WebSocketDisconnect(code=1000)
 
@@ -124,7 +130,20 @@ async def _run_audio_turn(*, hint, stt_result):
     stt = MagicMock(loading=False, available=True)
     stt.transcribe_detailed = MagicMock(return_value=stt_result)
 
-    ws = FakeWebSocket([_audio_frame(hint)])
+    # The audio branch schedules its work (so the receive loop keeps taking
+    # frames while Whisper runs), which makes "the frame was accepted" and "the
+    # utterance was handled" two different moments. This extra inbound frame
+    # waits for the second one, exactly as a real client does by staying
+    # connected; without it the test asserts against whatever won a race with
+    # the socket's idle timeout.
+    async def _settle():
+        for frame in ws.sent:
+            if frame.get("session_id"):
+                await wait_for_audio_work(frame["session_id"])
+                break
+        return json.dumps({"type": "ping"})
+
+    ws = FakeWebSocket([_audio_frame(hint), _settle])
     await create_websocket_handler(
         websocket=ws,
         rate_limiter=TokenBucketRateLimiter(max_requests=100, window=60),

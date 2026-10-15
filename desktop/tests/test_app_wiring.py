@@ -11,6 +11,8 @@ Nothing here opens a window, touches the network, or spawns a process.
 
 from __future__ import annotations
 
+import base64
+
 import sys
 from pathlib import Path
 
@@ -93,9 +95,17 @@ class FakeClient:
         self.sent.append(("confirm", request_id, approved))
 
 
-@pytest.fixture
-def app():
-    """A ZaytoonApp with its constructor skipped and its collaborators faked."""
+def make_shell():
+    """A ZaytoonApp with its constructor skipped and its collaborators faked.
+
+    One builder, called by the `app` fixture and directly by the tests that need
+    an attribute changed. It used to exist twice — here and again inside
+    `TestTurnScopedAudio` — and the copy omitted `client`, `events`, `mode` and
+    `shutting_down`, which the constructor always sets. Nothing local caught it
+    (`customtkinter` is absent, so this module is collect-skipped) and CI, where
+    the module does run, failed on `'ZaytoonApp' object has no attribute
+    'client'`.
+    """
     shell = object.__new__(ZaytoonApp)
     shell.events = __import__("queue").Queue()
     shell.mode = None
@@ -114,7 +124,24 @@ def app():
     shell.client = FakeClient()
     shell.telemetry = Recorder()
     shell._ids = __import__("itertools").count(1)
+    # Turn-scoped state, at the values the constructor uses. Here rather than
+    # in each test because the audio branches read them on *every* inbound
+    # frame; `tests/test_shell_doubles.py` fails if this list falls behind
+    # `__init__` again.
+    shell._latest_response_id = None
+    shell._ignore_audio = False
+    # Set when the side panel is placed; only the geometry code reads them.
+    shell._panel_saved_geometry = None
+    shell._panel_saved_state = None
+    # Set by a voice command that changed the status, so the connection frame
+    # that follows does not overwrite it.
+    shell._status_from_voice = None
     return shell
+
+
+@pytest.fixture
+def app():
+    return make_shell()
 
 
 def deliver(shell, *events) -> None:
@@ -378,3 +405,105 @@ class TestStateRefreshIsTheSingleFanOut:
         args, kwargs = app.panel.last("set_ui_state")
         assert args[1] == "ar"          # the session language reaches the panel
         assert kwargs["text"] == "بفهم…"  # and the label is resolved in it
+
+
+# ---------------------------------------------------------------------------
+# Turn-scoped speech
+# ---------------------------------------------------------------------------
+class TestTurnScopedAudio:
+    """`audio_start` for a replaced turn suppresses that turn's whole utterance.
+
+    The server stops synthesising a superseded turn at the next chunk boundary,
+    but chunks already on the socket still arrive, and this shell plays them as
+    they land. Without the guard the previous answer is spoken over the one the
+    user is waiting for.
+    """
+
+    def _shell(self):
+        """The module's `app` fixture, with a recording player.
+
+        Deliberately **not** a second copy of the fixture: the copy that used to
+        live here omitted `client`, `events`, `mode` and `shutting_down`, which
+        the real `__init__` always sets. Nothing caught it on the machine where
+        it was written — `customtkinter` is absent there, so this module is
+        collect-skipped — and CI, where the module does run, failed on
+        `'ZaytoonApp' object has no attribute 'client'`. A double that is a copy
+        of another double drifts from it the same way a copy of a schema drifts
+        from the schema.
+        """
+        shell = make_shell()
+        shell.status = "connected"
+        shell.player = RecorderPlayer()
+        return shell, shell.player
+
+    def test_a_current_turn_plays(self):
+        shell, player = self._shell()
+        shell._latest_response_id = "r2"
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_START, {"response_id": "r2"}))
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_CHUNK,
+            {"response_id": "r2", "data": base64.b64encode(b"PCM").decode()}))
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_END, {"response_id": "r2"}))
+        assert player.played and not shell._ignore_audio
+
+    def test_a_superseded_turn_is_silent(self):
+        # Every frame must fold cleanly: `_handle_event` runs on the Tk thread.
+        shell, player = self._shell()
+        shell._latest_response_id = "r2"
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_START, {"response_id": "r1"}))
+        assert shell._ignore_audio is True
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_CHUNK,
+            {"response_id": "r1", "data": base64.b64encode(b"OLD").decode()}))
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_END, {"response_id": "r1"}))
+        assert player.played == [], "a superseded turn was spoken aloud"
+
+    def test_audio_end_clears_the_suppression(self):
+        shell, player = self._shell()
+        shell._latest_response_id = "r2"
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_START, {"response_id": "r1"}))
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_END, {"response_id": "r1"}))
+        assert shell._ignore_audio is False
+        # The next turn's audio must play: a dropped utterance may not poison
+        # the speaker for the rest of the session.
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_START, {"response_id": "r2"}))
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_CHUNK,
+            {"response_id": "r2", "data": base64.b64encode(b"NEW").decode()}))
+        assert player.played == [b"NEW"]
+
+    def test_a_chunk_with_no_start_frame_is_not_played(self):
+        # Defensive: a `audio_chunk` arriving before any anchor frame used to
+        # read an attribute that did not exist yet.
+        shell, player = self._shell()
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_CHUNK, {"data": base64.b64encode(b"X").decode()}))
+        assert player.played == [b"X"]  # no turn in flight: play it, as before
+
+    def test_only_anchor_frames_move_the_current_turn(self):
+        shell, _player = self._shell()
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.MESSAGE, {"content": "hi", "response_id": "r1"}))
+        assert shell._latest_response_id == "r1"
+        # A payload frame from the *old* turn must not move it back.
+        shell._handle_event(protocol.ServerEvent(
+            protocol.EventType.AUDIO_START, {"response_id": "r0"}))
+        assert shell._latest_response_id == "r1"
+
+
+class RecorderPlayer:
+    """A stand-in for `app.audio.AudioPlayer` that records what it was asked to
+    play. The real one decodes MP3 and pushes it at PortAudio, neither of which
+    this machine can do — and neither of which is the question here."""
+    def play(self, pcm: bytes) -> None:
+        self.played.append(pcm)
+
+    def __init__(self):
+        self.played: list[bytes] = []

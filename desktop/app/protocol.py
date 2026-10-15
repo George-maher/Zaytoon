@@ -101,6 +101,41 @@ class EventType(str, Enum):
     STT_RESULT = "stt_result"
     AUDIO_START = "audio_start"
     AUDIO_CHUNK = "audio_chunk"
+    AUDIO_END = "audio_end"
+    #: The backend relays the core bus verbatim, so these arrive with dotted
+    #: names. Listed because a frame the shell cannot name is a frame it renders
+    #: as `unknown`, and an activity feed that drops task progress is the
+    #: difference between "working" and "hung".
+    PONG = "pong"
+    TASK_RESULT = "task_result"
+    TRACE = "trace"
+    SOURCES = "sources"
+    # -- the core bus, relayed verbatim --------------------------------
+    # These arrive with their dotted names exactly as `core.events` publishes
+    # them. A frame the shell cannot name is decoded as `unknown` and dropped,
+    # so this list has to cover the whole vocabulary — `test_wire_protocol.py`
+    # checks it against the backend's `CoreEventType` and fails if one is
+    # missing, which is how the activity feed silently lost tool progress before.
+    TASK_CREATED = "task.created"
+    TASK_UPDATED = "task.updated"
+    TASK_STEP = "task.step"
+    TASK_LOG = "task.log"
+    TOOL_STARTED_STREAM = "tool.started"
+    TOOL_OUTPUT = "tool.output"
+    TOOL_COMPLETED = "tool.completed"
+    TOOL_FAILED = "tool.failed"
+    MODEL_STARTED = "model.started"
+    MODEL_TOKEN = "model.token"
+    MODEL_COMPLETED = "model.completed"
+    MODEL_FAILED = "model.failed"
+    PERMISSION_REQUESTED = "permission.requested"
+    PERMISSION_RESOLVED = "permission.resolved"
+    FILE_CHANGED = "file.changed"
+    PROJECT_CHANGED = "project.changed"
+    SKILL_CHANGED = "skill.changed"
+    PROVIDER_CHANGED = "provider.changed"
+    TERMINAL_OUTPUT = "terminal_output"
+    TERMINAL_OUTPUT_EVENT = "terminal.output"
     WAKE_WORD = "wake_word"
     REQUIRE_CONFIRMATION = "require_confirmation"
     CONFIRMATION_RESULT = "confirmation_result"
@@ -127,6 +162,22 @@ KNOWN_STATUSES = frozenset(
         "done",
         "awaiting_command",
         "awaiting_confirmation",
+    }
+)
+
+
+#: Frames that establish which turn is the current one. The browser client keeps
+#: the same list (`ANCHOR_FRAMES` in `useWebSocket.js`) and the server declares
+#: the field on every frame it emits (`api/ws_protocol.py`). Payload frames —
+#: `token`, `audio_start`, `audio_chunk`, `audio_end` — are absent on purpose:
+#: one of them can carry a superseded turn's data, and treating it as an anchor
+#: would make the staleness check compare a turn against itself.
+ANCHOR_EVENT_TYPES = frozenset(
+    {
+        EventType.INTENT,
+        EventType.MESSAGE,
+        EventType.STATUS,
+        EventType.SUBTITLE,
     }
 )
 
@@ -190,6 +241,11 @@ class ServerEvent:
     def is_final(self) -> bool:
         """True on the frame that completes a streamed reply."""
         return self.type in (EventType.MESSAGE, EventType.MESSAGE_DONE, EventType.ERROR)
+
+    @property
+    def is_anchor(self) -> bool:
+        """True when this frame names the turn the shell should be following."""
+        return bool(self.response_id) and self.type in ANCHOR_EVENT_TYPES
 
     # -- convenience readers for the activity feed -------------------------
     @property

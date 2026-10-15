@@ -40,6 +40,17 @@ const LIST = {
   ],
 };
 
+const GRANTS = {
+  default_decision: "ask",
+  grants: { "process.execute": "deny", "filesystem.write": "allow" },
+  vocabulary: [
+    { permission: "filesystem.write", label: "Create and modify files" },
+    { permission: "process.execute", label: "Run commands and code" },
+    { permission: "network.request", label: "Make network requests" },
+  ],
+  tools: [],
+};
+
 function jsonResponse(body, { ok = true, status = 200 } = {}) {
   return { ok, status, json: async () => body };
 }
@@ -59,6 +70,22 @@ function mockFetch(handlers = {}) {
       if (method === "DELETE") return jsonResponse({ id: "x", revoked: true });
       return jsonResponse(LIST);
     }
+    if (u.includes("/permissions/")) {
+      // Mirrors the real route: it answers with the decision it *stored* and
+      // says whether that decision actually restricts anything.
+      const permission = decodeURIComponent(u.split("/permissions/")[1]);
+      const decision = body?.decision || "ask";
+      return jsonResponse({
+        permission,
+        decision: decision === "ask" ? "ask" : decision,
+        enforced: decision === "deny",
+        note:
+          decision === "deny"
+            ? "refused at the tool gate"
+            : "no additional restriction: the usual tier rules apply",
+      });
+    }
+    if (u.includes("/permissions")) return jsonResponse(GRANTS);
     throw new Error(`unexpected fetch: ${method} ${u}`);
   });
   return calls;
@@ -286,6 +313,81 @@ describe("SecurityView", () => {
     expect(screen.getByText("تشغيل الفحص")).toBeTruthy();
     // The probe URL stays LTR: it is a technical string, not prose.
     expect(screen.getByLabelText(/الرابط/).getAttribute("dir")).toBe("ltr");
+  });
+
+  it("shows each capability with the decision the backend recorded", async () => {
+    mockFetch();
+    render(<SecurityView />);
+
+    expect(await screen.findByText("Run commands and code")).toBeTruthy();
+    // The stored decision is rendered as the pressed state, not inferred by
+    // the client: DENY comes back from `GET /permissions`, and a permission
+    // with no row on the server shows the backend's default (ASK) — never a
+    // hard-coded fallback of the client's own.
+    const pressed = (permission) =>
+      screen.getByRole("button", { name: new RegExp(`^${permission} `) , pressed: true })
+        .getAttribute("aria-label")
+        .split(" ")[1];
+    expect(pressed("process.execute")).toBe("deny");
+    expect(pressed("filesystem.write")).toBe("allow");
+    expect(pressed("network.request")).toBe("ask");
+  });
+
+  it("sends the decision to the backend and shows what was stored", async () => {
+    const calls = mockFetch();
+    render(<SecurityView />);
+    await screen.findByText("Make network requests");
+
+    fireEvent.click(screen.getByRole("button", { name: "network.request deny" }));
+
+    await waitFor(() => {
+      expect(calls.some((c) => c.url.includes("/permissions/network.request") && c.method === "POST")).toBe(true);
+    });
+    const posted = calls.find((c) => c.url.includes("/permissions/network.request"));
+    expect(posted.body).toEqual({ decision: "deny" });
+    // The row now reads from the response, so a backend that stores something
+    // other than what was clicked is visible rather than assumed away.
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "network.request deny", pressed: true })
+      ).toBeTruthy();
+    });
+  });
+
+  it("shows the stored decision even when the backend does not echo the click", async () => {
+    mockFetch({
+      "/permissions/f": () => jsonResponse({ permission: "filesystem.write", decision: "ask" }),
+    });
+    render(<SecurityView />);
+    await screen.findByText("Create and modify files");
+
+    fireEvent.click(screen.getByRole("button", { name: "filesystem.write deny" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "filesystem.write ask", pressed: true })
+      ).toBeTruthy();
+    });
+  });
+
+  it("says that ALLOW is recorded but does not silence the prompt", async () => {
+    mockFetch();
+    render(<SecurityView />);
+    // The distinction is the whole point of the three-way control: a UI that
+    // renders ALLOW as "this will now run without asking" is lying about a
+    // control the backend deliberately keeps.
+    const note = await screen.findByText(/ALLOW is recorded and shown/i);
+    expect(note.textContent).toContain("confirmation-tier action still asks");
+  });
+
+  it("reports a permissions failure without blanking the authorisations", async () => {
+    mockFetch({ "/permissions": () => jsonResponse({ error: "storage unavailable" }, { ok: false, status: 500 }) });
+    render(<SecurityView />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("storage unavailable");
+    // The other panel is unaffected: one failing endpoint is not two.
+    expect(screen.getByText("127.0.0.1")).toBeTruthy();
   });
 
   it("states the boundary of what it checked", async () => {

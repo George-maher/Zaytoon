@@ -74,6 +74,83 @@ export function normalizeStatus(status) {
   return KNOWN_STATUSES.has(status) ? status : FALLBACK_STATUS;
 }
 
+/**
+ * Frames that establish which turn is the current one.
+ *
+ * `intent` opens a turn, `message` closes it, and `status`/`subtitle` are
+ * emitted inside it. Payload frames (`token`, `audio_start`, `audio_chunk`,
+ * `audio_end`) are deliberately absent: they can carry a superseded turn's
+ * data, and treating one as an anchor would make the staleness guards compare a
+ * turn against itself.
+ */
+const ANCHOR_FRAMES = new Set(["intent", "message", "status", "subtitle"]);
+
+/**
+ * One assistant bubble, in the shape the token and message branches both build.
+ *
+ * Factored out because a turn's tokens and its final `message` have to agree on
+ * every field: when they were built separately a field added to one was missed
+ * in the other, and the mismatch showed up as a bubble that changed shape (and
+ * lost its timestamp) the moment the authoritative text arrived.
+ *
+ * `ts` is the receipt time of the first token — a real clock reading, not an
+ * invented one — so a reply is never stamped with a time nobody observed (see
+ * `clockTime`).
+ */
+function newAssistantBubble(data) {
+  return {
+    id: ++_msgId,
+    role: "assistant",
+    content: data.content,
+    streaming: true,
+    trace_id: data.trace_id,
+    ts: clockTime(),
+  };
+}
+
+/**
+ * Stamp the turn a `model.completed` frame belongs to.
+ *
+ * Joined on `trace_id` rather than "whatever is streaming right now": the
+ * backend tags each attempt with the turn's trace, so a late attempt from a
+ * turn the user has already replaced cannot relabel the answer on screen. A
+ * badge that names the wrong model is worse than no badge — it is a claim
+ * about routing that happens to be false, and it is exactly the claim a user
+ * checks when a reply looks wrong.
+ *
+ * Returns `prev` unchanged when nothing matches or nothing changed, so a
+ * fallback chain that produced four attempts does not re-render four times.
+ */
+function modelBadgeFor(prev, data) {
+  const trace = data.trace_id;
+  if (!trace) return prev;
+  for (let i = prev.length - 1; i >= 0; i -= 1) {
+    const msg = prev[i];
+    if (msg.role !== "assistant" || msg.trace_id !== trace) continue;
+    const next = {
+      ...msg,
+      model: data.model || msg.model || null,
+      provider: data.provider || msg.provider || null,
+      latencyMs: typeof data.latency_ms === "number" ? data.latency_ms : msg.latencyMs ?? null,
+      attempt: data.attempt || msg.attempt || null,
+      toolCalled: typeof data.tool_called === "boolean" ? data.tool_called : msg.toolCalled ?? null,
+    };
+    if (
+      next.model === msg.model &&
+      next.provider === msg.provider &&
+      next.latencyMs === msg.latencyMs &&
+      next.attempt === msg.attempt &&
+      next.toolCalled === msg.toolCalled
+    ) {
+      return prev;
+    }
+    const out = [...prev];
+    out[i] = next;
+    return out;
+  }
+  return prev;
+}
+
 export default function useWebSocket() {
   const [messages, setMessages] = useState([]);
   const [isListening, setIsListening] = useState(false);
@@ -115,6 +192,12 @@ export default function useWebSocket() {
   // `api/websocket.py`. They live here rather than in a second hook because
   // they arrive on the *same* frames: a socket per concern would double the
   // connections and let the two disagree about ordering.
+  // What the backend actually used for the reply in flight (the `model.*`
+  // core events). Held per turn and attached to the assistant bubble, because
+  // "which model answered this" is a property of the answer, not of the
+  // session: a fallback mid-conversation moves it, and a settings page that
+  // showed one global value would be describing a different request.
+  const [modelInfo, setModelInfo] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [activeTask, setActiveTask] = useState(null);
   const [terminalLines, setTerminalLines] = useState({});
@@ -135,6 +218,23 @@ export default function useWebSocket() {
   const isSpeakingRef = useRef(false);
   const isProcessingRef = useRef(false);
   const renderedResponseIds = useRef(new Set());
+  //: The turn the transcript is currently showing. Every frame that carries a
+  //: `response_id` is checked against it, so a superseded turn's tokens or
+  //: audio cannot be appended to the reply the user is actually reading. The
+  //: backstop for the server-side guard: the two agree because the server
+  //: stamps the id on the first frame of each turn.
+  const activeResponseIdRef = useRef(null);
+  //: The newest turn this client has seen *any* frame for. Audio is checked
+  //: against it, not against `activeResponseIdRef`: a reply's audio arrives
+  //: after its `message` frame (the transport streams speech while it writes
+  //: the text, and the drain finishes last), so by the time `audio_start`
+  //: lands the transcript has already finished the turn and the "active" ref
+  //: is deliberately cleared.
+  const latestResponseIdRef = useRef(null);
+  //: Which turn's audio is currently being collected. Three states: a
+  //: response id (collecting), `IGNORED` (a superseded turn's audio — dropped
+  //: whole), or null (nothing in flight).
+  const audioTurnRef = useRef(null);
   const renderedContentHashes = useRef(new Set());
   // Sources for the turn in flight: set by the `sources` frame (which the
   // backend sends *before* the final `message`) and consumed when that
@@ -171,6 +271,10 @@ export default function useWebSocket() {
   }, []);
 
   const stopAudio = useCallback(() => {
+    // A stop must also discard whatever utterance is mid-collection, otherwise
+    // its `audio_end` would start playing a voice the user just silenced.
+    audioTurnRef.current = null;
+    audioChunksRef.current = [];
     // Silence the playing utterance itself, not just the flags. Releasing the
     // blob URL here matters: once the handlers are detached the browser will
     // never call onended, so nothing else would revoke it.
@@ -239,6 +343,23 @@ export default function useWebSocket() {
         setCurrentTraceId(data.trace_id);
       }
       
+      // Anchor frames update what "the newest turn" is. Everything else that
+      // carries a `response_id` — a token, an audio frame, `audio_start` — can
+      // belong to a turn that has already been superseded, so using one as the
+      // anchor would drag the reference *back* to the turn the client is trying
+      // to ignore and quietly defeat the two guards below.
+      //
+      // A list of anchors rather than a list of exceptions, because the next
+      // frame type somebody adds is far more likely to be a payload than an
+      // anchor, and a missed exclusion fails silently.
+      //
+      // The server makes this reliable: every turn emits `intent`, and every
+      // reply ends with `message`/`status`, all carrying that turn's own
+      // `response_id`, and `intent` precedes any token of the turn.
+      if (data.response_id && ANCHOR_FRAMES.has(data.type)) {
+        latestResponseIdRef.current = data.response_id;
+      }
+
       switch (data.type) {
         case "status":
           setStatus(normalizeStatus(data.content));
@@ -331,30 +452,67 @@ export default function useWebSocket() {
           setStatus("thinking");
           break;
         case "token":
+          // A token from a turn this client is no longer showing is dropped.
+          // It happens when a second message supersedes the first: the server
+          // stops the old turn, but frames already in flight on the socket
+          // arrive after the new turn's first token, and appending them
+          // interleaves two answers into one bubble.
+          if (data.response_id) {
+            if (!activeResponseIdRef.current) {
+              activeResponseIdRef.current = data.response_id;
+            } else if (activeResponseIdRef.current !== data.response_id) {
+              if (data.response_id !== latestResponseIdRef.current) {
+                // A superseded turn still draining its buffer.
+                break;
+              }
+              // A new turn: its `intent` frame already named it, so this is the
+              // turn the user is waiting for. The previous bubble has to stop
+              // being the streaming one, or this turn's tokens append to it and
+              // two answers merge into one bubble — which is the very thing
+              // this guard exists to prevent.
+              activeResponseIdRef.current = data.response_id;
+              // A new turn: the streaming bubble belongs to the turn that just
+              // ended, so it must stop being the one this turn appends to.
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (!last || last.role !== "assistant" || !last.streaming) return prev;
+                return [...prev.slice(0, -1), { ...last, streaming: false }];
+              });
+            }
+          }
           setIsTyping(true);
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (last && last.role === "assistant" && last.streaming) {
               return [...prev.slice(0, -1), { ...last, content: last.content + data.content, trace_id: data.trace_id }];
             }
-            return [
-              ...prev,
-              {
-                id: ++_msgId,
-                role: "assistant",
-                content: data.content,
-                streaming: true,
-                trace_id: data.trace_id,
-                // Stamp on the first token of the turn: the receipt time of
-                // the reply, not an invented one (see clockTime).
-                ts: clockTime(),
-              },
-            ];
+            return [...prev, newAssistantBubble(data)];
           });
           break;
         case "message": {
+          // A *final* reply ends its turn. Two cases must be told apart, and
+          // the turn's own state is what distinguishes them:
+          //
+          //   * a different id arriving while this client is still streaming
+          //     another turn is that other turn's late reply — the server
+          //     stops a superseded turn, but frames already on the socket
+          //     arrive afterwards, and rendering one would print an answer to
+          //     a question the user has moved past;
+          //   * a different id arriving while nothing is streaming is simply
+          //     the next turn, which must be rendered. (Comparing ids alone
+          //     cannot tell these apart: ids carry no order, and a client that
+          //     guessed would either drop every second answer or accept every
+          //     stale one.)
+          if (data.response_id && activeResponseIdRef.current
+              && activeResponseIdRef.current !== data.response_id
+              && isProcessingRef.current) {
+            break;
+          }
           setIsTyping(false);
           isProcessingRef.current = false;
+          // The turn is over either way, so nothing is "active" any more; the
+          // per-turn dedupe set below is what remembers the id.
+          activeResponseIdRef.current = null;
           
           // Dual-layer deduplication: response_id (primary) + content hash (fallback)
           const responseId = data.response_id;
@@ -435,9 +593,21 @@ export default function useWebSocket() {
           });
           break;
         }
-        case "audio_start":
+        case "audio_start": {
+          // Speech for a superseded turn is dropped entire: the server stops
+          // synthesising at the next chunk boundary, but sentences already
+          // queued (or frames already on the socket) would otherwise play
+          // over the answer the user is actually waiting for. Comparing to the
+          // newest id is what makes this a *turn* check rather than a guess.
+          const turn = data.response_id || null;
+          if (turn && latestResponseIdRef.current && turn !== latestResponseIdRef.current) {
+            audioTurnRef.current = null;
+            audioChunksRef.current = [];
+            break;
+          }
+          audioTurnRef.current = turn || latestResponseIdRef.current || "current";
           audioChunksRef.current = [];
-          audioChunksRef.format = data.format || "mpeg";
+          audioChunksRef.current.format = data.format || "mpeg";
           // Server-side voice selection, surfaced so the HUD can show which
           // locale is being spoken.
           activeVoiceRef.current = data.voice || null;
@@ -445,10 +615,17 @@ export default function useWebSocket() {
           setIsSpeaking(true);
           isSpeakingRef.current = true;
           break;
+        }
         case "audio_chunk":
+          if (audioTurnRef.current === null) break;  // dropped utterance
           audioChunksRef.current.push(data.data);
           break;
         case "audio_end": {
+          if (audioTurnRef.current === null) {
+            audioChunksRef.current = [];
+            break;
+          }
+          audioTurnRef.current = null;
           const chunks = audioChunksRef.current;
           if (chunks.length > 0) {
             const decoded = [];
@@ -630,6 +807,51 @@ export default function useWebSocket() {
         // alongside it. Unrecognised core events fall through the switch
         // silently, which is the point: a newer backend adding an event must
         // not break an older client.
+        // -- model routing (real, from the core bus) ---------------------
+        // `services/llm_client.py` publishes one `model.started` per call and
+        // one outcome event per *attempt*, so a call that fell back produces
+        // several. The last one to arrive is the attempt that actually served
+        // the reply; a failure is recorded as a failure rather than being
+        // dropped, because "which model answered" is exactly the question a
+        // user asks when the reply looks wrong. This is observation of the
+        // backend's real routing — no provider list is invented here.
+        case "model.started":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            provider: data.provider || (prev && prev.provider) || null,
+            tier: data.tier || (prev && prev.tier) || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            pending: true,
+          }));
+          break;
+        case "model.completed":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            model: data.model || null,
+            provider: data.provider || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            latencyMs: typeof data.latency_ms === "number" ? data.latency_ms : null,
+            attempt: data.attempt || null,
+            toolCalled: data.tool_called || null,
+            ok: true,
+            pending: false,
+          }));
+          // …and on the bubble itself, when this attempt names a turn we are
+          // showing. The banner says "the last thing that ran"; the badge says
+          // "this answer".
+          if (data.trace_id) setMessages((prev) => modelBadgeFor(prev, data));
+          break;
+        case "model.failed":
+          setModelInfo((prev) => ({
+            ...(prev || {}),
+            model: data.model || (prev && prev.model) || null,
+            provider: data.provider || (prev && prev.provider) || null,
+            requestId: data.request_id || (prev && prev.requestId) || null,
+            reason: data.reason || data.outcome || null,
+            ok: false,
+            pending: false,
+          }));
+          break;
         case "task.created":
           setTasks((prev) => [data.task, ...prev.filter((t) => t.id !== data.task?.id)]);
           setActiveTask(data.task);
@@ -1162,6 +1384,7 @@ if (rms > threshold) {
     respondToConfirmation,
     cancelPendingConfirmation,
     currentTraceId,
+    modelInfo,
     // Core runtime
     tasks,
     activeTask,

@@ -127,13 +127,51 @@ class SpeechToText:
                 self._loading = False
                 return False
 
+    def ensure_loaded(self) -> bool:
+        """Load the model if it is not loaded. **Blocking** — call off the loop.
+
+        This is the explicit form of what ``available`` used to do implicitly.
+        Every caller that may load the model (backend startup, the preload
+        triggered by an audio frame with no model yet) goes through
+        ``asyncio.to_thread`` / ``run_in_executor``, because building a
+        ``WhisperModel`` imports CTranslate2, reads a few hundred megabytes and
+        may *download* the model on first use — seconds to minutes of work that
+        must never happen on the event loop.
+        """
+        return self._load_model()
+
+    @property
+    def loaded(self) -> bool:
+        """Whether a model is in memory *right now*. Never loads anything.
+
+        The distinction matters at the transport: the old single property
+        returned the same answer for "ready" and "not ready yet", and the way it
+        answered the second case was to load the model on the thread that asked
+        — inside a WebSocket frame handler, with the event loop held. A caller
+        that needs the model can call :meth:`ensure_loaded` on a worker; a
+        caller that is only *reporting* state (`GET /health`, an audio frame
+        deciding whether to warn) must not be able to trigger the load at all.
+        """
+        return self._model is not None
+
     @property
     def available(self) -> bool:
-        return self._load_model()
+        """Alias for :attr:`loaded`, kept for the existing call sites.
+
+        Deliberately non-blocking: the property used to *perform* the load, so
+        reading it from a request path was a latent event-loop stall — and
+        ``GET /health`` reads it on every poll.
+        """
+        return self.loaded
 
     @property
     def loading(self) -> bool:
         return self._loading
+
+    @property
+    def load_error(self) -> Optional[str]:
+        """Why the model is not loaded, or ``None``. Non-blocking."""
+        return self._load_error
 
     def transcribe(self, audio_data: bytes, language: Optional[str] = None) -> str:
         """Backwards-compatible transcript-only API."""

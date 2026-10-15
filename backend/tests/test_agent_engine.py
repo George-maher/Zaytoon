@@ -525,6 +525,27 @@ class TestRenderObservation:
         assert "NOT RUN" in text
         assert "declined" in text
 
+    def test_a_denied_permission_is_not_reported_as_a_failure(self):
+        """A refusal the user chose must not read as something that went wrong.
+
+        The engine feeds this text back to the model. "FAILED" invites a retry
+        or a different tool that reaches the same capability; the capability is
+        off, so the model has to be told that plainly.
+        """
+        text = render_observation(
+            self._call(),
+            {
+                "success": False,
+                "denied": True,
+                "permissions": ["filesystem.write"],
+                "error": "This action needs filesystem.write, which you have turned off.",
+            },
+        )
+        assert "FAILED" not in text
+        assert "NOT RUN" in text
+        assert "filesystem.write" in text
+        assert "Do not retry" in text
+
     def test_needs_confirmation_is_labelled(self):
         text = render_observation(
             self._call(), {"success": False, "requires_confirmation": True, "error": "x"}

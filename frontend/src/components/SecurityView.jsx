@@ -1,5 +1,6 @@
-import { memo, useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../lib/api";
+import { translate } from "../i18n/strings";
 
 /**
  * SecurityView — the Security Workspace.
@@ -12,10 +13,17 @@ import * as api from "../lib/api";
  * something. So authorisation has to be a user action, and this is where the
  * user performs it.
  *
- * Two halves:
+ * Three halves:
  *
  *   **Authorisations** — the recorded targets, what each one covers, and a
  *   revoke button. Revoking takes effect on the next probe, not on restart.
+ *
+ *   **Capabilities** — the permission grants. This is not a display of the
+ *   vocabulary: `deny` is checked at the tool gate *before* the approval
+ *   prompt, so a switch here changes what the product will do. `allow` is the
+ *   opposite case and the UI says so rather than implying it — it is recorded
+ *   and shown, and a confirmation-tier action still asks, because a stored
+ *   preference must never become a silent bypass of the prompt.
  *
  *   **Probe** — runs `security_probe` through `/computer`-style tool dispatch
  *   for a target the user names. A target that is not authorised comes back
@@ -35,11 +43,33 @@ const OP_LABELS = {
   "local.scan": { en: "Local scan", ar: "فحص محلي" },
 };
 
+//: The three decisions, in the order a user reads them: the default first,
+//: then the two that mean something. Deliberately not a two-state toggle —
+//: "allow" and "ask" are different answers and collapsing them would hide the
+//: distinction the backend makes.
+const DECISIONS = ["ask", "allow", "deny"];
+
+const DECISION_LABELS = {
+  ask: { en: "ASK", ar: "اسأل" },
+  allow: { en: "ALLOW", ar: "سماح" },
+  deny: { en: "DENY", ar: "منع" },
+};
+
+const DENIED_COUNT = (grants) =>
+  Object.values(grants.grants || {}).filter((decision) => decision === "deny").length;
+
 function SecurityView({ language = "en" }) {
   const ar = language === "ar";
+  // Every string on this page comes from `src/i18n/strings.js`; the two
+  // remaining `ar ? "ar" : "en"` expressions below are locale *selectors*
+  // (they choose a key in a lookup table), not copy.
+  const t = useMemo(() => (key, vars) => translate(language, key, vars), [language]);
   const [state, setState] = useState({ authorizations: [], operations: [], active_count: 0 });
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [grants, setGrants] = useState({ vocabulary: [], grants: {}, default_decision: "ask" });
+  const [grantsError, setGrantsError] = useState(null);
+  const [savingGrant, setSavingGrant] = useState(null);
 
   const [form, setForm] = useState({ target: "", operations: ["http.probe"], ttl: "", note: "" });
   const [busy, setBusy] = useState(false);
@@ -56,7 +86,35 @@ function SecurityView({ language = "en" }) {
       setError(null);
       setState(result);
     }
+    // Fetched separately and reported separately: a permissions endpoint that
+    // is down does not make the authorisation list unknown, and blanking both
+    // panels would hide which one actually failed.
+    const permissions = await api.getPermissions();
+    if (permissions.error) {
+      setGrantsError(permissions.error);
+    } else {
+      setGrantsError(null);
+      setGrants(permissions);
+    }
     setLoading(false);
+  }, []);
+
+  const decide = useCallback(async (permission, decision) => {
+    setSavingGrant(permission);
+    setGrantsError(null);
+    const result = await api.setPermission(permission, decision);
+    if (result.error) {
+      setGrantsError(result.error);
+    } else {
+      // The backend is the record, so the row shows what it stored rather than
+      // what was clicked — those differ for `allow`, which is stored but does
+      // not stop the tier gate from prompting.
+      setGrants((prev) => ({
+        ...prev,
+        grants: { ...prev.grants, [permission]: result.decision },
+      }));
+    }
+    setSavingGrant(null);
   }, []);
 
   useEffect(() => {
@@ -118,12 +176,10 @@ function SecurityView({ language = "en" }) {
     >
       <header>
         <h1 className="hud-label" style={{ fontSize: "var(--font-lg)" }}>
-          {ar ? "مساحة الأمان" : "SECURITY WORKSPACE"}
+          {t("security.security_workspace")}
         </h1>
         <p className="hud-micro" style={{ color: "var(--hud-text-mute)" }}>
-          {ar
-            ? "الفحص النشط يتطلب نطاقًا مُصرَّحًا به. الفرض يتم في طبقة التنفيذ، لا في تعليمات النموذج."
-            : "Active testing requires an authorised scope. Enforced in the execution layer, not in model instructions."}
+          {t("security.active_testing_requires_an_authorised_scope_enfo")}
         </p>
       </header>
 
@@ -137,12 +193,12 @@ function SecurityView({ language = "en" }) {
         {/* ---- Authorise a target ---- */}
         <section className="hud-panel flex-1" style={{ minWidth: "300px" }}>
           <header className="hud-panel-head">
-            <span>{ar ? "تفويض هدف" : "AUTHORISE A TARGET"}</span>
-            <span className="hud-micro ml-auto">{ar ? "نشط" : "ACTIVE"}: {state.active_count ?? 0}</span>
+            <span>{t("security.authorise_a_target")}</span>
+            <span className="hud-micro ml-auto">{t("security.active")}: {state.active_count ?? 0}</span>
           </header>
           <form onSubmit={authorize} style={{ padding: "var(--space-3)", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
             <label className="hud-micro" htmlFor="sec-target">
-              {ar ? "الهدف" : "Target"}
+              {t("security.target")}
             </label>
             <input
               id="sec-target"
@@ -154,14 +210,12 @@ function SecurityView({ language = "en" }) {
               required
             />
             <p className="hud-micro" style={{ color: "var(--hud-text-mute)", fontSize: "var(--font-xs)" }}>
-              {ar
-                ? "نطاق كامل للمضيف مرفوض: التفويض لكل شيء ليس تفويضًا."
-                : "A wildcard for every host is refused — an authorisation for everything is not one."}
+              {t("security.a_wildcard_for_every_host_is_refused_an_authoris")}
             </p>
 
             <fieldset style={{ border: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
               <legend className="hud-micro" style={{ padding: 0 }}>
-                {ar ? "العمليات" : "OPERATIONS"}
+                {t("security.operations")}
               </legend>
               {(state.operations || []).map((op) => (
                 <label key={op} className="flex items-center" style={{ gap: "var(--space-2)", fontSize: "var(--font-xs)", color: "var(--hud-text-dim)" }}>
@@ -176,7 +230,7 @@ function SecurityView({ language = "en" }) {
 
             <div className="flex" style={{ gap: "var(--space-2)" }}>
               <div className="flex-1">
-                <label className="hud-micro" htmlFor="sec-ttl">{ar ? "ينتهي بعد (أيام)" : "Expires after (days)"}</label>
+                <label className="hud-micro" htmlFor="sec-ttl">{t("security.expires_after_days")}</label>
                 <input
                   id="sec-ttl"
                   className="hud-input w-full"
@@ -184,18 +238,18 @@ function SecurityView({ language = "en" }) {
                   min="0"
                   value={form.ttl}
                   onChange={(e) => setForm({ ...form, ttl: e.target.value })}
-                  placeholder={ar ? "بدون انتهاء" : "no expiry"}
+                  placeholder={t("security.no_expiry")}
                 />
               </div>
             </div>
 
-            <label className="hud-micro" htmlFor="sec-note">{ar ? "ملاحظة" : "Note"}</label>
+            <label className="hud-micro" htmlFor="sec-note">{t("security.note")}</label>
             <input
               id="sec-note"
               className="hud-input w-full"
               value={form.note}
               onChange={(e) => setForm({ ...form, note: e.target.value })}
-              placeholder={ar ? "سبب التفويض / رقم المهمة" : "why, or which engagement"}
+              placeholder={t("security.why_or_which_engagement")}
             />
 
             <button
@@ -204,7 +258,7 @@ function SecurityView({ language = "en" }) {
               className="hud-micro"
               style={{ padding: "var(--space-2) var(--space-3)", cursor: "pointer", background: "color-mix(in srgb, var(--hud-cyan) 8%, transparent)", border: "var(--border-w) solid color-mix(in srgb, var(--hud-cyan) 25%, transparent)", color: "var(--hud-cyan)" }}
             >
-              {ar ? "تفويض" : "AUTHORISE"}
+              {t("security.authorise")}
             </button>
           </form>
         </section>
@@ -212,15 +266,13 @@ function SecurityView({ language = "en" }) {
         {/* ---- Run a probe ---- */}
         <section className="hud-panel flex-1" style={{ minWidth: "300px" }}>
           <header className="hud-panel-head">
-            <span>{ar ? "فحص مُصرَّح به" : "AUTHORISED PROBE"}</span>
+            <span>{t("security.authorised_probe")}</span>
           </header>
           <div style={{ padding: "var(--space-3)", display: "flex", flexDirection: "column", gap: "var(--space-2)" }}>
             <p className="hud-micro" style={{ color: "var(--hud-text-mute)", fontSize: "var(--font-xs)" }}>
-              {ar
-                ? "طلب واحد غير مُدمِّر. لا حمولات، ولا تعطيل، ولا تخمين — كل نتيجة مصحوبة بدليلها."
-                : "One non-destructive request. No payloads, no exploitation, no guessing — every finding carries its evidence."}
+              {t("security.one_non_destructive_request_no_payloads_no_explo")}
             </p>
-            <label className="hud-micro" htmlFor="sec-url">{ar ? "الرابط" : "URL"}</label>
+            <label className="hud-micro" htmlFor="sec-url">{t("security.url")}</label>
             <input
               id="sec-url"
               className="hud-input w-full"
@@ -236,7 +288,7 @@ function SecurityView({ language = "en" }) {
               className="hud-micro"
               style={{ padding: "var(--space-2) var(--space-3)", cursor: "pointer", background: "transparent", border: "var(--border-w) solid var(--hud-edge-faint)", color: "var(--hud-text-dim)" }}
             >
-              {ar ? "تشغيل الفحص" : "RUN PROBE"}
+              {t("security.run_probe")}
             </button>
 
             {probeResult && (
@@ -250,7 +302,7 @@ function SecurityView({ language = "en" }) {
                 ) : (
                   <>
                     <p className="hud-micro" style={{ color: "var(--hud-text-mute)" }}>
-                      {ar ? "المعرّف" : "authorisation"}: <span className="hud-mono">{probeResult.authorization_id}</span>
+                      {t("security.authorisation")}: <span className="hud-mono">{probeResult.authorization_id}</span>
                       {" · "}HTTP {probeResult.status}
                     </p>
                     {(probeResult.findings || []).map((finding) => (
@@ -290,18 +342,112 @@ function SecurityView({ language = "en" }) {
         </section>
       </div>
 
+      {/* ---- Capability grants ---- */}
+      <section className="hud-panel">
+        <header className="hud-panel-head">
+          <span>{t("security.capabilities")}</span>
+          <span className="hud-micro ml-auto">
+            {t("security.denied")}: {DENIED_COUNT(grants)}
+          </span>
+        </header>
+
+        {grantsError && (
+          <p role="alert" className="hud-micro" style={{ padding: "var(--space-3)", color: "var(--hud-red)" }}>
+            {grantsError}
+          </p>
+        )}
+
+        <p className="hud-micro" style={{ padding: "var(--space-3) var(--space-3) 0", color: "var(--hud-text-mute)", fontSize: "var(--font-xs)" }}>
+          {t("security.deny_is_refused_at_the_tool_gate_before_any_appr")}
+        </p>
+
+        {(grants.vocabulary || []).length === 0 ? (
+          <p className="hud-micro" style={{ padding: "var(--space-3)", color: "var(--hud-text-mute)" }}>
+            {t("security.no_permissions_listed")}
+          </p>
+        ) : (
+          <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+            {(grants.vocabulary || []).map((row) => {
+              // Partial payloads are tolerated on purpose: a response missing a
+              // key must render as "unknown", never as a crash that takes the
+              // whole shell down with it (the App runtime test walks every
+              // destination with a stubbed API).
+              const decision = (grants.grants || {})[row.permission] || grants.default_decision || "ask";
+              return (
+                <li
+                  key={row.permission}
+                  className="flex items-center flex-wrap"
+                  style={{ gap: "var(--space-3)", padding: "var(--space-2) var(--space-3)", borderTop: "var(--border-w) solid var(--hud-edge-faint)" }}
+                >
+                  <span
+                    aria-hidden="true"
+                    // Three states, three colours: the indicator has to agree
+                    // with the pressed button or a user reads the node, not
+                    // the control, and has to be able to tell "no answer yet"
+                    // from "this is refused".
+                    className={`hud-hex ${
+                      decision === "deny"
+                        ? "hud-hex--error"
+                        : decision === "allow"
+                          ? "hud-hex--ok"
+                          : "hud-hex--hollow hud-hex--idle"
+                    }`}
+                  />
+                  <span style={{ fontSize: "var(--font-sm)", color: "var(--hud-text)" }}>
+                    {row.label}
+                  </span>
+                  <span className="hud-mono" dir="ltr" style={{ fontSize: "var(--font-xs)", color: "var(--hud-text-mute)" }}>
+                    {row.permission}
+                  </span>
+                  <div className="ml-auto flex" style={{ gap: "var(--space-1)" }}>
+                    {DECISIONS.map((option) => (
+                      <button
+                        key={option}
+                        type="button"
+                        // "DENY" appears once per row, so the accessible name
+                        // has to carry the permission: three identical buttons
+                        // are three identical buttons to a screen reader.
+                        aria-label={`${row.permission} ${option}`}
+                        aria-pressed={decision === option}
+                        disabled={savingGrant === row.permission}
+                        onClick={() => decide(row.permission, option)}
+                        className="hud-micro"
+                        style={{
+                          padding: "var(--space-1) var(--space-2)",
+                          cursor: "pointer",
+                          background: decision === option ? "color-mix(in srgb, var(--hud-cyan) 12%, transparent)" : "transparent",
+                          border: `var(--border-w) solid ${decision === option ? "color-mix(in srgb, var(--hud-cyan) 35%, transparent)" : "var(--hud-edge-faint)"}`,
+                          color:
+                            decision !== option
+                              ? "var(--hud-text-mute)"
+                              : option === "deny"
+                                ? "var(--hud-red)"
+                                : "var(--hud-cyan)",
+                        }}
+                      >
+                        {DECISION_LABELS[option][ar ? "ar" : "en"]}
+                      </button>
+                    ))}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
       {/* ---- Recorded authorisations ---- */}
       <section className="hud-panel">
         <header className="hud-panel-head">
-          <span>{ar ? "التفويضات المسجّلة" : "RECORDED AUTHORISATIONS"}</span>
+          <span>{t("security.recorded_authorisations")}</span>
         </header>
         {loading ? (
           <p className="hud-micro" style={{ padding: "var(--space-3)", color: "var(--hud-text-mute)" }}>
-            {ar ? "جارٍ التحميل…" : "LOADING…"}
+            {t("security.loading")}
           </p>
         ) : (state.authorizations || []).length === 0 ? (
           <p className="hud-micro" style={{ padding: "var(--space-3)", color: "var(--hud-text-mute)" }}>
-            {ar ? "لا تفويضات. الفحص النشط مرفوض حتى تُضاف واحدة." : "None. Active testing is refused until one exists."}
+            {t("security.none_active_testing_is_refused_until_one_exists")}
           </p>
         ) : (
           <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
@@ -326,10 +472,10 @@ function SecurityView({ language = "en" }) {
                 )}
                 <span className="hud-micro ml-auto" style={{ color: auth.active ? "var(--hud-green)" : "var(--hud-amber)" }}>
                   {auth.revoked_at
-                    ? (ar ? "ملغى" : "REVOKED")
+                    ? (t("security.revoked"))
                     : auth.expired
-                      ? (ar ? "منتهٍ" : "EXPIRED")
-                      : (ar ? "نشط" : "ACTIVE")}
+                      ? (t("security.expired"))
+                      : (t("security.active_2"))}
                 </span>
                 {auth.active && (
                   <button
@@ -338,7 +484,7 @@ function SecurityView({ language = "en" }) {
                     className="hud-micro"
                     style={{ padding: "var(--space-1) var(--space-2)", cursor: "pointer", background: "transparent", border: "var(--border-w) solid var(--hud-edge-faint)", color: "var(--hud-red)" }}
                   >
-                    {ar ? "إلغاء" : "REVOKE"}
+                    {t("security.revoke")}
                   </button>
                 )}
               </li>

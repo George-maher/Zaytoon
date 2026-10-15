@@ -620,6 +620,18 @@ def render_observation(call: ToolCall, result: Dict[str, Any]) -> str:
         body = str(result.get("output") or "(no output)")
     elif result.get("blocked"):
         body = f"REFUSED BY THE SECURITY SANDBOX: {result.get('error')}"
+    elif result.get("denied"):
+        # Distinct from a failure, and the distinction is the point: a model
+        # told "FAILED" retries, or reaches the same capability through another
+        # tool. The permission is off because the user turned it off, so the
+        # only correct next step is to say so.
+        needed = ", ".join(result.get("permissions") or []) or "a required permission"
+        body = (
+            "NOT RUN - the user has turned this capability off, so the call is "
+            f"refused before any approval prompt (needs {needed}). Do not retry "
+            "it and do not look for another tool that reaches the same "
+            "capability; tell the user what you were trying to do."
+        )
     elif result.get("requires_confirmation"):
         body = (
             "NOT RUN - this action needs the user's explicit approval, and it "

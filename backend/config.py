@@ -723,6 +723,28 @@ class Config:
     WS_RATE_LIMIT_MAX: int = _env_int("WS_RATE_LIMIT_MAX", 60)
     WS_RATE_LIMIT_WINDOW: int = _env_int("WS_RATE_LIMIT_WINDOW", 60)
 
+    # -- WebSocket handshake policy (see api/ws_security.py) --------------
+    #: Extra `Origin` values a browser client may connect from, comma
+    #: separated, each a regex matched against the full origin. The loopback
+    #: origins the shipped clients use are always allowed; this is for a
+    #: deployment that serves the UI from another host.
+    WS_ALLOWED_ORIGINS: str = _env_str("WS_ALLOWED_ORIGINS", "")
+    #: Require a valid paired-device token on every WebSocket handshake. Off
+    #: by default: on a loopback-only install the web UI and the desktop shell
+    #: *are* the local user, and demanding a pairing step to talk to your own
+    #: machine is a setup cost with no attacker to stop. Turn it on when the
+    #: backend is reachable by anything else.
+    WS_REQUIRE_AUTH: bool = _env_bool("WS_REQUIRE_AUTH", False)
+    #: Allow an un-paired *remote* peer (i.e. not loopback) to open a socket.
+    #: Off by default so a misconfigured bind cannot silently expose desktop
+    #: control to the LAN; a remote client should pair a device instead.
+    WS_ALLOW_REMOTE: bool = _env_bool("WS_ALLOW_REMOTE", False)
+    #: Secret a *remote* caller must present to POST /devices/pair. Pairing
+    #: from loopback — the machine's own user — needs no secret. See
+    #: `services/auth.py` for why the endpoint is not open to anyone who can
+    #: reach the port.
+    PAIRING_SECRET: str = _env_str("ZAYTOON_PAIRING_SECRET", "")
+
     MAX_MESSAGE_LENGTH: int = 8000
     MAX_CONTEXT_MESSAGES: int = 50
     REMINDER_CHECK_INTERVAL: int = 15
