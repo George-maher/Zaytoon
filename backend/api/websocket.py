@@ -21,7 +21,7 @@ from common.reporting import client_error, safe_error, redact
 from common.tracing import set_trace_id
 from services.wake_word_service import apply_wake_gate
 from tools.safety import ConfirmationManager, PendingConfirmation
-from api.ws_protocol import validate_inbound, validate_outbound
+from api.ws_protocol import INBOUND_NAMES, validate_inbound, validate_outbound
 from core.events import bus as core_bus
 from core.orchestrator import Orchestrator
 from core.workspace.terminal import get_manager as get_terminal_manager
@@ -373,6 +373,31 @@ async def create_websocket_handler(
                 })
                 continue
             msg_type = data.get("type", "message")
+
+            # The declaration in `api/ws_protocol.py` is checked here, at the
+            # one place frames arrive. Before this, an inbound frame was
+            # interpreted by the `if`/`elif` chain below and *anything* the
+            # chain did not recognise fell off the end in silence — including a
+            # declared frame missing a required field, which then behaved like a
+            # different frame entirely (a `tool_confirm` with no `request_id`
+            # resolved nothing and said nothing). An undeclared *type* is still
+            # ignored rather than refused, because that is how a newer client
+            # and an older server coexist; a malformed one is now reported.
+            # Validated only when the frame *declares* a type: a frame with no
+            # `type` has always been read as a `message` here, and that leniency
+            # is what an older client relies on. Tightening it is a separate
+            # decision, not a side effect of adding validation.
+            declared = isinstance(data.get("type"), str)
+            problem = validate_inbound(data) if declared else None
+            if problem and msg_type in INBOUND_NAMES:
+                logger.warning(
+                    "Session %s: refusing malformed frame (%s)", session_id, problem
+                )
+                await connection_manager.send(websocket, {
+                    "type": "error",
+                    "content": f"Malformed {msg_type} frame ignored: {problem}",
+                })
+                continue
 
             if msg_type == "interrupt":
                 state = session_states.get(session_id)

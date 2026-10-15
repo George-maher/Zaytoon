@@ -281,6 +281,82 @@ class TestFilesystemTools:
         out = asyncio.run(registry.execute("file_read", {"path": "big.txt"}))["output"]
         assert "truncated" in out
 
+    def test_a_write_is_verified_by_reading_it_back(self, registry, workspace, gated):
+        """The result says the effect was observed, not merely attempted.
+
+        `write()` returning without raising means the call was accepted. The
+        agent loop is told never to claim an action it has not observed, and
+        this is where the observation happens — so the flag is set from the
+        file on disk.
+        """
+        result = asyncio.run(
+            registry.execute(
+                "file_write", {"path": "verified.txt", "content": "landed"},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["success"] is True
+        assert result["verified"] is True
+        assert (workspace / "verified.txt").read_text(encoding="utf-8") == "landed"
+
+    def test_a_write_that_does_not_land_is_a_failure(self, registry, workspace, gated, monkeypatch):
+        """The case the read-back exists for.
+
+        Simulated by making the write a no-op, which is what a full volume, a
+        path that turned out to be special, or a filesystem that filled up
+        between the two syscalls all look like from here.
+        """
+        from tools import filesystem as filesystem_module
+
+        monkeypatch.setattr(filesystem_module, "_write_file", lambda *a, **k: None)
+
+        result = asyncio.run(
+            registry.execute(
+                "file_write", {"path": "ghost.txt", "content": "never written"},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["success"] is False
+        # The message has to carry the truth either way: the bytes are not
+        # there. Which of the two paths reports it depends on whether the file
+        # exists at all when we look.
+        assert "could not read it back" in result["error"]
+        assert "verified" not in result or result.get("verified") is not True
+        assert not (workspace / "ghost.txt").exists()
+
+    def test_an_append_is_verified_against_its_tail(self, registry, workspace, gated):
+        asyncio.run(
+            registry.execute(
+                "file_write", {"path": "tail.txt", "content": "first\n"},
+                confirmation_manager=gated,
+            )
+        )
+        result = asyncio.run(
+            registry.execute(
+                "file_write", {"path": "tail.txt", "content": "second\n", "append": True},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["verified"] is True
+        assert (workspace / "tail.txt").read_text(encoding="utf-8") == "first\nsecond\n"
+
+    def test_a_tool_with_nothing_to_verify_does_not_claim_verification(self, registry, workspace):
+        """`verified` is absent, not `false`, for a read-only tool.
+
+        A `false` here would mean "we looked and it was not true"; for a tool
+        that had no effect there is nothing to look at, and a client that
+        renders "unverified" for `file_read` trains people to ignore the field
+        on the results where it matters.
+        """
+        (workspace / "plain.txt").write_text("x", encoding="utf-8")
+        result = asyncio.run(registry.execute("file_read", {"path": "plain.txt"}))
+
+        assert result["success"] is True
+        assert "verified" not in result
+
     def test_write_creates_parents(self, registry, workspace, gated):
         asyncio.run(
             registry.execute(

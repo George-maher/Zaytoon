@@ -53,6 +53,14 @@ class ToolResult:
     data: Optional[Dict[str, Any]] = None
     #: Set when the sandbox refused the call outright (no approval could help).
     blocked: bool = False
+    #: Whether the tool *checked* that its effect happened, as opposed to
+    #: reporting that its call returned without raising. `None` means "this tool
+    #: does not verify" — the honest empty, not a claim either way. A tool that
+    #: writes a file sets it by reading the file back: `write()` returning
+    #: normally is not evidence that the bytes are on disk, and an assistant
+    #: whose whole promise is "I do not claim what I have not observed" cannot
+    #: treat "no exception" as confirmation.
+    verified: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"success": self.success, "output": self.output}
@@ -62,11 +70,22 @@ class ToolResult:
             payload["data"] = self.data
         if self.blocked:
             payload["blocked"] = True
+        # Only when the tool actually checked. Serialising `null` would invite a
+        # client to render "not verified" for tools that never had an effect to
+        # verify (get_time, system_info) — noise that trains people to ignore
+        # the field that matters.
+        if self.verified is not None:
+            payload["verified"] = self.verified
         return payload
 
     @classmethod
-    def ok(cls, output: str, data: Optional[Dict[str, Any]] = None) -> "ToolResult":
-        return cls(success=True, output=output, data=data)
+    def ok(
+        cls,
+        output: str,
+        data: Optional[Dict[str, Any]] = None,
+        verified: Optional[bool] = None,
+    ) -> "ToolResult":
+        return cls(success=True, output=output, data=data, verified=verified)
 
     @classmethod
     def fail(
