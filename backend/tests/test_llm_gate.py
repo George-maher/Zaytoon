@@ -345,6 +345,79 @@ class TestClientWiring:
         assert body["llm"]["slots"]["limit"] == config.LLM_MAX_CONCURRENCY
 
 
+class _StubCaps:
+    supports_streaming = True
+    supports_tools = False
+    supports_structured_output = False
+
+
+class _StubProbe:
+    """A stand-in for OllamaClient: only ``probe_capabilities`` is exercised."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def probe_capabilities(self, model):
+        self.calls += 1
+        return _StubCaps()
+
+
+class TestModelSlot:
+    """A probe or a 'test chat' is a real generation and takes a real slot.
+
+    ``complete()``/``stream()`` were the only paths that held one, so a
+    user-triggered capability probe ran *alongside* a live turn — two
+    generations on one GPU, which is the exact case the bound exists for.
+    ``model_slot`` routes those callers through the same gate.
+    """
+
+    async def test_it_holds_a_slot_of_the_process_gate(self, monkeypatch):
+        from services import llm_client as mod
+        from services.llm_client import model_slot
+
+        gate = BoundedGate(limit=1, queue_timeout=5)
+        monkeypatch.setattr(mod, "_llm_gate", gate)
+        async with model_slot():
+            assert gate.stats()["in_flight"] == 1
+        assert gate.stats()["in_flight"] == 0
+
+    async def test_a_full_gate_refuses_a_probe_honestly(self, monkeypatch):
+        from fastapi import HTTPException
+
+        import api.main as main_module
+        from services import llm_client as mod
+
+        gate = BoundedGate(limit=1, queue_timeout=0.05)
+        monkeypatch.setattr(mod, "_llm_gate", gate)
+        release = asyncio.Event()
+
+        async def hold():
+            async with gate:
+                await release.wait()
+
+        holder = asyncio.create_task(hold())
+        await asyncio.sleep(0.02)
+
+        stub = _StubProbe()
+        with pytest.raises(HTTPException) as caught:
+            await main_module._probe_capabilities_gated(stub, "qwen3.5:9b")
+        assert caught.value.status_code == 503
+        assert stub.calls == 0, "the probe ran despite the gate being full"
+
+        release.set()
+        await holder
+
+    async def test_a_free_gate_lets_the_probe_through(self, monkeypatch):
+        import api.main as main_module
+        from services import llm_client as mod
+
+        monkeypatch.setattr(mod, "_llm_gate", BoundedGate(limit=2, queue_timeout=5))
+        stub = _StubProbe()
+        caps = await main_module._probe_capabilities_gated(stub, "qwen3.5:9b")
+        assert caps.supports_streaming is True
+        assert stub.calls == 1
+
+
 async def _wait_once(gate):
     async with gate:
         await asyncio.sleep(0.01)

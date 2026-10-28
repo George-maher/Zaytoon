@@ -14,6 +14,8 @@ Layout::
     ├── secrets.py       credential storage that never reaches a response
     ├── events.py        task.* / tool.* / model.* / permission.* vocabulary
     ├── permissions.py   the named permission vocabulary
+    ├── discovery        device discovery and inventory system
+    ├── inventory        device inventory model and repository
     ├── tasks/           task records, lifecycle, dependency graph
     ├── projects/        project detection, registry, model context
     ├── skills/          skill.json packages: discover, install, create
@@ -21,4 +23,4 @@ Layout::
     └── workspace/       file service, terminal sessions, and git
 """
 
-__all__ = ["db", "events", "paths", "permissions", "secrets"]
+__all__ = ["db", "events", "paths", "permissions", "secrets", "discovery", "inventory"]

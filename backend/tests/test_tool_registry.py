@@ -343,6 +343,81 @@ class TestFilesystemTools:
         assert result["verified"] is True
         assert (workspace / "tail.txt").read_text(encoding="utf-8") == "first\nsecond\n"
 
+    def test_a_multiline_append_is_verified_on_every_platform(
+        self, registry, workspace, gated
+    ):
+        """Byte offsets vs character counts — the false negative.
+
+        The read-back used to compute the tail window as ``tell() - len(content)``
+        while the file was open in *text* mode, where ``tell()`` counts bytes and
+        ``len()`` counts characters. On Windows the writer translates ``\\n`` to
+        ``\\r\\n``, so the two numbers disagreed by one per newline, the wrong
+        window was read, and a *successful* append was reported as "the write did
+        not land". That direction is the harmful one: it tells the model the write
+        failed it succeeded, and the natural recovery is to append it again.
+        """
+
+        asyncio.run(
+            registry.execute(
+                "file_write", {"path": "multi.txt", "content": "line one\nline two\n"},
+                confirmation_manager=gated,
+            )
+        )
+        result = asyncio.run(
+            registry.execute(
+                "file_write",
+                {"path": "multi.txt", "content": "line three\n", "append": True},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["success"] is True, result
+        assert result["verified"] is True
+        assert (
+            workspace / "multi.txt"
+        ).read_text(encoding="utf-8") == "line one\nline two\nline three\n"
+
+    def test_an_append_of_multibyte_text_is_verified(self, registry, workspace, gated):
+        """The same arithmetic breaks on any non-ASCII content too."""
+        asyncio.run(
+            registry.execute(
+                "file_write", {"path": "ar.txt", "content": "سطر\n"},
+                confirmation_manager=gated,
+            )
+        )
+        result = asyncio.run(
+            registry.execute(
+                "file_write",
+                {"path": "ar.txt", "content": "بك\n", "append": True},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["success"] is True, result
+        assert result["verified"] is True
+        assert (workspace / "ar.txt").read_text(encoding="utf-8") == "سطر\nبك\n"
+
+    def test_an_append_without_a_trailing_newline_is_verified(
+        self, registry, workspace, gated
+    ):
+        asyncio.run(
+            registry.execute(
+                "file_write", {"path": "noeol.txt", "content": "abc"},
+                confirmation_manager=gated,
+            )
+        )
+        result = asyncio.run(
+            registry.execute(
+                "file_write",
+                {"path": "noeol.txt", "content": "def", "append": True},
+                confirmation_manager=gated,
+            )
+        )
+
+        assert result["success"] is True, result
+        assert result["verified"] is True
+        assert (workspace / "noeol.txt").read_text(encoding="utf-8") == "abcdef"
+
     def test_a_tool_with_nothing_to_verify_does_not_claim_verification(self, registry, workspace):
         """`verified` is absent, not `false`, for a read-only tool.
 

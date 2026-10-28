@@ -1,4 +1,5 @@
 import { memo, useRef, useCallback, useEffect, useState } from "react";
+import { voiceStateBadge } from "../lib/voiceState";
 
 /**
  * Command input.
@@ -24,6 +25,10 @@ export default memo(function InputBar({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
+  /** The server's voice pipeline state (one of the seven in `lib/voiceState`).
+   *  `voiceMode` is the toggle; this is what the pipeline is actually doing, and
+   *  it is what the badge says. */
+  voiceState = "disabled",
   onStop,
   /** True while a turn is generating or speaking — the window in which STOP
    *  means something. Without it the button would either always show (and
@@ -35,6 +40,24 @@ export default memo(function InputBar({
   const formRef = useRef(null);
   const canRecord = !!onVoiceStart || !!onVoiceStop;
   const [_composing, setComposing] = useState(false);
+  // The badge names the *pipeline* state, not just "recording or not". With a
+  // continuous wake-word listener there are moments (working, waiting for an
+  // approval, speaking) where the button is on but the microphone is shut, and
+  // a bare "REC" claimed the opposite.
+  const badge = voiceStateBadge(voiceState, language);
+  // The toggle reflects the user's *intent* (`voiceMode`, which also follows
+  // the server's `enabled` frames); the badge reflects what the pipeline is
+  // doing. Keeping them separate is what lets the button read as "on" while
+  // the badge says WORK or TTS instead of a dishonest "REC".
+  const recorderOn = !!voiceMode;
+  const badgeColor =
+    badge.tone === "error"
+      ? "var(--hud-red)"
+      : badge.tone === "wait"
+        ? "var(--hud-amber)"
+        : badge.tone === "busy"
+          ? "var(--hud-cyan)"
+          : "var(--hud-green)";
 
   const handleSubmit = useCallback(
     (e) => {
@@ -143,19 +166,27 @@ export default memo(function InputBar({
                which left no way to stop a recording from the UI once the
                dock's duplicate mic was removed. The control must persist
                across the state change it controls. */
-            onClick={() => (voiceMode ? onVoiceStop?.() : onVoiceStart?.())}
+            onClick={() => (recorderOn ? onVoiceStop?.() : onVoiceStart?.())}
             className="absolute top-1/2 -translate-y-1/2 flex items-center justify-center transition-all"
             style={{
               width: "var(--ctl-size)",
               height: "var(--ctl-size)",
-              color: voiceMode ? "var(--hud-green)" : "var(--hud-text-mute)",
+              color: recorderOn ? badgeColor : "var(--hud-text-mute)",
               insetInlineEnd: "var(--space-2)",
-              background: voiceMode ? "color-mix(in srgb, var(--hud-green) 10%, transparent)" : "transparent",
-              border: `var(--border-w) solid ${voiceMode ? "color-mix(in srgb, var(--hud-green) 35%, transparent)" : "var(--hud-edge-faint)"}`,
+              background: recorderOn ? `color-mix(in srgb, ${badgeColor} 10%, transparent)` : "transparent",
+              border: `var(--border-w) solid ${recorderOn ? `color-mix(in srgb, ${badgeColor} 35%, transparent)` : "var(--hud-edge-faint)"}`,
             }}
-            title={language === "ar" ? "إدخال صوتي مباشر" : "Direct voice input"}
-            aria-label={language === "ar" ? "تفعيل الصوت" : "Activate voice mode"}
-            aria-pressed={!!voiceMode}
+            title={
+              recorderOn
+                ? language === "ar" ? "إيقاف وضع الصوت" : "Disable voice mode"
+                : language === "ar" ? "تفعيل وضع الصوت" : "Enable voice mode"
+            }
+            aria-label={
+              recorderOn
+                ? language === "ar" ? "إيقاف وضع الصوت" : "Disable voice mode"
+                : language === "ar" ? "تفعيل وضع الصوت" : "Enable voice mode"
+            }
+            aria-pressed={recorderOn}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
@@ -211,18 +242,20 @@ export default memo(function InputBar({
         {language === "ar" ? "إرسال" : "SEND"}
       </button>
 
-      {voiceMode && (
+      {badge.text && (
         <span
           className="font-mono flex-none"
           style={{
             padding: "0 var(--space-3)",
-            color: "var(--hud-green)",
+            color: badgeColor,
             fontSize: "var(--font-sm)",
             letterSpacing: "0.18em",
           }}
           role="status"
+          aria-live="polite"
+          data-voice-state={badge.key}
         >
-          <span aria-hidden="true">●</span> REC
+          <span aria-hidden="true">●</span> {badge.text}
         </span>
       )}
     </form>

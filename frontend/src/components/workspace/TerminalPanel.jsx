@@ -1,5 +1,7 @@
 import { memo, useCallback, useMemo, useState } from "react";
 
+import { translate } from "../../i18n/strings";
+
 /**
  * The integrated terminal.
  *
@@ -27,6 +29,13 @@ function TerminalPanel({
   const [activeId, setActiveId] = useState(sessions[0]?.id || null);
   const [command, setCommand] = useState("");
   const [error, setError] = useState(null);
+  /**
+   * The parked preview of `onOpen`'s first call: `{confirm, command, summary}`.
+   * The server validates the command and mints the token; nothing has run.
+   * Confirm replays the exact command shown to this panel; cancel drops the
+   * token (it expires anyway).
+   */
+  const [pendingOpen, setPendingOpen] = useState(null);
 
   const ar = language === "ar";
   const active = sessions.find((s) => s.id === activeId) || sessions[0] || null;
@@ -35,9 +44,14 @@ function TerminalPanel({
     const text = command.trim();
     if (!text) return;
     setError(null);
+    setPendingOpen(null);
     const result = await onOpen(text);
     if (result?.error) {
       setError(result.error);
+      return;
+    }
+    if (result?.requires_confirmation) {
+      setPendingOpen(result);
       return;
     }
     setCommand("");
@@ -49,6 +63,31 @@ function TerminalPanel({
       onRefreshOutput?.(result.id);
     }
   }, [command, onOpen, onWatch, onRefreshOutput]);
+
+  const confirmOpen = useCallback(async () => {
+    const preview = pendingOpen;
+    if (!preview) return;
+    setError(null);
+    setPendingOpen(null);
+    // The token, not this panel's current input, is what gets executed: the
+    // token is bound server-side to the exact command that was previewed.
+    const result = await onOpen(preview.command, "", preview.confirm);
+    if (result?.error) {
+      setError(result.error);
+      return;
+    }
+    if (result?.requires_confirmation) {
+      // A stale token (the clocks differ, or two panels raced) — re-preview.
+      setPendingOpen(result);
+      return;
+    }
+    setCommand("");
+    if (result?.id) {
+      setActiveId(result.id);
+      onWatch?.(result.id);
+      onRefreshOutput?.(result.id);
+    }
+  }, [pendingOpen, onOpen, onWatch, onRefreshOutput]);
 
   const select = useCallback(
     (id) => {
@@ -93,6 +132,39 @@ function TerminalPanel({
               ? "بدون رموز الصدفة: لا أنابيب، ولا اقتباس، ولا >&."
               : "No shell syntax: no pipes, quotes or chaining."}
           </p>
+          {pendingOpen && (
+            <div
+              role="alertdialog"
+              aria-label={translate(language, "terminal.confirm_dialog")}
+              style={{ marginTop: "var(--space-2)" }}
+            >
+              <p
+                className="hud-micro"
+                style={{ color: "var(--hud-amber)", direction: "ltr", textAlign: "left" }}
+                dir="ltr"
+              >
+                {pendingOpen.summary}
+              </p>
+              <div className="flex items-center gap-2" style={{ marginTop: "var(--space-1)" }}>
+                <button
+                  type="button"
+                  className="hud-micro"
+                  onClick={confirmOpen}
+                  style={{ color: "var(--hud-amber)" }}
+                >
+                  {translate(language, "terminal.run_action")}
+                </button>
+                <button
+                  type="button"
+                  className="hud-micro"
+                  onClick={() => setPendingOpen(null)}
+                  style={{ color: "var(--hud-text-mute)" }}
+                >
+                  {translate(language, "common.cancel")}
+                </button>
+              </div>
+            </div>
+          )}
           {error && (
             <p role="alert" style={{ marginTop: "var(--space-2)", color: "var(--hud-red)" }}>
               {error}

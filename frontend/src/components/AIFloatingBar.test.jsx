@@ -15,7 +15,7 @@ describe("AIFloatingBar", () => {
   it("gives a screen the product's composer, with its one accessible name", () => {
     render(<AIFloatingBar language="en" isConnected onSend={vi.fn()} {...voice} />);
     expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
-    expect(screen.getAllByLabelText(/activate voice mode/i)).toHaveLength(1);
+    expect(screen.getAllByLabelText(/voice mode/i)).toHaveLength(1);
   });
 
   it("sends through the same send path InputBar uses", () => {

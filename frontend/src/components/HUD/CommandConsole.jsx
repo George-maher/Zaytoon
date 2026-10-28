@@ -21,6 +21,9 @@ function CommandConsole({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
+  /** The server's pipeline state; the badge beside the composer names it so
+   *  "recording" is never claimed while the assistant is working or speaking. */
+  voiceState = "disabled",
   isListening,
   subtitle,
   statusText,
@@ -93,6 +96,7 @@ function CommandConsole({
               onVoiceStart={onVoiceStart}
               onVoiceStop={onVoiceStop}
               voiceMode={voiceMode}
+              voiceState={voiceState}
             />
           </div>
 

@@ -308,6 +308,73 @@ class TestMalformedFallsBack:
 
 
 # ---------------------------------------------------------------------------
+# Retry-After
+# ---------------------------------------------------------------------------
+class TestRetryAfterIsHonoured:
+    """``_retry_after_seconds`` was written, documented as honoured, and never
+    called — so the header did nothing at all.
+
+    The rule now: the header may only make a bench *shorter*. A provider saying
+    "retry in 2s" is evidence that contention cleared; ignoring it and benching
+    the model for the full 90 s cooldown is ignoring the only evidence there is.
+    """
+
+    def test_a_hint_shortens_the_bench(self):
+        c = LLMClient(max_retries=1)
+        response = httpx.Response(429, headers={"retry-after": "2"})
+        assert c._cooldown_with_retry_after("rate_limited", response) == 2.0
+
+    def test_no_header_keeps_the_default(self):
+        c = LLMClient(max_retries=1)
+        assert c._cooldown_with_retry_after(
+            "rate_limited", httpx.Response(429)
+        ) == c._cooldown_for("rate_limited")
+
+    def test_a_zero_hint_is_ignored(self):
+        """`Retry-After: 0` must not become a tight retry loop."""
+        c = LLMClient(max_retries=1)
+        response = httpx.Response(429, headers={"retry-after": "0"})
+        assert c._cooldown_with_retry_after("rate_limited", response) == (
+            c._cooldown_for("rate_limited")
+        )
+
+    def test_an_absurd_hint_is_capped(self):
+        c = LLMClient(max_retries=1)
+        response = httpx.Response(429, headers={"retry-after": "3600"})
+        assert c._cooldown_with_retry_after("rate_limited", response) == 5.0
+
+    def test_a_garbage_hint_falls_back_to_the_default(self):
+        c = LLMClient(max_retries=1)
+        response = httpx.Response(429, headers={"retry-after": "soon"})
+        assert c._cooldown_with_retry_after("rate_limited", response) == (
+            c._cooldown_for("rate_limited")
+        )
+
+    async def test_a_429_with_a_hint_benches_briefly(self, monkeypatch):
+        monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-test", raising=False)
+        import time as _time
+
+        c = client_with(
+            lambda u, p, h: httpx.Response(
+                429, headers={"retry-after": "1"}, text="slow down"
+            )
+        )
+        with pytest.raises(LLMError):
+            await c.complete([{"role": "user", "content": "x"}])
+
+        remaining = [
+            state.blocked_until - _time.monotonic()
+            for state in c.health.values()
+            if getattr(state, "blocked_until", 0)
+        ]
+        assert remaining, "the model should have been benched"
+        assert max(remaining) <= 5.0, (
+            "a 429 that advertises Retry-After must not be benched for the "
+            "full 90 s default"
+        )
+
+
+# ---------------------------------------------------------------------------
 # SSE frame parsing
 # ---------------------------------------------------------------------------
 class TestSSEParsing:
@@ -332,3 +399,56 @@ class TestSSEParsing:
     )
     def test_ignores_unusable_frames(self, raw):
         assert LLMClient._parse_sse_line(raw) is None
+
+    def test_extracts_native_tool_call_deltas(self):
+        frame = json.dumps({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "get_time", "arguments": "{}"}}
+        ]}}]})
+        calls = LLMClient._parse_sse_tool_calls(frame)
+        assert [c["function"]["name"] for c in calls] == ["get_time"]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "{not json",
+            json.dumps({"choices": [{"delta": {"content": "hi"}}]}),
+            json.dumps({"choices": []}),
+            json.dumps({"choices": [{"delta": {"tool_calls": "nope"}}]}),
+            json.dumps({"error": {"message": "boom"}}),
+            "",
+        ],
+    )
+    def test_tool_call_parser_ignores_everything_else(self, raw):
+        assert LLMClient._parse_sse_tool_calls(raw) == []
+
+    def test_fragmented_calls_merge_by_index(self):
+        """OpenAI fragments a call: name in one frame, arguments in the rest."""
+        pending = {}
+        LLMClient._merge_tool_call(
+            pending, {"index": 0, "function": {"name": "file_read", "arguments": ""}}
+        )
+        LLMClient._merge_tool_call(
+            pending, {"index": 0, "function": {"arguments": '{"path"'}}
+        )
+        LLMClient._merge_tool_call(
+            pending, {"index": 0, "function": {"arguments": ': "a.txt"}'}}
+        )
+        assert LLMClient._render_accumulated_calls(pending) == [
+            json.dumps({"action": "file_read", "params": {"path": "a.txt"}})
+        ]
+
+    def test_a_nameless_fragment_is_not_a_call(self):
+        pending = {}
+        LLMClient._merge_tool_call(
+            pending, {"index": 0, "function": {"arguments": "{}"}}
+        )
+        assert LLMClient._render_accumulated_calls(pending) == []
+
+    def test_unparseable_arguments_are_kept_as_raw(self):
+        """Losing the call would be worse than reporting its arguments as bad."""
+        pending = {}
+        LLMClient._merge_tool_call(
+            pending, {"index": 0, "function": {"name": "t", "arguments": "{oops"}}
+        )
+        rendered = LLMClient._render_accumulated_calls(pending)
+        assert json.loads(rendered[0]) == {"action": "t", "params": {"_raw": "{oops"}}

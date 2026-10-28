@@ -222,6 +222,40 @@ def sanitize_app_name(app: str) -> str:
     return text
 
 
+#: The single allow-list of application **names** Zaytoon launches and closes
+#: without extra scrutiny. It is one authority on purpose: `POST
+#: /command/open-app` (`api/main.py::APP_WHITELIST`) and the Computer view both
+#: read this set, because the previous arrangement kept a second copy of the
+#: list in the REST layer — so the *agent's* `open_app` tool would launch any
+#: name (a `shutil.which` fallback reaches any binary on `PATH`) while the REST
+#: route refused it. Two entry points, two policies, and no test that compared
+#: them.
+#:
+#: Membership here is necessary but not sufficient for a *close*: a name outside
+#: this set that is still one of our known applications (a key of
+#: `tools.applications.APP_PATHS`) may also be closed, resolved to its exact
+#: binary. A name in neither table is refused outright — that is the property
+#: that stops `close_app` from being a remote kill switch.
+APP_LAUNCH_ALLOWLIST: frozenset = frozenset(
+    {
+        "chrome", "google chrome", "firefox", "edge", "microsoft edge",
+        "vscode", "vs code", "visual studio code",
+        "notepad", "notepad++", "calculator", "cmd", "powershell",
+        "terminal", "command prompt", "file explorer", "explorer",
+        "spotify", "discord", "slack", "zoom", "teams", "microsoft teams",
+        "outlook", "word", "excel", "powerpoint", "paint", "regedit",
+        "task manager", "control panel", "settings", "fxsound",
+    }
+)
+
+
+def is_allowed_app(name: str) -> bool:
+    """Whether ``name`` is on the launch allow-list (case/space-insensitive)."""
+    if not isinstance(name, str):
+        return False
+    return name.strip().lower() in APP_LAUNCH_ALLOWLIST
+
+
 # ---------------------------------------------------------------------------
 # PowerShell invocation
 # ---------------------------------------------------------------------------

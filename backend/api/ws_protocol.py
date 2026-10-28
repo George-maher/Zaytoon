@@ -83,9 +83,18 @@ INBOUND: Dict[str, FrameSpec] = _specs(
     ),
     FrameSpec(
         "audio", "in", required=("audio",),
-        optional=("language", "isManualVoice"),
+        optional=("language", "isManualVoice", "utterance_id"),
         note="base64 audio; refused above MAX_AUDIO_FRAME_B64 before decoding. "
-             "The client's key is `audio`, not `data`",
+             "The client's key is `audio`, not `data`. `utterance_id` makes the "
+             "frame idempotent across a reconnect; `isManualVoice` only skips "
+             "the wake gate when WAKE_WORD_ALLOW_MANUAL_BYPASS is on",
+    ),
+    FrameSpec(
+        "voice", "in", required=("action",),
+        optional=("language",),
+        note="enable | disable | stop_recording | cancel. Enabling starts "
+             "wake-word standby; stop_recording finalizes capture without "
+             "cancelling an accepted command; cancel is the explicit abort",
     ),
     FrameSpec("interrupt", "in", note="cancels the in-flight turn"),
     FrameSpec(
@@ -127,6 +136,13 @@ OUTBOUND: Dict[str, FrameSpec] = _specs(
     FrameSpec("stt_result", "out", optional=("language", "voice", "duration"),
               note="emitted only when the spoken language is known"),
     FrameSpec("wake_word", "out", optional=("detected",)),
+    FrameSpec(
+        "voice_state", "out", required=("state",),
+        optional=("enabled", "reason", "utterance_id", "response_id",
+                  "awaiting_command"),
+        note="the explicit voice lifecycle: disabled | standby | listening | "
+             "processing | awaiting_confirmation | speaking | recovering",
+    ),
     FrameSpec("subtitle", "out", required=("content",), optional=("response_id",)),
     FrameSpec("audio_start", "out", optional=("response_id", "voice", "mime", "rate")),
     FrameSpec("audio_chunk", "out", required=("data",), optional=("response_id",)),

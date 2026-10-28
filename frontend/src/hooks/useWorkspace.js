@@ -351,9 +351,13 @@ export default function useWorkspace(_language = "en") {
 
   // -- terminal --------------------------------------------------------
   const openTerminal = useCallback(
-    async (command, cwd = "") => {
-      const result = await api.openTerminal(command, { cwd });
+    async (command, cwd = "", confirm = null) => {
+      const result = await api.openTerminal(command, { cwd, confirm });
       if (fail(result)) return null;
+      // The server's preview frame: `{requires_confirmation, confirm, …}` —
+      // nothing has run yet, and no session exists to add. The caller renders
+      // the preview and re-calls with the token.
+      if (result.requires_confirmation) return result;
       setSessions((prev) => [result, ...prev]);
       setTerminalLines([]);
       return result;

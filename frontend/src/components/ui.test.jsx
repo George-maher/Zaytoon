@@ -76,11 +76,11 @@ describe('InputBar', () => {
 
   it('offers a mic button only when a handler is supplied', () => {
     const { rerender } = render(<InputBar onSend={vi.fn()} isConnected language="en" />)
-    expect(screen.queryByLabelText('Activate voice mode')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Enable voice mode')).not.toBeInTheDocument()
     rerender(
       <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} />,
     )
-    expect(screen.getByLabelText('Activate voice mode')).toBeInTheDocument()
+    expect(screen.getByLabelText('Enable voice mode')).toBeInTheDocument()
   })
 
   it('starts voice mode from the mic button', () => {
@@ -88,17 +88,27 @@ describe('InputBar', () => {
     render(
       <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={onVoiceStart} />,
     )
-    fireEvent.click(screen.getByLabelText('Activate voice mode'))
+    fireEvent.click(screen.getByLabelText('Enable voice mode'))
     expect(onVoiceStart).toHaveBeenCalled()
   })
 
   it('shows a voice-active indicator', () => {
-    render(<InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} voiceMode />)
+    render(
+      <InputBar
+        onSend={vi.fn()}
+        isConnected
+        language="en"
+        onVoiceStart={vi.fn()}
+        voiceMode
+        voiceState="listening"
+      />,
+    )
     // Restyled from the literal "VOICE ON" to a recording indicator, but the
     // requirement is unchanged: the state must be readable as text, not only
-    // as a colour change on the button.
+    // as a colour change on the button. The badge is driven by the server's
+    // voice state, so the test supplies the state the mic click produces.
     expect(screen.getByText(/REC/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /activate voice mode/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /voice mode/i })).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('keeps the mic mounted so a recording can be stopped', () => {
@@ -106,11 +116,11 @@ describe('InputBar', () => {
     const { rerender } = render(
       <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} voiceMode={false} />,
     )
-    expect(screen.getByRole('button', { name: /activate voice mode/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /voice mode/i })).toBeInTheDocument()
     rerender(
       <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} onVoiceStop={vi.fn()} voiceMode />,
     )
-    expect(screen.getByRole('button', { name: /activate voice mode/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /voice mode/i })).toBeInTheDocument()
   })
 
   it('stops recording through the same mic control', () => {
@@ -118,7 +128,7 @@ describe('InputBar', () => {
     render(
       <InputBar onSend={vi.fn()} isConnected language="en" onVoiceStart={vi.fn()} onVoiceStop={onVoiceStop} voiceMode />,
     )
-    fireEvent.click(screen.getByRole('button', { name: /activate voice mode/i }))
+    fireEvent.click(screen.getByRole('button', { name: /voice mode/i }))
     expect(onVoiceStop).toHaveBeenCalled()
   })
 })

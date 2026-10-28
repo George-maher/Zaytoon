@@ -72,6 +72,29 @@ class MidStreamDrop:
         return gen()
 
 
+class SlowStream:
+    """A 200 stream whose first line arrives after a delay, then ends cleanly.
+
+    Used to make time-to-first-token measurable without a real socket.
+    """
+
+    status_code = 200
+
+    def __init__(self, text, delay=0.05):
+        self.text = text
+        self.delay = delay
+
+    def aiter_lines(self):
+        slow = self
+
+        async def gen():
+            await asyncio.sleep(slow.delay)
+            for line in slow.text.splitlines():
+                yield line
+
+        return gen()
+
+
 class RecordingClient:
     """Stands in for httpx.AsyncClient and records every request."""
 
@@ -108,7 +131,7 @@ class _FakeStream:
                 # Mirror httpx: reading is required before `.text`.
                 self._result.request = httpx.Request("POST", "http://x")
             return self._result
-        if isinstance(self._result, MidStreamDrop):
+        if isinstance(self._result, (MidStreamDrop, SlowStream)):
             return self._result
         raise AssertionError("non-200 stream must be an httpx.Response")
 
@@ -452,6 +475,59 @@ class TestStreaming:
         assert deltas == ["Hel", "lo ", "world"]
         assert result == "Hello world"
         assert client._client.requests[0]["json"]["stream"] is True
+
+    async def test_stream_records_time_to_first_token(self, monkeypatch):
+        """TTFT is the number a user feels: a fast total can still sit empty."""
+        body = sse_lines(["Hel", "lo"])
+        client = make_client(
+            lambda url, payload, headers: SlowStream(body, delay=0.05)
+        )
+        records = []
+        client._emit_model_event = records.append
+
+        await client.stream([{"role": "user", "content": "x"}])
+
+        ok = [r for r in records if r.outcome == "ok"]
+        assert ok, "the streamed attempt was not recorded"
+        assert ok[0].ttft_ms >= 40, (
+            f"time-to-first-token was not measured: {ok[0].ttft_ms}ms"
+        )
+        assert ok[0].ttft_ms <= ok[0].latency_ms
+
+    async def test_a_native_tool_call_survives_streaming(self, monkeypatch):
+        """A model that streams only ``tool_calls`` is not an empty completion.
+
+        The chain's SSE reader looked at ``delta.content`` alone, so a native
+        tool call — how OpenAI-shaped endpoints actually emit one — left the
+        accumulated text empty, raised ``stream completed with no content``,
+        benched a working model and failed the turn. The call is now collected
+        off-wire and rendered into the JSON-in-text dialect the validator and
+        the engine both read.
+        """
+        body = "\n\n".join([
+            "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "get_time", "arguments": ""}}
+            ]}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{}"}}
+            ]}}]}),
+            "data: [DONE]",
+        ]) + "\n\n"
+        client = make_client(
+            lambda url, payload, headers: httpx.Response(200, text=body)
+        )
+
+        deltas = []
+
+        async def on_delta(text):
+            deltas.append(text)
+
+        result = await client.stream(
+            [{"role": "user", "content": "x"}], on_delta=on_delta
+        )
+        # A tool call is not prose: none of it reaches the token stream.
+        assert deltas == []
+        assert json.loads(result) == {"action": "get_time", "params": {}}
 
     async def test_stream_429_before_first_delta_switches_endpoint(
         self, monkeypatch

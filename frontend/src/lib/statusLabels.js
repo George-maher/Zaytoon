@@ -32,6 +32,13 @@ const EN = {
   transcribing: "Transcribing…",
   awaiting: "Say your command…",
   offline: "Offline",
+  // The seven voice states. `standby` is deliberately not "Ready": voice mode
+  // is on and the microphone is open, and the one useful thing to say is the
+  // word that makes it act.
+  voiceStandby: "Say “Zaytoon”…",
+  voiceListening: "Listening for your command…",
+  voiceProcessing: "Working on your command…",
+  voiceRecovering: "Voice hit a problem — press the mic to retry",
 };
 
 const AR = {
@@ -49,6 +56,10 @@ const AR = {
   transcribing: "أحوّل الصوت…",
   awaiting: "قل أمرك…",
   offline: "غير متصل",
+  voiceStandby: "قل «زيتون»…",
+  voiceListening: "أستمع لأمرك…",
+  voiceProcessing: "بشتغل على أمرك…",
+  voiceRecovering: "حصلت مشكلة في الصوت — اضغط المايك وحاول تاني",
 };
 
 /**
@@ -63,6 +74,7 @@ const AR = {
  * @param {boolean} [s.isSpeaking]
  * @param {boolean} [s.isTyping]
  * @param {object|null} [s.pendingConfirmation]
+ * @param {string} [s.voiceState]       the server's voice pipeline state
  * @param {"en"|"ar"} [s.language]
  * @returns {string}
  */
@@ -77,6 +89,7 @@ export function statusLabel({
   isSpeaking = false,
   isTyping = false,
   pendingConfirmation = null,
+  voiceState = "disabled",
   language = "en",
 } = {}) {
   const t = language === "ar" ? AR : EN;
@@ -86,10 +99,20 @@ export function statusLabel({
   // running, so this is what the user is actually waiting on.
   if (!connected) return everConnected ? t.reconnecting : t.connecting;
 
-  // Blocked on a person: above every "working" state by design.
-  if (pendingConfirmation || status === "awaiting_confirmation") return t.approval;
+  // Blocked on a person: above every "working" state by design. The voice
+  // state can say the same thing, and when it does it is the more specific
+  // answer (the block is on a voice command).
+  if (
+    pendingConfirmation ||
+    status === "awaiting_confirmation" ||
+    voiceState === "awaiting_confirmation"
+  ) {
+    return t.approval;
+  }
 
-  if (isSpeaking || status === "speaking") return t.speaking;
+  if (isSpeaking || status === "speaking" || voiceState === "speaking") {
+    return t.speaking;
+  }
 
   // Tokens are already flowing — the most recent thing that is happening.
   if (streaming) return t.generating;
@@ -107,7 +130,9 @@ export function statusLabel({
   // announced plan (say so), or simply working (the honest generic word).
   if (status === "executing") return hasPlan ? t.planning : t.thinking;
 
-  if (status === "transcribing") return t.transcribing;
+  if (status === "transcribing" || voiceState === "processing") {
+    return voiceState === "processing" ? t.voiceProcessing : t.transcribing;
+  }
 
   if (status === "thinking" || status === "analyzing" || isTyping) {
     // The router's intent is what distinguishes "understanding a request"
@@ -115,7 +140,15 @@ export function statusLabel({
     return intent ? t.understanding : t.thinking;
   }
 
-  if (status === "awaiting_command") return t.awaiting;
+  if (status === "awaiting_command" || voiceState === "listening") return t.awaiting;
+
+  // Voice mode on and idle. "Ready" would hide the one thing that matters:
+  // nothing is heard until the wake word is said.
+  if (voiceState === "standby") return t.voiceStandby;
+
+  // A failure the user can act on. Above "Ready" for the same reason the
+  // approval is: claiming to be fine while the microphone is not is a lie.
+  if (voiceState === "recovering") return t.voiceRecovering;
 
   if (status === "listening" || status === "connected" || status === "done" || !status) {
     // A finished turn keeps its plan on screen (it is only cleared with the

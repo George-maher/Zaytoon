@@ -31,22 +31,23 @@ from app import theme  # noqa: E402
 # shell had been magenta — one pin saying `#22d3ee`, the other comparing the CSS
 # `#d946ef` — and only the Windows leg ran either.
 REQUIRED_COLORS = {
-    "BG0": "#0a0510",
-    "BG1": "#110a1a",
-    "BG2": "#180f24",
-    "HAIRLINE": "#1a0e2a",
-    "BORDER_STRONG": "#24344a",
-    "TEXT_BASE": "#f3eef9",
-    "TEXT_MUTE": "#7a6c8a",
-    "TEXT_FAINT": "#7a6c8a",
-    # The accent is the HUD reference's magenta. The name `CYAN` and the
-    # `--hud-cyan` token both outlived the colour, and `test_design_parity` pins
-    # them together, so the name stays and the value moved.
-    "CYAN": "#d946ef",
-    "GREEN": "#35d399",
-    "AMBER": "#f2b84b",
-    "RED": "#ff6b6b",
-    "VIOLET": "#e879f9",
+    "BG0": "#010812",
+    "BG1": "#020d1a",
+    "BG2": "#071428",
+    "HAIRLINE": "#0b1d30",
+    "BORDER_STRONG": "#144e63",
+    "TEXT_BASE": "#c6d4e7",
+    "TEXT_MUTE": "#6b809c",
+    "TEXT_FAINT": "#6b809c",
+    # The accent is the Figma reference's system cyan. The name `CYAN` and the
+    # `--hud-cyan` token both outlived two colour migrations, and
+    # `test_design_parity` pins them together, so the name stays and the value
+    # moved with the stylesheet.
+    "CYAN": "#00f5ff",
+    "GREEN": "#22c55e",
+    "AMBER": "#f59e0b",
+    "RED": "#ec4899",
+    "VIOLET": "#a855f7",
 }
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -67,9 +68,11 @@ class TestRequiredTokens:
 
 
 class TestRadiusAndSpacing:
-    def test_radius_scale_is_8_6_2(self):
-        assert theme.RADIUS_PANEL == 8
-        assert theme.RADIUS_CARD == 6
+    def test_radius_scale_is_16_12_2(self):
+        # The Figma reference rounds its tiles and dock; the scale moved from
+        # 8/6 to 16/12 in step with frontend theme.css --radius-panel/card.
+        assert theme.RADIUS_PANEL == 16
+        assert theme.RADIUS_CARD == 12
         assert theme.RADIUS_CONTROL == 2
 
     def test_radius_decreases_as_the_element_gets_smaller(self):

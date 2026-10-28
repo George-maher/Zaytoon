@@ -241,7 +241,7 @@ describe("GitPanel", () => {
     expect(screen.queryByRole("option", { name: /origin\/main/ })).not.toBeInTheDocument();
     expect(screen.getByRole("option", { name: /dev/ })).toBeInTheDocument();
     fireEvent.change(select, { target: { value: "dev" } });
-    await waitFor(() => expect(api.gitCheckout).toHaveBeenCalledWith("dev", { path: "." }));
+    await waitFor(() => expect(api.gitCheckout).toHaveBeenCalledWith("dev", { path: ".", confirm: null }));
   });
 
   it("pulls fast-forward first and offers a merge when it is refused", async () => {
@@ -284,7 +284,7 @@ describe("GitPanel", () => {
     fireEvent.click(await screen.findByRole("button", { name: /^fetch$/i }));
     await waitFor(() => expect(api.gitFetch).toHaveBeenCalledWith({ path: "." }));
     fireEvent.click(screen.getByRole("button", { name: /^push$/i }));
-    await waitFor(() => expect(api.gitPush).toHaveBeenCalledWith({ path: "." }));
+    await waitFor(() => expect(api.gitPush).toHaveBeenCalledWith({ path: ".", confirm: null }));
     fireEvent.click(screen.getByRole("button", { name: /stage all/i }));
     await waitFor(() => expect(api.gitAdd).toHaveBeenCalledWith([], { all: true, path: "." }));
   });
@@ -325,7 +325,7 @@ describe("GitPanel", () => {
     expect(api.gitRestore).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /confirm discard a\.py/i }));
     await waitFor(() =>
-      expect(api.gitRestore).toHaveBeenCalledWith(["a.py"], { staged: false, path: "." })
+      expect(api.gitRestore).toHaveBeenCalledWith(["a.py"], { staged: false, path: ".", confirm: null })
     );
   });
 
@@ -420,7 +420,7 @@ describe("GitPanel", () => {
     // Send on the second click.
     fireEvent.click(screen.getByRole("button", { name: "MERGE" }));
     await waitFor(() =>
-      expect(api.gitMerge).toHaveBeenCalledWith("dev", { path: "." }),
+      expect(api.gitMerge).toHaveBeenCalledWith("dev", { path: ".", confirm: null }),
     );
     await waitFor(() =>
       expect(screen.queryByLabelText("Branch to merge")).not.toBeInTheDocument(),
@@ -464,6 +464,103 @@ describe("GitPanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "CONFLICT (content): Merge conflict in a.py",
     );
+  });
+
+  it("previews a consequential verb, then runs only on the token", async () => {
+    // Two-step approval: the first call must never have an effect, and the
+    // confirming call must carry the server's own token back — the panel is
+    // the second half of the guarantee the backend enforces.
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({
+        clean: false, branch: "main", staged: 1,
+        entries: [{ path: "a.py", status: "modified", staged: true, unstaged: false }],
+      })),
+      gitCommit: vi.fn(async (message, { confirm = null } = {}) =>
+        confirm
+          ? { status: { clean: true, branch: "main", entries: [] } }
+          : {
+              requires_confirmation: true,
+              confirm: "git_t1",
+              action: "commit",
+              summary: 'Commit staged changes as "wip"',
+              tier: "confirm",
+            },
+      ),
+    }));
+    render(<GitPanel path="." />);
+    fireEvent.change(await screen.findByLabelText(/commit message/i), {
+      target: { value: "wip" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /commit/i }));
+
+    // The preview row shows the server's own words; step 2 has not happened.
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+      'Commit staged changes as "wip"',
+    );
+    expect(api.gitCommit).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: /^confirm$/i }));
+    await waitFor(() => expect(api.gitCommit).toHaveBeenCalledTimes(2));
+    expect(api.gitCommit).toHaveBeenLastCalledWith("wip", { path: ".", confirm: "git_t1" });
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("cancelling a preview runs nothing", async () => {
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({
+        clean: false, branch: "main", staged: 1,
+        entries: [{ path: "a.py", status: "modified", staged: true, unstaged: false }],
+      })),
+      gitCommit: vi.fn(async () => ({
+        requires_confirmation: true,
+        confirm: "git_t2",
+        action: "commit",
+        summary: 'Commit staged changes as "wip"',
+        tier: "confirm",
+      })),
+    }));
+    render(<GitPanel path="." />);
+    fireEvent.change(await screen.findByLabelText(/commit message/i), {
+      target: { value: "wip" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /commit/i }));
+    await screen.findByRole("alertdialog");
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(api.gitCommit).toHaveBeenCalledTimes(1); // the preview only
+  });
+
+  it("a failed confirm reports the server's reason and parks no token", async () => {
+    mockApi(respond({
+      getGitStatus: vi.fn(async () => ({
+        clean: false, branch: "main", staged: 1,
+        entries: [{ path: "a.py", status: "modified", staged: true, unstaged: false }],
+      })),
+      gitCommit: vi.fn(async (message, { confirm = null } = {}) =>
+        confirm
+          ? { error: "Unknown or expired confirmation token. Preview the change again." }
+          : {
+              requires_confirmation: true,
+              confirm: "git_t3",
+              action: "commit",
+              summary: 'Commit staged changes as "wip"',
+              tier: "confirm",
+            },
+      ),
+    }));
+    render(<GitPanel path="." />);
+    fireEvent.change(await screen.findByLabelText(/commit message/i), {
+      target: { value: "wip" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /commit/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^confirm$/i }));
+
+    expect(await screen.findByText(/expired confirmation token/i)).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(api.gitCommit).toHaveBeenCalledTimes(2);
   });
 
   it("says an empty history is empty rather than showing nothing", async () => {

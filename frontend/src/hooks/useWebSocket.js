@@ -1,5 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { clientMsgId } from "../lib/ids";
+import {
+  VOICE_STATES,
+  applyVoiceState,
+  canCapture,
+} from "../lib/voiceState";
+import { reconnectDelay } from "../lib/backoff";
 
 const WS_URL = (() => {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -72,6 +78,43 @@ function clockTime() {
 
 export function normalizeStatus(status) {
   return KNOWN_STATUSES.has(status) ? status : FALLBACK_STATUS;
+}
+
+// ---------------------------------------------------------------------------
+// Microphone capture
+// ---------------------------------------------------------------------------
+/** How often the VAD samples the analyser. */
+const VAD_FRAME_MS = 50;
+/**
+ * Silence frames that end an utterance. 10 × 50 ms = 500 ms: long enough that
+ * a natural pause between words does not split one command into two, short
+ * enough that the assistant answers before the user wonders whether it heard.
+ */
+const VAD_SILENCE_FRAMES = 10;
+/** Anything shorter than this is a cough or a door, not a word. */
+const VAD_MIN_SPEECH_MS = 400;
+/** A hard ceiling on one utterance, so a monologue still produces an answer. */
+const VAD_MAX_SEGMENT_MS = 20000;
+
+/**
+ * A recorder with the codec faster-whisper decodes most reliably.
+ *
+ * Module scope, not a component local: it is called from a `useCallback`, and a
+ * local would either be a missing dependency or rebuild the recorder whenever
+ * an unrelated render happened.
+ */
+function createRecorder(stream) {
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+  if (typeof MediaRecorder === "undefined") {
+    throw new Error("MediaRecorder is unavailable in this browser");
+  }
+  for (const mime of types) {
+    if (MediaRecorder.isTypeSupported(mime)) {
+      return new MediaRecorder(stream, { mimeType: mime });
+    }
+  }
+  console.warn("No preferred audio MIME type supported, using browser default");
+  return new MediaRecorder(stream);
 }
 
 /**
@@ -165,6 +208,11 @@ export default function useWebSocket() {
   const [intent, setIntent] = useState(null);
   const [subtitle, setSubtitle] = useState("");
   const [voiceMode, setVoiceMode] = useState(false);
+  //: What the *pipeline* is doing, as the server reports it. `voiceMode` is the
+  //: user's choice; this is the truth. Keeping them apart is what lets the HUD
+  //: say "working on your command" without the microphone capturing a second
+  //: one, and it is the state the capture gate reads.
+  const [voiceState, setVoiceState] = useState(VOICE_STATES.DISABLED);
   const [awaitingCommand, setAwaitingCommand] = useState(false);
   const [language, setLanguage] = useState(() => {
     // Restored from the device so an Arabic session survives a reload. The
@@ -214,7 +262,33 @@ export default function useWebSocket() {
   // audio_end branch, so nothing could stop a voice that had already started —
   // the STOP control only flipped the flags while the audio kept talking.
   const audioPlayerRef = useRef(null);
-  const voiceModeRef = useRef(false);
+  //: Voice-state refs. The capture loop runs outside React's render cycle, so
+  //: it reads the *refs*, never the state values, or a segment boundary would
+  //: see whatever state happened to be captured when the callback was created.
+  const voiceStateRef = useRef(VOICE_STATES.DISABLED);
+  //: The user's intent, which deliberately survives a reconnect: enabling voice
+  //: starts a persistent wake-word listener, so a dropped socket re-arms it
+  //: once the link is back. No audio is ever replayed.
+  const micDesiredRef = useRef(false);
+  const captureActiveRef = useRef(false);
+  const startingCaptureRef = useRef(false);
+  const audioGraphRef = useRef(null);
+  const vadTimerRef = useRef(null);
+  const speechRef = useRef({ speaking: false, start: 0 });
+  const energyHistoryRef = useRef([]);
+  const silenceFramesRef = useRef(0);
+  const segmentStartRef = useRef(0);
+  const reconnectAttemptRef = useRef(0);
+  //: Set by `teardownCapture` below. Callbacks declared before it (device loss,
+  //: recorder error) call through the ref so they do not have to make a
+  //: function that tears down its own dependencies part of their dependency
+  //: list.
+  const teardownCaptureRef = useRef(null);
+  //: True from "we asked the server to enable voice" until its `enabled: true`
+  //: frame arrives. A reconnect races the initial `voice_state: disabled`
+  //: frame against our own `voice enable`, and without this the stale frame
+  //: would cancel the intent the effect just restored.
+  const pendingEnableRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isProcessingRef = useRef(false);
   const renderedResponseIds = useRef(new Set());
@@ -236,13 +310,18 @@ export default function useWebSocket() {
   //: whole), or null (nothing in flight).
   const audioTurnRef = useRef(null);
   const renderedContentHashes = useRef(new Set());
+  //: Set by the effect's cleanup. `onclose` fires *during* teardown when the
+  //: socket is closed by the cleanup itself, and scheduling a reconnect there
+  //: creates a socket nobody owns — after unmount, and (in tests) after the
+  //: fake globals were swapped. The timer also outlived the `clearTimeout`
+  //: above it, because `close()` runs after the clear.
+  const disposedRef = useRef(false);
   // Sources for the turn in flight: set by the `sources` frame (which the
   // backend sends *before* the final `message`) and consumed when that
   // message lands. Held in a ref rather than dropped because the client used
   // to have no `sources` case at all — the frame fell through the switch and
   // citations never reached the transcript.
   const pendingSourcesRef = useRef([]);
-  const unsentSpeechRef = useRef(false);
   const confirmationRef = useRef(null);
   // Tools currently in flight, name → display label. See `tool_started`.
   const runningToolsRef = useRef(new Map());
@@ -318,6 +397,10 @@ export default function useWebSocket() {
     socket.onopen = () => {
       setIsConnected(true);
       setEverConnected(true);
+      // A working link resets the backoff. Without this, a long session that
+      // survived three drops would still hold a 4s delay for the fourth,
+      // because the attempt counter only ever grew.
+      reconnectAttemptRef.current = 0;
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
@@ -687,10 +770,47 @@ export default function useWebSocket() {
           }
           break;
         }
+        case "voice_state": {
+          // The server's view of the voice pipeline, one frame per real
+          // transition. It is the only thing allowed to say whether the
+          // microphone may capture: the client can observe its own recorder,
+          // but not whether the utterance it just sent was accepted, is being
+          // transcribed, or is blocked on an approval.
+          const next = applyVoiceState(
+            voiceStateRef.current,
+            data.state,
+            (message) => console.warn(`[voice] ${message}`),
+          );
+          voiceStateRef.current = next;
+          setVoiceState(next);
+          const enabled = Boolean(data.enabled);
+          if (enabled) {
+            pendingEnableRef.current = false;
+            setVoiceMode(true);
+          } else if (pendingEnableRef.current) {
+            // Our own `voice enable` is still in flight; this is the frame the
+            // server emitted at connect, before it saw the request. Do not
+            // cancel the listener the user just asked for.
+          } else {
+            // The server turned voice off (another client, a device failure, or
+            // a disable this window had not sent yet). Release the microphone:
+            // an enabled-looking UI with a live recorder is the exact bug that
+            // made the assistant transcribe the room.
+            setVoiceMode(false);
+            micDesiredRef.current = false;
+          }
+          setAwaitingCommand(Boolean(data.awaiting_command));
+          break;
+        }
         case "wake_word":
           if (data.detected) {
             setAwaitingCommand(true);
-            setStatus("awaiting_command");
+            // A wake word *with* a command is followed immediately by
+            // `voice_state: processing`; only the wake-only case becomes a
+            // listening state, so do not claim the user must speak again.
+            if (voiceStateRef.current !== VOICE_STATES.PROCESSING) {
+              setStatus("awaiting_command");
+            }
             isProcessingRef.current = false;
           } else {
             // The backend dropped the utterance: it did not start with the
@@ -764,19 +884,13 @@ export default function useWebSocket() {
           addMessage("system", `\uD83D\uDD14 ${data.message}`, { type: "reminder" });
           break;
         case "reminder_list": {
-          const rlist = data.reminders || [];
-          setReminders(rlist);
-          if (rlist.length === 0) {
-            addMessage("system", "\uD83D\uDCCB No pending reminders.", { type: "reminder" });
-          } else {
-            const lines = rlist.map((r, i) => {
-              const task = r.task || r.title || "?";
-              const t = r.scheduled_time || r.remind_time || "";
-              const rec = r.recurring && r.recurring !== "none" ? ` (${r.recurring})` : "";
-              return `#${r.reminder_id || r.id || i + 1}: ${task} @ ${t}${rec}`;
-            });
-            addMessage("system", `\uD83D\uDCCB Reminders:\n${lines.join("\n")}`, { type: "reminder" });
-          }
+          // The list's home is the ReminderPanel, not the transcript. This
+          // used to echo into the chat as well, so the panel's own
+          // connect-time refresh dropped a "No pending reminders" chip into
+          // every fresh conversation — a system message about panel state
+          // nobody asked about in chat. The action echoes below stay: those
+          // answer a request the user actually made.
+          setReminders(data.reminders || []);
           break;
         }
         case "reminder_deleted":
@@ -935,15 +1049,29 @@ export default function useWebSocket() {
           type: "error",
         });
       }
-      reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
+      // The component is gone (unmount / effect teardown). Reconnecting now
+      // would resurrect a socket with no owner and, worse, keep retrying
+      // forever against a page that no longer exists.
+      if (disposedRef.current) return;
+      // Exponential, bounded, jittered. A flat 3s retry either hammered a
+      // restarting backend or added three seconds to a one-second blip; the
+      // counter is reset by a successful open.
+      const delay = reconnectDelay(reconnectAttemptRef.current++);
+      reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay);
     };
     socket.onerror = () => socket.close();
     wsRef.current = socket;
   }, [addMessage, isSocketOpen, nextRunningTool]);
 
   useEffect(() => {
+    // A fresh subscription: a previous teardown may have marked this hook
+    // disposed (StrictMode double-invoke, or a dependency change).
+    disposedRef.current = false;
     connectWebSocket();
     return () => {
+      // Order matters: mark disposed *before* closing, because `close()` calls
+      // `onclose` synchronously and that is what would schedule a reconnect.
+      disposedRef.current = true;
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       const ws = wsRef.current;
       if (ws && isSocketOpen()) ws.close();
@@ -1104,240 +1232,546 @@ export default function useWebSocket() {
     sendReminderCmd("list");
   }, [sendReminderCmd]);
 
+  /**
+   * Adopt a voice state the client decided on its own (optimistically).
+   *
+   * Used at exactly two moments: "I have just handed an utterance to the
+   * server" (PROCESSING) and "I disabled voice" (DISABLED). Both are followed
+   * by the server's own frame within milliseconds; this exists so the capture
+   * loop stops *immediately* rather than continuing to record its own tail
+   * while the round trip completes.
+   */
+  const setLocalVoiceState = useCallback((next) => {
+    const adopted = applyVoiceState(
+      voiceStateRef.current,
+      next,
+      (message) => console.warn(`[voice] ${message}`),
+    );
+    voiceStateRef.current = adopted;
+    setVoiceState(adopted);
+  }, []);
+
   const transmitAudio = useCallback(
-    (chunks, mimeType, minSize = 5000, isManualVoice = false) => {
+    (chunks, mimeType, minSize = 5000) => {
       if (!chunks || chunks.length === 0) return;
       const blob = new Blob(chunks, { type: mimeType || "audio/webm" });
       if (blob.size < minSize || blob.size > 5 * 1024 * 1024) {
+        // Too short to contain a word, or larger than the server accepts.
+        // Neither is an error worth a banner: the next utterance is unaffected,
+        // and the capture loop has already moved on.
         console.warn(`Blob out of range: ${blob.size} bytes, type=${blob.type}`);
         isProcessingRef.current = false;
         return;
       }
+      const utteranceId = clientMsgId();
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64 = reader.result.split(",")[1];
-        if (isSocketOpen()) {
-          addMessage("user", "\uD83C\uDFA4");
-          wsRef.current.send(JSON.stringify({ type: "audio", audio: base64, language, isManualVoice }));
-          setIsTyping(true);
-          setStatus("transcribing");
-        } else {
+        if (!isSocketOpen()) {
+          // A recording belongs to the session that was live when it was made.
+          // It is never queued and replayed: after a reconnect the command may
+          // be stale, and the backend explicitly refuses a resent utterance id.
           isProcessingRef.current = false;
+          addMessage("system", "Not connected — that recording was not sent.", {
+            type: "error",
+          });
+          return;
         }
+        addMessage("user", "\uD83C\uDFA4");
+        wsRef.current.send(
+          JSON.stringify({
+            type: "audio",
+            audio: base64,
+            language,
+            // The id makes a resend idempotent server-side. `isManualVoice` is
+            // deliberately absent: it used to be sent as `true` on every VAD
+            // segment, which told the backend to skip its wake-word gate.
+            utterance_id: utteranceId,
+          }),
+        );
+        isProcessingRef.current = true;
+        setIsTyping(true);
+        setStatus("transcribing");
+        setLocalVoiceState(VOICE_STATES.PROCESSING);
       };
       reader.readAsDataURL(blob);
     },
-    [addMessage, language, isSocketOpen],
+    [addMessage, language, isSocketOpen, setLocalVoiceState],
   );
 
-  // Prefers opus/webm because that is what faster-whisper decodes most
-  // reliably. The selected MIME type is reported by the out-of-range warning
-  // in transmitAudio when something is actually wrong, so it is not logged on
-  // every recording.
-  const _createRecorder = (stream) => {
-    const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
-    for (const mime of types) {
-      if (MediaRecorder.isTypeSupported(mime)) {
-        return new MediaRecorder(stream, { mimeType: mime });
+  /**
+   * End the current recording segment.
+   *
+   * `transmit` says what the audio is: a finished utterance the user wants
+   * handled, or a partial capture being dropped because the pipeline is busy
+   * or the microphone is being turned off. A partial capture is never sent —
+   * that is how a "stop" turned into a ghost command.
+   *
+   * The final slice arrives *after* `stop()`: `MediaRecorder` flushes the last
+   * buffer through `dataavailable` as it stops. The previous code nulled that
+   * handler first, which threw the tail of the utterance away and is why short
+   * commands could arrive truncated.
+   */
+  const finalizeSegment = useCallback(
+    ({ transmit = true } = {}) => {
+      const mr = mediaRecorderRef.current;
+      const chunks = mediaChunksRef.current;
+      mediaChunksRef.current = [];
+      mediaRecorderRef.current = null;
+
+      const finish = (collected) => {
+        if (transmit && collected.length > 0) {
+          const mime = mr?.mimeType || "audio/webm";
+          transmitAudio(collected, mime);
+        }
+      };
+
+      if (!mr || mr.state === "inactive") {
+        finish(chunks);
+        return;
+      }
+      mr.onstop = () => {
+        try {
+          mr.ondataavailable = null;
+        } catch (e) {
+          /* the recorder is already gone */
+        }
+        finish(chunks);
+      };
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+      try {
+        mr.stop();
+      } catch (e) {
+        finish(chunks);
+      }
+    },
+    [transmitAudio],
+  );
+
+  /**
+   * Start (or keep) a recorder for the current capture window.
+   *
+   * One recorder, running only while the microphone is allowed to capture.
+   * `mediaChunksRef` is cleared when speech begins, so the blob that is sent
+   * contains the utterance and not the silence that preceded it.
+   */
+  const beginSegment = useCallback(() => {
+    const stream = mediaStreamRef.current;
+    if (!stream) return;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      return;
+    }
+    let mr;
+    try {
+      mr = createRecorder(stream);
+    } catch (e) {
+      console.error("Could not start the recorder", e);
+      addMessage("system", "Could not start recording. Check your microphone.", {
+        type: "error",
+      });
+      return;
+    }
+    mr.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) mediaChunksRef.current.push(e.data);
+    };
+    mr.onerror = (event) => {
+      console.error("Recorder error", event);
+      addMessage("system", "The microphone stopped working. Voice is off.", {
+        type: "error",
+      });
+      micDesiredRef.current = false;
+      setVoiceMode(false);
+      setLocalVoiceState(VOICE_STATES.DISABLED);
+      teardownCaptureRef.current?.();
+      if (isSocketOpen()) {
+        wsRef.current.send(JSON.stringify({ type: "voice", action: "disable" }));
+      }
+    };
+    mediaChunksRef.current = [];
+    try {
+      mr.start(100);
+    } catch (e) {
+      console.error("Recorder failed to start", e);
+      return;
+    }
+    mediaRecorderRef.current = mr;
+    segmentStartRef.current = Date.now();
+  }, [addMessage, isSocketOpen, setLocalVoiceState]);
+
+  /**
+   * The VAD tick.
+   *
+   * Three rules, each of which fixes something the browser used to get wrong:
+   *
+   * 1. **Capture only in a capturing state.** While the server says PROCESSING,
+   *    AWAITING_CONFIRMATION, SPEAKING, RECOVERING or DISABLED — or while the
+   *    client's own player is audible — the recorder is stopped and its buffer
+   *    dropped. Otherwise the assistant transcribes its own speech.
+   * 2. **A segment ends the recording; it does not interrupt the turn.** The old
+   *    loop sent `interrupt` before every utterance, which is why speaking a
+   *    second sentence killed the command the first one had produced.
+   * 3. **A new segment starts on demand.** After sending, the recorder stays
+   *    stopped until the state returns to STANDBY, so no audio accumulates
+   *    across a turn.
+   */
+  const runVad = useCallback(() => {
+    vadTimerRef.current = null;
+    const graph = audioGraphRef.current;
+    if (!captureActiveRef.current || !graph) return;
+
+    const { analyser, dataArray, bufferLength } = graph;
+    const allowed =
+      micDesiredRef.current &&
+      canCapture(voiceStateRef.current, { speaking: isSpeakingRef.current });
+
+    if (!allowed) {
+      if (speechRef.current.speaking) {
+        speechRef.current.speaking = false;
+        silenceFramesRef.current = 0;
+        setIsListening(false);
+      }
+      finalizeSegment({ transmit: false });
+      vadTimerRef.current = setTimeout(runVad, VAD_FRAME_MS);
+      return;
+    }
+
+    // The recorder is created lazily and kept running for the whole capture
+    // window; buffers are cleared at speech onset, not before transcription.
+    beginSegment();
+
+    analyser.getByteTimeDomainData(dataArray);
+    let sum = 0;
+    for (let i = 0; i < bufferLength; i++) {
+      const val = (dataArray[i] - 128) / 128;
+      sum += val * val;
+    }
+    const rms = Math.sqrt(sum / bufferLength);
+    const history = energyHistoryRef.current;
+    history.push(rms);
+    if (history.length > 50) history.shift();
+    let noiseFloor = 0.01;
+    if (history.length >= 10) {
+      const sorted = [...history].sort((a, b) => a - b);
+      noiseFloor = Math.max(0.005, sorted[Math.floor(sorted.length * 0.2)]);
+    }
+    const threshold = Math.max(0.008, noiseFloor + 0.015);
+
+    if (rms > threshold) {
+      silenceFramesRef.current = 0;
+      if (!speechRef.current.speaking) {
+        speechRef.current.speaking = true;
+        speechRef.current.start = Date.now();
+        // Drop the silence that preceded the first word, so the blob the
+        // server receives is the utterance and not a minute of room tone.
+        mediaChunksRef.current = [];
+        setIsListening(true);
+        setStatus("listening");
+      }
+    } else if (speechRef.current.speaking) {
+      silenceFramesRef.current += 1;
+      const spokeFor = Date.now() - speechRef.current.start;
+      const tooLong = Date.now() - segmentStartRef.current > VAD_MAX_SEGMENT_MS;
+      if (silenceFramesRef.current >= VAD_SILENCE_FRAMES || tooLong) {
+        speechRef.current.speaking = false;
+        silenceFramesRef.current = 0;
+        setIsListening(false);
+        setStatus("transcribing");
+        // Shorter than a word: a cough, a door, the tail of the TTS the echo
+        // cancellation missed. Never sent.
+        finalizeSegment({ transmit: spokeFor >= VAD_MIN_SPEECH_MS });
       }
     }
-    console.warn("No preferred audio MIME type supported, using browser default");
-    return new MediaRecorder(stream);
-  };
 
+    vadTimerRef.current = setTimeout(runVad, VAD_FRAME_MS);
+  }, [beginSegment, finalizeSegment]);
+
+  /**
+   * Turn voice mode on: acquire the microphone and start the wake-word listener.
+   *
+   * The listener is continuous for as long as voice mode is on, but the
+   * recorder is not: see `runVad`. Ending a recording is never a cancellation —
+   * the command it produced finishes on its own.
+   */
   const startVoiceMode = useCallback(async () => {
-    voiceModeRef.current = true;
-    setVoiceMode(true);
-    setStatus("listening");
+    micDesiredRef.current = true;
+    if (startingCaptureRef.current || captureActiveRef.current) {
+      // A second click while `getUserMedia` is still resolving must not open a
+      // second stream (two recorders, two copies of every utterance).
+      setVoiceMode(true);
+      return;
+    }
+    startingCaptureRef.current = true;
+
+    if (isSocketOpen()) {
+      pendingEnableRef.current = true;
+      wsRef.current.send(JSON.stringify({ type: "voice", action: "enable" }));
+    }
+
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      addMessage("system", "Microphone permission denied.");
-      voiceModeRef.current = false;
+      startingCaptureRef.current = false;
+      micDesiredRef.current = false;
       setVoiceMode(false);
+      setLocalVoiceState(VOICE_STATES.DISABLED);
+      // Actionable, per failure: "permission denied" and "no microphone" need
+      // different things from the user, and a single generic sentence teaches
+      // them nothing.
+      const name = e && e.name ? e.name : "";
+      let message = "Could not start the microphone. Voice mode is off.";
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        message =
+          "Microphone permission is blocked. Allow it in your browser's site settings, then press the mic again.";
+      } else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+        message = "No microphone was found. Connect one, then press the mic again.";
+      } else if (name === "NotReadableError" || name === "TrackStartError") {
+        message = "The microphone is in use by another application. Close it and try again.";
+      }
+      addMessage("system", message, { type: "error" });
+      if (isSocketOpen()) {
+        wsRef.current.send(JSON.stringify({ type: "voice", action: "disable" }));
+      }
       return;
     }
-    mediaStreamRef.current = stream;
-    mediaChunksRef.current = [];
-    const mr = _createRecorder(stream);
-    mr.ondataavailable = (e) => {
-      if (e.data.size > 0) mediaChunksRef.current.push(e.data);
-    };
-    mr.start(100);
-    mediaRecorderRef.current = mr;
 
-    const _restartRecorder = () => {
-      if (!mediaStreamRef.current) return;
-      const newMr = _createRecorder(mediaStreamRef.current);
-      newMr.ondataavailable = (e) => {
-        if (e.data.size > 0) mediaChunksRef.current.push(e.data);
-      };
-      newMr.start(100);
-      mediaRecorderRef.current = newMr;
-    };
-
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioContext.state === "suspended") {
-      try {
-        await audioContext.resume();
-      } catch (e) {}
+    if (!micDesiredRef.current) {
+      // Disabled while the permission prompt was open.
+      stream.getTracks().forEach((t) => t.stop());
+      startingCaptureRef.current = false;
+      return;
     }
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    const source = audioContext.createMediaStreamSource(stream);
-    source.connect(analyser);
-    let energyHistory = [],
-      silenceFrames = 0,
-      isSpeechDetected = false,
-      speechStartTime = 0,
-      lastProcessTime = 0,
-      hasSpokenSinceLastSend = false;
 
-    const vadProcess = () => {
-      const now = Date.now();
-      if (!voiceModeRef.current || now - lastProcessTime < 50) {
-        if (voiceModeRef.current) requestAnimationFrame(vadProcess);
-        return;
-      }
-      lastProcessTime = now;
-      if (!voiceModeRef.current) {
-        analyser.disconnect();
-        source.disconnect();
-        audioContext.close();
-        return;
-      }
+    mediaStreamRef.current = stream;
+    // A device can disappear (headset unplugged, USB microphone removed). The
+    // track ends, the recorder silently produces nothing, and the UI keeps
+    // claiming to listen — so react to it explicitly.
+    const [track] = stream.getAudioTracks ? stream.getAudioTracks() : [];
+    if (track) {
+      track.onended = () => {
+        if (!micDesiredRef.current) return;
+        addMessage("system", "The microphone disconnected. Voice mode is off.", {
+          type: "error",
+        });
+        micDesiredRef.current = false;
+        setVoiceMode(false);
+        setLocalVoiceState(VOICE_STATES.DISABLED);
+        teardownCaptureRef.current?.();
+        if (isSocketOpen()) {
+          wsRef.current.send(JSON.stringify({ type: "voice", action: "disable" }));
+        }
+      };
+    }
 
-      analyser.getByteTimeDomainData(dataArray);
-      let sum = 0;
-      for (let i = 0; i < bufferLength; i++) {
-        const val = (dataArray[i] - 128) / 128;
-        sum += val * val;
-      }
-      const rms = Math.sqrt(sum / bufferLength);
-      energyHistory.push(rms);
-      if (energyHistory.length > 50) energyHistory.shift();
-      let noiseFloor = 0.01;
-      if (energyHistory.length >= 10) {
-        const sorted = [...energyHistory].sort((a, b) => a - b);
-        noiseFloor = Math.max(0.005, sorted[Math.floor(sorted.length * 0.2)]);
-      }
-      const threshold = Math.max(0.008, noiseFloor + 0.015);
-
-if (rms > threshold) {
-          silenceFrames = 0;
-          if (!isSpeechDetected) {
-            isSpeechDetected = true;
-            hasSpokenSinceLastSend = true;
-            unsentSpeechRef.current = true;
-            speechStartTime = Date.now();
-            setIsListening(true);
-            setStatus("listening");
-          }
-      } else {
-        silenceFrames++;
-        if (silenceFrames > 25 && isSpeechDetected) {
-          isSpeechDetected = false;
-          setIsListening(false);
-          // Must be a status the backend actually emits. It used to be
-          // "processing...", which is not in the backend's vocabulary, so the
-          // HUD rendered it literally as "MODE PROCESSING..." with a
-          // default-coloured dot.
-          setStatus("transcribing");
-          if (
-            mediaChunksRef.current.length > 0 &&
-            !isProcessingRef.current &&
-            speechStartTime > 0 &&
-            Date.now() - speechStartTime > 400
-          ) {
-            isProcessingRef.current = true;
-            if (hasSpokenSinceLastSend) {
-              sendInterrupt();
-              hasSpokenSinceLastSend = false;
-            }
-            unsentSpeechRef.current = false;
-            const chunks = [...mediaChunksRef.current];
-            const mime = mediaRecorderRef.current?.mimeType || "audio/webm";
-            if (mediaRecorderRef.current?.state !== "inactive") {
-              mediaRecorderRef.current.ondataavailable = null;
-              mediaRecorderRef.current.stop();
-            }
-            _restartRecorder();
-            mediaChunksRef.current = [];
-            transmitAudio(chunks, mime, 5000, true);
-          }
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    let audioContext = null;
+    let analyser = null;
+    let source = null;
+    try {
+      audioContext = new AudioCtor();
+      if (audioContext.state === "suspended") {
+        try {
+          await audioContext.resume();
+        } catch (e) {
+          /* autoplay policy: the analyser still works once resumed */
         }
       }
-      if (voiceModeRef.current) requestAnimationFrame(vadProcess);
-    };
-    requestAnimationFrame(vadProcess);
-    // `language` is intentionally absent: the VAD loop never reads it, and
-    // including it would tear down and rebuild the audio graph on every
-    // language change. `transmitAudio` already closes over it.
-  }, [addMessage, sendInterrupt, transmitAudio]);
-
-  const stopVoiceMode = useCallback(() => {
-    voiceModeRef.current = false;
-    setVoiceMode(false);
-    setIsListening(false);
-    setSubtitle("");
-    const chunks = [...mediaChunksRef.current];
-    const mime = mediaRecorderRef.current?.mimeType || "audio/webm";
-    if (mediaRecorderRef.current?.state !== "inactive") {
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+    } catch (e) {
+      console.error("Could not open the audio graph", e);
+      addMessage("system", "Audio capture is unavailable in this browser.", {
+        type: "error",
+      });
       try {
-        mediaRecorderRef.current.ondataavailable = null;
-        mediaRecorderRef.current.stop();
+        stream.getTracks().forEach((t) => t.stop());
+      } catch (_) {}
+      startingCaptureRef.current = false;
+      micDesiredRef.current = false;
+      setVoiceMode(false);
+      setLocalVoiceState(VOICE_STATES.DISABLED);
+      return;
+    }
+
+    audioGraphRef.current = {
+      ctx: audioContext,
+      analyser,
+      source,
+      stream,
+      dataArray: new Uint8Array(analyser.frequencyBinCount),
+      bufferLength: analyser.frequencyBinCount,
+    };
+    energyHistoryRef.current = [];
+    silenceFramesRef.current = 0;
+    speechRef.current = { speaking: false, start: 0 };
+    captureActiveRef.current = true;
+    startingCaptureRef.current = false;
+    setVoiceMode(true);
+    // Optimistic STANDBY: the server answers `voice enable` with the same
+    // state, but the mic is already open and the UI should not wait a round
+    // trip to say so.
+    setLocalVoiceState(VOICE_STATES.STANDBY);
+    beginSegment();
+    vadTimerRef.current = setTimeout(runVad, VAD_FRAME_MS);
+    // `language` is read through `transmitAudio`, deliberately not a dep here:
+    // rebuilding the audio graph on a language change would interrupt capture.
+  }, [addMessage, beginSegment, isSocketOpen, runVad, setLocalVoiceState]);
+
+  /**
+   * Stop the microphone without changing what the user asked for.
+   *
+   * Releases the device and drops any partial capture. Never sends the partial
+   * buffer: a half-spoken sentence is not a command, and sending it is how
+   * "stop recording" used to produce a ghost turn.
+   */
+  const teardownCapture = useCallback(() => {
+    captureActiveRef.current = false;
+    if (vadTimerRef.current) {
+      clearTimeout(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    const graph = audioGraphRef.current;
+    audioGraphRef.current = null;
+    if (graph) {
+      try {
+        graph.analyser?.disconnect();
       } catch (e) {}
+      try {
+        graph.source?.disconnect();
+      } catch (e) {}
+      try {
+        graph.ctx?.close?.();
+      } catch (e) {}
+      try {
+        graph.stream?.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
+    }
+    if (mediaRecorderRef.current) {
+      const mr = mediaRecorderRef.current;
       mediaRecorderRef.current = null;
+      try {
+        mr.ondataavailable = null;
+        mr.onstop = null;
+        if (mr.state !== "inactive") mr.stop();
+      } catch (e) {}
     }
     if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      try {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      } catch (e) {}
       mediaStreamRef.current = null;
     }
     mediaChunksRef.current = [];
-    const aiBusy = isSpeakingRef.current || isProcessingRef.current;
-    if (chunks.length > 0 && (unsentSpeechRef.current || !aiBusy)) {
-      const shouldInterrupt = unsentSpeechRef.current;
-      unsentSpeechRef.current = false;
-      isProcessingRef.current = true;
-      if (shouldInterrupt) sendInterrupt();
-      transmitAudio(chunks, mime, 2000, true);
+    speechRef.current = { speaking: false, start: 0 };
+    silenceFramesRef.current = 0;
+    energyHistoryRef.current = [];
+    setIsListening(false);
+  }, []);
+
+  // The teardown is needed by callbacks declared before it (device loss, the
+  // recorder error handler); a ref keeps the ordering honest without making
+  // every one of them a dependency of a function that tears down its own deps.
+  teardownCaptureRef.current = teardownCapture;
+
+  /**
+   * Finish the utterance in progress. *Not* a cancel and *not* a disable.
+   *
+   * Kept separate because the three used to be one operation: stopping the
+   * recorder also interrupted the turn (killing the command just spoken) and,
+   * before that, closing the socket. This sends what the user said, tells the
+   * server the recording ended, and keeps voice mode on.
+   */
+  const stopRecording = useCallback(() => {
+    if (!micDesiredRef.current) return;
+    finalizeSegment({ transmit: true });
+    if (isSocketOpen()) {
+      wsRef.current.send(JSON.stringify({ type: "voice", action: "stop_recording" }));
     }
-    setStatus(isSocketOpen() ? "connected" : "disconnected");
-  }, [sendInterrupt, transmitAudio, isSocketOpen]);
+  }, [finalizeSegment, isSocketOpen]);
+
+  /**
+   * Turn voice mode off.
+   *
+   * Distinct from `stopRecording`: nothing is sent, because the user asked for
+   * the microphone to stop, not for the half-sentence to become a command. The
+   * WebSocket stays open — voice is a mode, not a connection — and a turn that
+   * was already accepted keeps running (an explicit STOP is what cancels).
+   */
+  const stopVoiceMode = useCallback(() => {
+    micDesiredRef.current = false;
+    pendingEnableRef.current = false;
+    setVoiceMode(false);
+    setAwaitingCommand(false);
+    setSubtitle("");
+    teardownCapture();
+    setLocalVoiceState(VOICE_STATES.DISABLED);
+    if (isSocketOpen()) {
+      wsRef.current.send(JSON.stringify({ type: "voice", action: "disable" }));
+      setStatus("connected");
+    } else {
+      setStatus("disconnected");
+    }
+  }, [isSocketOpen, setLocalVoiceState, teardownCapture]);
+
+  /**
+   * Cancel the command in flight — the explicit third operation.
+   *
+   * Silence the speaker here, and ask the server to stop the turn and the
+   * recorder work behind it. Unlike `stopRecording`, this *is* a cancellation,
+   * and it is the only microphone-side action that is allowed to be one.
+   */
+  const cancelVoiceCommand = useCallback(() => {
+    stopAudio();
+    setAwaitingCommand(false);
+    isProcessingRef.current = false;
+    setIsTyping(false);
+    setLocalVoiceState(
+      micDesiredRef.current ? VOICE_STATES.STANDBY : VOICE_STATES.DISABLED,
+    );
+    if (isSocketOpen()) {
+      wsRef.current.send(JSON.stringify({ type: "voice", action: "cancel" }));
+    }
+  }, [isSocketOpen, setLocalVoiceState, stopAudio]);
 
   // The microphone is NOT acquired automatically on connect.
   //
   // This used to call `startVoiceMode()` as soon as the socket opened, which
   // requests `getUserMedia` with no user gesture. Browsers generally prompt for
   // this, but the app was still grabbing a live microphone stream the moment it
-  // loaded, and the recording indicator stayed on for users who only wanted to
-  // type. Voice is now opt-in via the existing dock toggle.
+  // loaded. Voice is opt-in via the composer's mic toggle.
+  //
+  // A *drop* is different: if the user had voice on, the intent survives
+  // (`micDesiredRef`) and the listener re-arms once the link is back. That is
+  // what makes it a persistent wake-word listener rather than a recording that
+  // dies with the socket. No audio is replayed — a recording belongs to the
+  // session that was live when it was made.
   useEffect(() => {
-    if (!isConnected && voiceModeRef.current) {
-      stopVoiceMode();
+    if (!isConnected) {
+      if (captureActiveRef.current) {
+        // Release the device while there is nowhere to send audio, but keep
+        // the intent so the reconnect can resume.
+        teardownCapture();
+      }
+      setVoiceMode(false);
+      setLocalVoiceState(VOICE_STATES.DISABLED);
+      return;
     }
-  }, [isConnected, stopVoiceMode]);
+    if (micDesiredRef.current && !captureActiveRef.current) {
+      startVoiceMode();
+    }
+  }, [isConnected, setLocalVoiceState, startVoiceMode, teardownCapture]);
 
   useEffect(() => {
     return () => {
-      voiceModeRef.current = false;
-      if (mediaRecorderRef.current?.state !== "inactive") {
-        try {
-          mediaRecorderRef.current.stop();
-        } catch (e) {}
-        mediaRecorderRef.current = null;
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-        mediaStreamRef.current = null;
-      }
-      mediaChunksRef.current = [];
+      micDesiredRef.current = false;
+      teardownCapture();
       if (isSpeakingRef.current) stopAudio();
     };
-  }, [stopAudio]);
+  }, [stopAudio, teardownCapture]);
 
   const clearChat = useCallback(() => {
     setMessages([]);
@@ -1363,6 +1797,7 @@ if (rms > threshold) {
     setLanguage,
     subtitle,
     voiceMode,
+    voiceState,
     awaitingCommand,
     isListening,
     isSpeaking,
@@ -1380,6 +1815,8 @@ if (rms > threshold) {
     clearChat,
     startVoiceMode,
     stopVoiceMode,
+    stopRecording,
+    cancelVoiceCommand,
     addMessage,
     respondToConfirmation,
     cancelPendingConfirmation,

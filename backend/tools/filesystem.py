@@ -233,21 +233,28 @@ class FileWrite(BaseTool):
 
 
 def _read_back(target: str, content: str, append: bool) -> bool:
-    """Does the file now end with what was just written?
+    """Does the file now contain / end with what was just written?
 
-    Compared as text through the same codec as the write. For an append, only
-    the tail is read and compared, because the point is "these bytes arrived",
-    not "the whole file equals this" — the file had a life before the append.
+    Compared as text through the same codec the write used, so a mismatch means
+    the content differs, not that the two calls disagreed about UTF-8.
+
+    Deliberately *not* implemented by seeking to ``size - len(content)``: the
+    file is opened in text mode, where ``tell()`` reports a byte offset and
+    ``len(content)`` counts characters. On Windows the writer translates ``\\n``
+    to ``\\r\\n``, so the two numbers disagree by exactly the number of newlines
+    and the comparison read the wrong window — reporting a *successful* append as
+    "the write did not land". That false negative is the dangerous direction: it
+    tells the model a write failed when it succeeded, and the obvious recovery is
+    to append the same content again. (On POSIX there is no translation, which is
+    why the bug was invisible there.)
     """
     with open(target, "r", encoding="utf-8", errors="replace") as handle:
-        if not append:
-            return handle.read() == content
-        if not content:
-            return True
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        handle.seek(max(0, size - len(content)))
-        return handle.read() == content
+        text = handle.read()
+    if not append:
+        return text == content
+    if not content:
+        return True
+    return text.endswith(content)
 
 
 def _write_file(target: str, content: str, append: bool) -> None:

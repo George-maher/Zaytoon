@@ -52,11 +52,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-#: Env var that overrides repository-root discovery. Required for a PyInstaller
-#: build, because ``__file__`` then points into a temporary extraction folder
-#: rather than at the checkout, and ``scripts/build_exe.py`` instructs the user
-#: to set exactly this variable.
+#: Env var that overrides repository-root discovery. Kept for support and for
+#: running the *frozen* shell against a checkout on purpose; a packaged install
+#: no longer needs it — the backend and the production frontend are bundled.
 REPO_ROOT_ENV = "ZAYTOON_REPO_ROOT"
+
+
+def is_frozen() -> bool:
+    """True when running from a PyInstaller bundle rather than source."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def bundle_dir() -> Path | None:
+    """The PyInstaller extraction/bundle directory, or ``None`` in source mode.
+
+    ``sys._MEIPASS`` points at the directory the bundle's data files land in:
+    ``<exe>/_internal`` for an ``--onedir`` build, a per-launch ``%TEMP%`` folder
+    for ``--onefile``. It is resolved at *runtime* — never baked at build time —
+    because the onedir location moves when the user moves the install, and the
+    onedir/onefile choice is the packager's, not the code's.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else None
 
 
 def _looks_like_repo_root(candidate: Path) -> bool:
@@ -106,12 +123,19 @@ def default_state_dir() -> Path:
     if override:
         return Path(override).expanduser()
 
-    repo_dir = default_repo_root() / "Config"
-    if _is_writable(repo_dir):
-        # A checkout, or anywhere the repo-adjacent directory can be written:
-        # keep the state where it has always been, so an upgrade does not move a
-        # user's saved geometry out from under them.
-        return repo_dir
+    # A frozen build never consults the checkout: `__file__` then points into
+    # the bundle (`_internal`, or a %TEMP% extraction folder for --onefile),
+    # whose "Config" is either read-only (an install under Program Files) or
+    # wiped on the next launch. The platform directory below is the only honest
+    # answer there — and it is where main() also points ZAYTOON_HOME, so the
+    # shell and its backend child agree on one writable home.
+    if not is_frozen():
+        repo_dir = default_repo_root() / "Config"
+        if _is_writable(repo_dir):
+            # A checkout, or anywhere the repo-adjacent directory can be written:
+            # keep the state where it has always been, so an upgrade does not move
+            # a user's saved geometry out from under them.
+            return repo_dir
 
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -125,14 +149,21 @@ def default_state_dir() -> Path:
 
 
 def default_repo_root() -> Path:
-    """Resolve the repository root.
+    """Resolve the application root.
 
     Resolution order:
 
-    1. ``ZAYTOON_REPO_ROOT`` when it is set and contains ``backend/main.py``.
-    2. ``<repo>/desktop/app/config.py`` -> ``<repo>`` (the source checkout).
-    3. ``sys._MEIPASS`` for a frozen build, which PyInstaller sets to the
-       extraction directory.
+    1. ``ZAYTOON_REPO_ROOT`` when it is set and contains ``backend/main.py`` —
+       a support/debugging override; a packaged install never needs it.
+    2. A **frozen** build: the directory holding the executable. This used to
+       walk up from ``sys._MEIPASS`` looking for a checkout-shaped neighbour,
+       which silently bound an installed app to whatever repository-like folder
+       happened to sit beside it (in practice: the ``dist`` directory the
+       build script had copied a whole virtualenv into). The application root
+       of an installed app is its own install directory, by definition.
+    3. ``<repo>/desktop/app/config.py`` -> ``<repo>`` (the source checkout),
+       with ``sys._MEIPASS`` as a last resort for a frozen build run from
+       somewhere unusual.
     """
     override = os.getenv(REPO_ROOT_ENV)
     if override:
@@ -143,21 +174,47 @@ def default_repo_root() -> Path:
         # stale value degrades to source-checkout discovery rather than
         # preventing the shell from starting.
 
+    if is_frozen():
+        executable = getattr(sys, "executable", "")
+        if executable:
+            return Path(executable).resolve().parent
+
     here = Path(__file__).resolve()
     # <repo>/desktop/app/config.py -> <repo>
     derived = here.parent.parent.parent
     if _looks_like_repo_root(derived):
         return derived
 
-    # Frozen build: PyInstaller unpacks the bundle under _MEIPASS, and the
-    # bundle may have been dropped next to a checkout.
+    # A frozen build whose layout defies both rules above: PyInstaller unpacks
+    # the bundle under _MEIPASS, so look there before giving up.
     meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        for base in (Path(meipass), Path(meipass).parent, Path(meipass).parent.parent):
-            if _looks_like_repo_root(base):
-                return base
+    if meipass and _looks_like_repo_root(Path(meipass)):
+        return Path(meipass)
 
     return derived
+
+
+def default_frontend_dist() -> Path:
+    """Where the production frontend build lives.
+
+    1. ``ZAYTOON_FRONTEND_DIST`` — a deliberate override.
+    2. Frozen: ``<bundle>/frontend`` — the assets the packaging script ships
+       into the executable with ``--add-data "<frontend/dist>;frontend"``.
+       Resolved from ``sys._MEIPASS`` at *runtime*, never baked at build time:
+       an onedir install may be moved anywhere, and a onefile build extracts to
+       a fresh folder per launch. When the bundle's assets are missing the same
+       path is still returned, so diagnostics point at the location the running
+       application actually looks in rather than at a development checkout that
+       does not exist on this machine.
+    3. Source: ``<repo>/frontend/dist``.
+    """
+    override = os.getenv("ZAYTOON_FRONTEND_DIST")
+    if override:
+        return Path(override).expanduser()
+    bundle = bundle_dir()
+    if bundle is not None:
+        return bundle / "frontend"
+    return default_repo_root() / "frontend" / "dist"
 
 
 @dataclass
@@ -236,9 +293,7 @@ class DesktopConfig:
     #: Port for the Vite dev server (dev mode only).
     dev_port: int = field(default_factory=lambda: _env_int("ZAYTOON_DEV_PORT", 5173))
     #: Path to the frontend production build directory.
-    frontend_dist: Path = field(
-        default_factory=lambda: Path(_env("ZAYTOON_FRONTEND_DIST", str(default_repo_root() / "frontend" / "dist")))
-    )
+    frontend_dist: Path = field(default_factory=default_frontend_dist)
     #: Default window width.
     window_width: int = field(default_factory=lambda: _env_int("ZAYTOON_WINDOW_WIDTH", 1280))
     #: Default window height.

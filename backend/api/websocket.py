@@ -20,6 +20,7 @@ from api.ws_security import (
 from common.reporting import client_error, safe_error, redact
 from common.tracing import set_trace_id
 from services.wake_word_service import apply_wake_gate
+from services.voice_session import VoiceState, remember_utterance
 from tools.safety import ConfirmationManager, PendingConfirmation
 from api.ws_protocol import INBOUND_NAMES, validate_inbound, validate_outbound
 from core.events import bus as core_bus
@@ -101,6 +102,38 @@ def is_replayed_message(session_id: str, message_id: Optional[str]) -> bool:
         return True
     seen[token] = now
     return False
+
+
+async def _emit_voice_state(websocket, connection_manager, state, *, reason: str = "") -> None:
+    """Tell the client where the voice pipeline actually is.
+
+    The UI is not allowed to infer this from microphone events: it can know
+    that it is capturing, but only the server knows whether the last utterance
+    passed the wake-word gate, is being transcribed, or is blocked on an
+    approval. One frame per real transition keeps the two from disagreeing.
+    """
+    if state is None:
+        return
+    frame = state.voice.to_frame()
+    if reason:
+        frame["reason"] = reason
+    await connection_manager.send(websocket, frame)
+
+
+async def _voice_recover(websocket, connection_manager, state, reason: str) -> None:
+    """Report a recoverable failure and settle back into standby.
+
+    RECOVERING is emitted first because "something failed and is being dealt
+    with" is true for the moment the error is reported. It is immediately
+    followed by STANDBY: a UI left in RECOVERING with no path out is the same
+    dead end as one left in LISTENING. Voice mode that was off stays off.
+    """
+    if state is None or not state.voice.enabled:
+        return
+    state.voice.recover(reason)
+    await _emit_voice_state(websocket, connection_manager, state, reason=reason)
+    state.voice.recovered()
+    await _emit_voice_state(websocket, connection_manager, state, reason="recovered")
 
 
 class ConnectionManager:
@@ -326,6 +359,14 @@ async def create_websocket_handler(
     # resolves them when the client replies with a `tool_confirm` message.
     async def _notify_confirmation(pending: PendingConfirmation) -> None:
         await connection_manager.send(websocket, pending.to_event())
+        # The voice pipeline is blocked on a person, which is a state the UI
+        # must show rather than a spinner that looks like work.
+        _state = session_states.get(session_id)
+        if _state is not None and _state.voice.enabled:
+            _state.voice.awaiting_confirmation()
+            await _emit_voice_state(
+                websocket, connection_manager, _state, reason="tool_approval",
+            )
 
     session_states[session_id].confirmation_manager = ConfirmationManager(
         notify=_notify_confirmation,
@@ -342,6 +383,12 @@ async def create_websocket_handler(
             "scope": decision.scope or ("local" if not decision.authenticated else ""),
             "authenticated": bool(decision.authenticated),
         })
+        # Voice starts off, and says so. A client that never enables it must
+        # not look like it is waiting for a wake word.
+        await _emit_voice_state(
+            websocket, connection_manager, session_states[session_id],
+            reason="socket_open",
+        )
 
         while True:
             raw = await websocket.receive_text()
@@ -403,6 +450,12 @@ async def create_websocket_handler(
                 state = session_states.get(session_id)
                 if state:
                     state.cancel()
+                    # An explicit cancel is the one operation allowed to kill
+                    # an accepted command. A finished recording is not.
+                    state.voice.cancel()
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="interrupted",
+                    )
                     await connection_manager.send(websocket, {"type": "interrupted"})
 
             elif msg_type == "message":
@@ -431,6 +484,14 @@ async def create_websocket_handler(
                 # trace, the frames and the frontend's staleness check all name
                 # the same turn.
                 response_id = _begin_turn(state)
+                # A typed request supersedes voice just as it supersedes the
+                # previous turn: the microphone must stop waiting for a
+                # follow-up command the user chose to type instead.
+                if state is not None and state.voice.enabled:
+                    state.voice.cancel()
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="typed_message",
+                    )
 
                 # Create trace for this user action
                 trace_id = _create_trace(user_message, session_id)
@@ -450,11 +511,16 @@ async def create_websocket_handler(
             elif msg_type == "audio":
                 audio_b64 = data.get("audio", "")
                 language = data.get("language", None)
-                # Manual voice mode (user pressed mic) skips wake-word gate
-                is_manual_voice = data.get("isManualVoice", False)
+                # The explicit push-to-talk flag. It is honoured only when the
+                # deployment opted into the legacy bypass; a continuous
+                # listener that sets it on every segment must still pass the
+                # wake-word gate.
+                is_manual_voice = bool(data.get("isManualVoice", False))
+                utterance_id = data.get("utterance_id", "")
                 logger.debug(
                     f"Audio msg received: b64_len={len(audio_b64)} "
-                    f"lang={language} manual={is_manual_voice}"
+                    f"lang={language} manual={is_manual_voice} "
+                    f"utterance={str(utterance_id)[:32]}"
                 )
                 if not audio_b64:
                     continue
@@ -471,6 +537,68 @@ async def create_websocket_handler(
                 state = session_states.get(session_id)
                 if state is None:
                     continue
+                # The microphone is closed while the assistant is talking. The
+                # client is told so (`voice_state: speaking`, and the hook stops
+                # capturing), but that instruction is the *only* thing standing
+                # between a misbehaving client — or a microphone that was never
+                # muted, or speakers loud enough for the mic to hear — and the
+                # assistant transcribing its own TTS as a new command, which is
+                # self-activation. Refusing here is defence in depth, not a
+                # duplicate of the client rule.
+                #
+                # Barge-in is unaffected: it is the explicit `interrupt` /
+                # `voice cancel` frame, which the user sends deliberately. An
+                # audio frame is never a reliable interruption signal *because*
+                # it cannot be told apart from the echo it is refused for.
+                if state.voice.state is VoiceState.SPEAKING:
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="speaking",
+                    )
+                    continue
+                # One utterance at a time. The receive loop used to cancel
+                # `state.audio_task` when a newer recording arrived, which
+                # killed an already-accepted command *and* the turn it had
+                # started — the reported "the command I just spoke never
+                # finished". A recording boundary is not a cancellation.
+                if state.audio_task is not None and not state.audio_task.done():
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="busy",
+                    )
+                    await connection_manager.send(websocket, {
+                        "type": "error",
+                        "content": (
+                            "Still working on the previous command. "
+                            "Press STOP to cancel it, or wait for the reply."
+                        ),
+                    })
+                    continue
+                # Idempotency, checked only once the frame is actually going to
+                # be handled. A client that reconnects after a genuine drop may
+                # resend its last frame; the command it carries has either
+                # already run or was cancelled with the socket, and running it
+                # twice is worse than either. Two ledgers: the per-socket one
+                # (`saw_utterance`) and a process-wide one
+                # (`remember_utterance`), because a reconnect is deliberately a
+                # new session id.
+                #
+                # This runs *after* the busy guard on purpose. Recording the id
+                # first meant a frame refused with "still working" consumed its
+                # id, so the client's legitimate retry was then thrown away as a
+                # replay — a dropped command, with two unrelated reasons in the
+                # log to explain it.
+                if utterance_id and (
+                    state.voice.saw_utterance(utterance_id)
+                    or remember_utterance(utterance_id)
+                ):
+                    logger.warning(
+                        "Session %s: replayed utterance %s dropped",
+                        session_id, str(utterance_id)[:32],
+                    )
+                    await _emit_voice_state(
+                        websocket, connection_manager, state,
+                        reason="replayed_utterance",
+                    )
+                    continue
                 # The transcription-and-turn sequence runs as its own task so
                 # the receive loop keeps taking frames while it does. It used
                 # to run inline, which meant that for the whole of a voice turn
@@ -478,15 +606,13 @@ async def create_websocket_handler(
                 # not process an `interrupt`, a `ping`, or a `tool_confirm`
                 # reply for a tool that was already blocked on approval. Those
                 # three are exactly the frames a user sends while waiting.
-                if state.audio_task and not state.audio_task.done():
-                    # A newer recording supersedes the one still in flight.
-                    state.audio_task.cancel()
                 audio_task = asyncio.create_task(
                     _handle_audio(
                         websocket, audio_b64, language, is_manual_voice,
                         session_id, connection_manager,
                         stt, tts, memory_agent, short_term_memory,
                         agent_service, router_agent, scheduler, config,
+                        utterance_id=utterance_id,
                     )
                 )
                 state.audio_task = audio_task
@@ -494,6 +620,42 @@ async def create_websocket_handler(
                 audio_task.add_done_callback(
                     lambda _t, sid=session_id: _AUDIO_TASKS.pop(sid, None)
                 )
+
+            elif msg_type == "voice":
+                state = session_states.get(session_id)
+                if state is None:
+                    continue
+                action = str(data.get("action", "")).lower()
+                if action == "enable":
+                    state.voice.enable()
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="enabled",
+                    )
+                elif action == "disable":
+                    state.voice.disable()
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="disabled",
+                    )
+                elif action == "stop_recording":
+                    # Finalizing a capture is *not* a cancel: the turn (if one
+                    # was already accepted) keeps running, and an armed
+                    # follow-up window survives. This frame exists so a client
+                    # can stop the recorder without sending `interrupt`.
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="recording_stopped",
+                    )
+                elif action == "cancel":
+                    state.cancel()
+                    state.voice.cancel()
+                    await _emit_voice_state(
+                        websocket, connection_manager, state, reason="cancelled",
+                    )
+                    await connection_manager.send(websocket, {"type": "interrupted"})
+                else:
+                    await connection_manager.send(websocket, {
+                        "type": "error",
+                        "content": f"Unknown voice action: {action!r}",
+                    })
 
             # NOTE: there is deliberately no `command` message type. An earlier
             # revision accepted {"type":"command","command":...} and routed it
@@ -523,6 +685,16 @@ async def create_websocket_handler(
                     "tool_confirm request_id=%s approved=%s resolved=%s",
                     request_id, approved, resolved,
                 )
+                # The turn continues either way: the engine hands a denial
+                # back to the model as an observation. Only a *resolved*
+                # request may move the voice state, or a stale approval would
+                # clear an approval the user is still looking at.
+                if resolved and state is not None and state.voice.enabled:
+                    state.voice.confirmation_resolved(approved)
+                    await _emit_voice_state(
+                        websocket, connection_manager, state,
+                        reason="approval_resolved",
+                    )
                 await connection_manager.send(websocket, {
                     "type": "confirmation_result",
                     "request_id": request_id,
@@ -582,6 +754,10 @@ async def create_websocket_handler(
         state = session_states.get(session_id)
         _forget_session(session_id)
         if state:
+            # The socket is gone, so the microphone has no consumer. Recording
+            # past this point would be the "listening forever" bug in its most
+            # literal form.
+            state.voice.disable()
             if state.confirmation_manager:
                 state.confirmation_manager.cancel_all("websocket closed")
             state.cancel()
@@ -750,7 +926,7 @@ class _ProgressRelay:
     tool_progress       ``tool_progress``   {name, message}
     tool_finished       ``tool_finished``   {name, success, summary}
     sources               ``sources``         {sources: [{n, url, kind, …}]}, capped
-    response_chunk      handled by the existing ``token`` stream
+    response_chunk        ``token``           {content, response_id}
     error               ``error``           {content}
     completed           ``status: done``
     ==================  ==================================================
@@ -836,8 +1012,31 @@ class _ProgressRelay:
             )
 
         elif kind is AgentEventType.RESPONSE_CHUNK:
-            # Already delivered by the `token` stream via stream_callback.
-            return
+            # The engine's prose answer. It is *not* already delivered by the
+            # token stream on a tool turn: the engine answers from its own
+            # non-streaming call, and `ToolAgent` forwards the chunk to
+            # `stream_callback` only when nothing is subscribed to this bus.
+            # This relay is the subscriber, so that forwarding is off and the
+            # text would otherwise surface only in the final `message` frame —
+            # no streamed bubble, and no early TTS sentence. Relaying it as a
+            # `token` closes the gap and keeps a single delivery path: the
+            # final `message` frame still supersedes the bubble with the
+            # authoritative text, exactly as it does for a streamed chat turn.
+            #
+            # `response_chunk` is emitted *only* by the engine, so this cannot
+            # double-deliver for the base-agent streaming path (which never
+            # emits this event) and it cannot race the `stream_callback`
+            # forwarding above (mutually exclusive by construction).
+            content = str(data.get("content", ""))
+            if content:
+                await self._cm.send(
+                    self._ws,
+                    add_trace({
+                        "type": "token",
+                        "content": content,
+                        "response_id": self._response_id,
+                    }),
+                )
 
         elif kind is AgentEventType.ERROR:
             await self._cm.send(
@@ -885,6 +1084,7 @@ async def _handle_audio(
     router_agent,
     scheduler,
     config,
+    utterance_id: str = "",
 ) -> None:
     """One microphone utterance, from encoded bytes to a running turn.
 
@@ -911,6 +1111,15 @@ async def _handle_audio(
     state = session_states.get(session_id)
     if state is None:
         return
+    # A client that streams audio is in voice mode even if it never sent a
+    # `voice enable` frame (an older client). Enable here so the state machine
+    # has a real starting point and the UI gets an honest STANDBY.
+    was_enabled = state.voice.enabled
+    state.voice.enable()
+    if not was_enabled:
+        await _emit_voice_state(
+            websocket, connection_manager, state, reason="audio_received",
+        )
     try:
         if stt.loading:
             logger.warning("STT is still loading, sending error")
@@ -918,6 +1127,7 @@ async def _handle_audio(
                 "type": "error",
                 "content": "Voice model is still loading. Please wait.",
             })
+            await _voice_recover(websocket, connection_manager, state, "stt_loading")
             return
         if not stt.loaded:
             # A fact, not a hint: the model is neither loaded nor being loaded,
@@ -935,6 +1145,7 @@ async def _handle_audio(
                     "type": "error",
                     "content": "Speech-to-text not available. Type instead.",
                 })
+            await _voice_recover(websocket, connection_manager, state, "stt_unavailable")
             return
 
         try:
@@ -943,6 +1154,7 @@ async def _handle_audio(
             await connection_manager.send(websocket, {
                 "type": "error", "content": "Malformed audio frame.",
             })
+            await _voice_recover(websocket, connection_manager, state, "malformed_audio")
             return
         # Length only: the prefixes are the user's audio, and a log is not the
         # place for it.
@@ -973,6 +1185,7 @@ async def _handle_audio(
             await connection_manager.send(websocket, {
                 "type": "status", "content": "listening",
             })
+            await _voice_recover(websocket, connection_manager, state, "stt_failed")
             return
         logger.info(
             "STT took %d ms for %d bytes (lang=%s)",
@@ -992,6 +1205,12 @@ async def _handle_audio(
                 len(audio_bytes), getattr(transcription, "language", None) or "auto",
             )
             await connection_manager.send(websocket, {"type": "status", "content": "listening"})
+            # Silence is a recording that produced no command. Go back to
+            # standby, not to a spinner: nothing was accepted.
+            state.voice.turn_complete()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="no_speech",
+            )
             return
         # Whisper's verdict beats the client's hint, so voice routing and the
         # agent's language kwarg stay in sync: `language` was re-derived from
@@ -1018,8 +1237,16 @@ async def _handle_audio(
         state = session_states.get(session_id)
         if state is None:
             return
-        # Skip wake-word gate for manual voice mode (user explicitly pressed mic)
-        wake_enabled = config.WAKE_WORD_REQUIRED and not is_manual_voice
+        # The legacy manual flag is honoured only when the deployment opted in.
+        # A continuous listener used to send it on every VAD segment, which
+        # made the wake-word gate a decoration; `is True` keeps a mock or a
+        # loosely-typed config from silently enabling it.
+        allow_manual = (
+            getattr(config, "WAKE_WORD_ALLOW_MANUAL_BYPASS", False) is True
+        )
+        wake_enabled = config.WAKE_WORD_REQUIRED and not (
+            is_manual_voice and allow_manual
+        )
         wake = apply_wake_gate(
             text,
             awaiting_command=bool(state.awaiting_command),
@@ -1027,13 +1254,12 @@ async def _handle_audio(
             timeout_secs=config.WAKE_SESSION_TIMEOUT,
             enabled=wake_enabled,
         )
-        if wake.detected:
-            # A wake word was spoken: arm the follow-up window so the user does
-            # not have to repeat it for the next command.
-            state.awaiting_command = not wake.acted
         if wake.dropped:
             # Not addressed to Zaytoon. Say so, otherwise the user just sees the
-            # app go quiet and assumes it is broken.
+            # app go quiet and assumes it is broken. This is the branch that
+            # keeps ordinary speech out of the command pipeline: it ends here,
+            # before a trace, a turn or a model call exists.
+            logger.info("Voice utterance dropped: no wake word (%d chars)", len(text))
             if config.WAKE_WORD_HINT:
                 await connection_manager.send(websocket, {
                     "type": "wake_word", "detected": False,
@@ -1041,24 +1267,35 @@ async def _handle_audio(
             await connection_manager.send(websocket, {
                 "type": "status", "content": "listening",
             })
+            state.voice.turn_complete()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="not_addressed",
+            )
             return
         if wake.detected:
             await connection_manager.send(websocket, {"type": "wake_word", "detected": True})
-            if not wake.acted:
-                await connection_manager.send(websocket, {
-                    "type": "status", "content": "listening",
-                })
-                return
-        if wake.acted:
-            text = wake.text
-
-        if state.awaiting_command:
-            state.awaiting_command = False
+        if not wake.acted:
+            # The wake word stood alone. The *next* utterance is the command;
+            # this is the "Zaytoon … (pause) … open Chrome" path, and it is the
+            # only reason the follow-up window exists.
+            state.voice.arm_follow_up()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="wake_word",
+            )
+            await connection_manager.send(websocket, {
+                "type": "status", "content": "listening",
+            })
+            return
+        text = wake.text
         # Same helper as the typed path: cancel the previous turn, mint this
         # one's id, and hand that id to everything downstream. The transcript
         # frame above already carried the *previous* id (the new one did not
         # exist yet), which is why the `stt_result` block re-stamps below.
         response_id = _begin_turn(state)
+        state.voice.command_accepted(utterance_id, response_id)
+        await _emit_voice_state(
+            websocket, connection_manager, state, reason="command_accepted",
+        )
 
         # Create trace for voice message
         trace_id = _create_trace(text, session_id)
@@ -1510,6 +1747,22 @@ async def _run_turn(
 
     await connection_manager.send(websocket, {"type": "status", "content": "thinking", "trace_id": trace_id})
 
+    async def announce_speaking() -> None:
+        """Tell the client speech is starting, and mute the microphone.
+
+        The voice state is the half the status frame cannot express: while
+        SPEAKING the client must not capture, or the assistant transcribes its
+        own TTS output and treats it as a new command.
+        """
+        await connection_manager.send(
+            websocket, {"type": "status", "content": "speaking", "trace_id": trace_id}
+        )
+        if state is not None and state.voice.enabled:
+            state.voice.speaking()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="tts",
+            )
+
     token_buffer: list[str] = []
 
     confirmation_manager = state.confirmation_manager if state else None
@@ -1549,7 +1802,7 @@ async def _run_turn(
             if complete:
                 tts_triggered = True
                 await flush_tokens()
-                await connection_manager.send(websocket, {"type": "status", "content": "speaking", "trace_id": trace_id})
+                await announce_speaking()
                 tts_task = asyncio.create_task(
                     _stream_tts_chunks(
                         websocket, complete[0], detect_language(complete[0]),
@@ -1659,6 +1912,11 @@ async def _run_turn(
         await connection_manager.send(websocket, {
             "type": "status", "content": "done", "response_id": response_id, "trace_id": trace_id,
         })
+        if state is not None and state.voice.enabled and state.is_current(response_id):
+            state.voice.turn_complete()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="empty_reply",
+            )
         _update_trace(trace_id, status="completed", final_length=0)
         return
 
@@ -1700,7 +1958,7 @@ async def _run_turn(
         # would talk over the turn that superseded it.
         logger.info("Session %s: not speaking a superseded reply (trace=%s)", session_id, trace_id)
     elif not tts_triggered:
-        await connection_manager.send(websocket, {"type": "status", "content": "speaking", "trace_id": trace_id})
+        await announce_speaking()
         tts_task = asyncio.create_task(
             _stream_tts_chunks(
                 websocket, final_content, response_language,
@@ -1713,7 +1971,7 @@ async def _run_turn(
     elif tts_triggered and spoken_tracker:
         remaining = spoken_tracker.get_new_sentences(final_content, tts.split_sentences)
         if remaining:
-            await connection_manager.send(websocket, {"type": "status", "content": "speaking", "trace_id": trace_id})
+            await announce_speaking()
             tts_task = asyncio.create_task(
                 _stream_tts_chunks(
                     websocket, " ".join(remaining), response_language,
@@ -1765,7 +2023,15 @@ async def _run_turn(
     })
 
     if state:
-        state.last_active_ts = time.time()
+        # The turn is over, so the voice pipeline is ready for the next wake
+        # word. This used to stamp `last_active_ts`, which armed a *wake-word
+        # free* window for the next ten seconds — and did so for typed turns
+        # too. The follow-up window now belongs to the wake word alone.
+        if state.voice.enabled and state.is_current(response_id):
+            state.voice.turn_complete()
+            await _emit_voice_state(
+                websocket, connection_manager, state, reason="turn_complete",
+            )
 
     await connection_manager.send(websocket, {
         "type": "status", "content": "listening",

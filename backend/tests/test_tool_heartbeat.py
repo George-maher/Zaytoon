@@ -51,6 +51,9 @@ class _Sleepy(BaseTool):
     def __init__(self, name="sleepy", delay=0.0):
         self._name = name
         self.delay = delay
+        #: How long this tool's own body took. Recorded so a test can say
+        #: "this call was fast" as a fact rather than assuming it.
+        self.elapsed = None
 
     def name(self):
         return self._name
@@ -62,8 +65,10 @@ class _Sleepy(BaseTool):
         return {"type": "object", "properties": {}}
 
     async def execute(self, **kwargs):
+        started = asyncio.get_running_loop().time()
         if self.delay:
             await asyncio.sleep(self.delay)
+        self.elapsed = asyncio.get_running_loop().time() - started
         return ToolResult.ok(f"{self._name} ran")
 
 
@@ -142,13 +147,29 @@ class TestHeartbeat:
         assert all(e.data["message"] == "Still working…" for e in beats)
 
     async def test_a_fast_tool_produces_none(self, monkeypatch):
-        monkeypatch.setattr(engine_mod, "TOOL_HEARTBEAT_S", 0.05)
+        """A call that never runs long emits no beat.
+
+        The interval here used to be 0.05 s — copied from the *slow*-tool test
+        above — which made this assertion a measurement of the host rather than
+        of the engine: on a loaded machine the engine's own bookkeeping around
+        a zero-delay call took longer than 50 ms, a beat fired for a tool that
+        had already returned, and a correct implementation failed. The interval
+        is now an order of magnitude above any plausible per-round overhead, and
+        the tool's own duration is asserted, so the test still says exactly what
+        it claims: this call really was fast, and it produced nothing.
+        """
+        monkeypatch.setattr(engine_mod, "TOOL_HEARTBEAT_S", 0.5)
         registry = ToolRegistry()
-        registry.register(_Sleepy("sleepy", delay=0.0))
+        fast = _Sleepy("sleepy", delay=0.0)
+        registry.register(fast)
         bus, seen = collector()
 
         await run_one_round(registry, call("sleepy"), bus=bus)
 
+        assert fast.elapsed is not None and fast.elapsed < 0.1, (
+            f"the probe was not fast ({fast.elapsed}s) — the assertion below "
+            f"would not mean anything"
+        )
         assert progress_events(seen) == []
 
     async def test_the_beats_stop_the_moment_the_call_ends(self, monkeypatch):

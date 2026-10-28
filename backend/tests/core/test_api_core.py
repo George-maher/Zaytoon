@@ -462,8 +462,29 @@ class TestFiles:
 
 
 class TestTerminal:
+    def _open(self, client, payload):
+        """preview, then confirm — the way the panel performs an open.
+
+        The full payload goes to the preview: it is the options recorded
+        against the token that run, so a test that changed them in the
+        confirming body would prove nothing but the binding.
+        """
+        preview = client.post("/terminal", json=payload)
+        assert preview.status_code == 200, preview.json()
+        return client.post(
+            "/terminal", json={**payload, "confirm": preview.json()["confirm"]}
+        )
+
     def test_open_list_and_close(self, client):
-        opened = client.post("/terminal", json={"command": "python -c pass"})
+        preview = client.post("/terminal", json={"command": "python -c pass"})
+        assert preview.status_code == 200
+        frame = preview.json()
+        assert frame["requires_confirmation"] is True
+        assert frame["command"] == "python -c pass"
+        assert frame["confirm"].startswith("term")
+        opened = client.post(
+            "/terminal", json={"command": "python -c pass", "confirm": frame["confirm"]}
+        )
         assert opened.status_code == 201
         session_id = opened.json()["id"]
 
@@ -471,6 +492,52 @@ class TestTerminal:
             s["id"] == session_id for s in client.get("/terminal").json()["sessions"]
         )
         assert client.delete(f"/terminal/{session_id}").status_code == 200
+
+    def test_a_terminal_token_is_single_use_and_surface_bound(self, client):
+        session = client.post("/terminal", json={"command": "python -c pass"})
+        token = session.json()["confirm"]
+        # A git verb cannot spend it: previews are scoped to their surface.
+        crossed = client.post(
+            "/git/commit", json={"path": ".", "message": "x", "confirm": token}
+        )
+        assert crossed.status_code == 409
+        first = client.post(
+            "/terminal",
+            json={"command": "python -c pass", "confirm": token},
+        )
+        assert first.status_code == 201
+        client.delete(f"/terminal/{first.json()['id']}")
+        replay = client.post(
+            "/terminal", json={"command": "python -c pass", "confirm": token}
+        )
+        assert replay.status_code == 409
+
+    def test_the_confirming_body_cannot_change_what_runs(self, client):
+        session = client.post("/terminal", json={"command": "python -c pass"})
+        token = session.json()["confirm"]
+        # The recorded command is what runs, whatever the confirming body says;
+        # the body's other fields are ignored at confirm time.
+        opened = client.post(
+            "/terminal",
+            json={
+                "command": "python -c 'print(1)'",
+                "timeout": 999,
+                "env": {"ZAY_EVIL": "yes"},
+                "confirm": token,
+            },
+        )
+        assert opened.status_code == 201
+        opened_session = opened.json()
+        assert opened_session["timeout_s"] != 999
+        assert "ZAY_EVIL" not in str(opened_session)
+        client.delete(f"/terminal/{opened_session['id']}")
+
+    def test_a_chained_command_never_reaches_a_token(self, client):
+        preview = client.post(
+            "/terminal", json={"command": "python -c pass & hostname"}
+        )
+        assert preview.status_code == 403
+        assert "confirm" not in preview.json()
 
     def test_an_empty_command_is_refused(self, client):
         assert client.post("/terminal", json={"command": "  "}).status_code == 422
@@ -486,13 +553,15 @@ class TestTerminal:
         assert client.get("/terminal/term_nope").status_code == 404
 
     def test_input_needs_data(self, client):
-        session_id = client.post("/terminal", json={"command": "python -c pass"}).json()["id"]
+        session_id = self._open(
+            client, {"command": "python -c pass"}
+        ).json()["id"]
         assert client.post(
             f"/terminal/{session_id}/input", json={}
         ).status_code == 422
 
     def test_env_and_timeout_pass_through(self, client):
-        opened = client.post("/terminal", json={
+        opened = self._open(client, {
             "command": "python -c pass",
             "env": {"ZAY_API_TEST": "sup3r-s3cret-value"},
             "timeout": 45,
@@ -507,14 +576,14 @@ class TestTerminal:
         client.delete(f"/terminal/{payload['id']}")
 
     def test_an_invalid_env_key_is_a_400(self, client):
-        response = client.post(
-            "/terminal", json={"command": "python -c pass", "env": {"BAD KEY": "v"}}
+        response = self._open(
+            client, {"command": "python -c pass", "env": {"BAD KEY": "v"}}
         )
         assert response.status_code == 400
 
     def test_an_absurd_timeout_is_a_400(self, client):
-        response = client.post(
-            "/terminal", json={"command": "python -c pass", "timeout": 9_999_999}
+        response = self._open(
+            client, {"command": "python -c pass", "timeout": 9_999_999}
         )
         assert response.status_code == 400
 

@@ -157,6 +157,11 @@ class AttemptRecord:
     tool_called: str = ""
     #: Why we moved off this model, in the operator's vocabulary.
     fallback_reason: str = ""
+    #: Time to first token, in ms — streaming attempts only. This is the number
+    #: a user actually feels: a model with a fast total latency but a slow first
+    #: token is the one that makes the bubble sit empty. Zero on a non-streaming
+    #: attempt, where "first token" has no distinct meaning.
+    ttft_ms: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -165,6 +170,7 @@ class AttemptRecord:
             "status": self.status,
             "detail": self.detail[:200],
             "latency_ms": self.latency_ms,
+            "ttft_ms": self.ttft_ms,
             "attempt": self.attempt,
             "request_id": self.request_id,
             "validation": self.validation,
@@ -640,6 +646,28 @@ class LLMClient:
             return default
         return min(seconds, 5.0)
 
+    def _cooldown_with_retry_after(
+        self, kind: str, response: Optional[httpx.Response]
+    ) -> float:
+        """How long to bench a model after a transport status, honouring
+        ``Retry-After``.
+
+        The header can only make the bench **shorter**, never longer. A provider
+        that answers 429 with ``Retry-After: 2`` is telling us the contention has
+        cleared; benching the model for the full ``LLM_RATE_LIMIT_COOLDOWN``
+        (90 s) would be ignoring the only evidence available. Floored at 1 s so a
+        ``Retry-After: 0`` cannot turn the chain into a tight loop, and capped at
+        5 s by :meth:`_retry_after_seconds`. ``_retry_after_seconds`` was written
+        once and never called, so the documented behaviour did not exist.
+        """
+        default = self._cooldown_for(kind)
+        if response is None:
+            return default
+        hinted = self._retry_after_seconds(response, 0.0)
+        if hinted <= 0:
+            return default
+        return max(1.0, min(default, hinted))
+
     def _log_attempt(self, record: AttemptRecord) -> None:
         """One structured line per attempt.
 
@@ -656,7 +684,7 @@ class LLMClient:
         logger.log(
             level,
             "LLM_ATTEMPT request=%s attempt=%d/%s model=%s status=%s "
-            "validation=%s tool=%s caps=%s reason=%s latency=%dms",
+            "validation=%s tool=%s caps=%s reason=%s latency=%dms ttft=%dms",
             record.request_id or "-",
             record.attempt,
             self.max_attempts,
@@ -667,6 +695,7 @@ class LLMClient:
             ",".join(record.required_capabilities) or "-",
             record.fallback_reason or record.detail[:120] or "-",
             record.latency_ms,
+            record.ttft_ms,
         )
         self._emit_model_event(record)
 
@@ -691,6 +720,10 @@ class LLMClient:
             "request_id": record.request_id,
             "attempt": record.attempt,
             "latency_ms": record.latency_ms,
+            # Streaming-only: how long the bubble sat empty. 0 for a blocking
+            # attempt, where the concept does not apply. Additive like the
+            # trace id — a client that does not know the field ignores it.
+            "ttft_ms": record.ttft_ms,
             # The turn this attempt belongs to, when one is bound (the transport
             # sets it in `_run_turn`, so every model call made inside a turn sees
             # it). Without it a client can only guess which of two overlapping
@@ -980,6 +1013,7 @@ class LLMClient:
                 started = time.monotonic()
                 full = ""
                 got_delta = False
+                ttft_ms = 0
                 try:
                     sink: List[str] = []
                     async for delta in transport.stream(
@@ -987,6 +1021,8 @@ class LLMClient:
                         max_tokens=max_tokens, temperature=temperature,
                         tools=tools, tool_calls_out=sink,
                     ):
+                        if not ttft_ms:
+                            ttft_ms = int((time.monotonic() - started) * 1000)
                         full += delta
                         got_delta = True
                         last_partial = full
@@ -1014,6 +1050,7 @@ class LLMClient:
                             attempt=number, request_id=rid,
                             validation=verdict.verdict,
                             required_capabilities=required,
+                            ttft_ms=ttft_ms,
                         )
                         attempts.append(record)
                         self._emit_model_event(record)
@@ -1320,6 +1357,7 @@ class LLMClient:
             if number is None:
                 break
             full = ""
+            ttft_ms = 0
             started = time.monotonic()
             try:
                 stream = await client.chat(
@@ -1327,6 +1365,8 @@ class LLMClient:
                     options=self._ollama_options(max_tokens, temperature),
                 )
                 async for delta in stream:
+                    if not ttft_ms:
+                        ttft_ms = int((time.monotonic() - started) * 1000)
                     full += delta
                     emitted = True
                     last_partial = full
@@ -1437,7 +1477,7 @@ class LLMClient:
                 AttemptRecord(
                     label, "ollama", model, "ok", 200, latency_ms=elapsed,
                     attempt=number, request_id=rid, validation=verdict.verdict,
-                    required_capabilities=required,
+                    required_capabilities=required, ttft_ms=ttft_ms,
                 )
             )
             return full
@@ -1643,7 +1683,15 @@ class LLMClient:
                         self._health(endpoint.model).record_failure(
                             self.provider_cooldown, str(e)
                         )
-                        continue  # retry same model, then move on
+                        break
+                    # A malformed body is a *contract* failure, not a transport
+                    # blip: this endpoint returned something that is not the
+                    # JSON it promised, and an identical request to the same
+                    # endpoint is the one request least likely to answer
+                    # differently. It used to `continue` and spend a second
+                    # attempt on the same model before falling back, which is
+                    # exactly the retry the validator's own doctrine forbids
+                    # ("a model that answers wrongly is benned").
 
                     # --- The fix. A 200 is not success. ------------------
                     verdict = validate_completion(content, contract, extract=extract)
@@ -1702,7 +1750,7 @@ class LLMClient:
                 attempts.append(record)
                 self.metrics.record(kind, elapsed)
                 self._health(endpoint.model).record_failure(
-                    self._cooldown_for(kind), detail
+                    self._cooldown_with_retry_after(kind, response), detail
                 )
                 if kind == "fatal":
                     break
@@ -1755,6 +1803,68 @@ class LLMClient:
         delta = (choices[0] or {}).get("delta") or {}
         content = delta.get("content")
         return content if isinstance(content, str) else None
+
+    @staticmethod
+    def _parse_sse_tool_calls(data_str: str) -> List[Dict[str, Any]]:
+        """Native ``tool_calls`` deltas from one SSE ``data:`` payload.
+
+        The OpenAI streaming shape fragments a call across frames — the name in
+        one, ``arguments`` pieces in the rest — so the caller merges by
+        ``index``. Returns ``[]`` for a frame that carries none, which is every
+        ordinary text delta.
+
+        This is what the chain's streaming reader was missing. Its registry
+        counterpart (``OpenAICompatibleClient.stream``) already collected these,
+        so the same model was handled on one transport and treated as an *empty
+        completion* on the other — benched, and the turn reported as a provider
+        failure. A tool call is not prose, so it never reaches ``on_delta``; it
+        joins the accumulated text *after* the stream, off the wire.
+        """
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(chunk, dict) or chunk.get("error"):
+            return []
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return []
+        delta = (choices[0] or {}).get("delta") or {}
+        calls = delta.get("tool_calls")
+        if not isinstance(calls, list):
+            return []
+        return [c for c in calls if isinstance(c, dict)]
+
+    @staticmethod
+    def _merge_tool_call(
+        pending: Dict[int, Dict[str, str]], call: Dict[str, Any]
+    ) -> None:
+        """Fold one fragmented native call into the per-``index`` accumulator."""
+        index = call.get("index")
+        slot = pending.setdefault(
+            index if isinstance(index, int) else len(pending),
+            {"name": "", "arguments": ""},
+        )
+        function = call.get("function") or {}
+        name = function.get("name")
+        if name and not slot["name"]:
+            slot["name"] = str(name)
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            slot["arguments"] += arguments
+        elif arguments is not None:
+            slot["arguments"] = json.dumps(arguments, ensure_ascii=False)
+
+    @staticmethod
+    def _render_accumulated_calls(pending: Dict[int, Dict[str, str]]) -> List[str]:
+        """Every completed native call, rendered in the JSON-in-text dialect."""
+        from core.providers.client import render_tool_call
+
+        return [
+            render_tool_call(slot["name"].strip(), slot["arguments"])
+            for index in sorted(pending)
+            if (slot := pending[index])["name"].strip()
+        ]
 
     async def stream(
         self,
@@ -1878,6 +1988,8 @@ class LLMClient:
                 if number is None:
                     break
                 full = ""
+                ttft_ms = 0
+                pending_calls: Dict[int, Dict[str, str]] = {}
                 started = time.monotonic()
                 try:
                     async with client.stream(
@@ -1904,7 +2016,8 @@ class LLMClient:
                                 response.status_code, detail,
                             )
                             self._health(endpoint.model).record_failure(
-                                self._cooldown_for(kind), detail
+                                self._cooldown_with_retry_after(kind, response),
+                                detail,
                             )
                             break  # next model (429 included)
 
@@ -1915,13 +2028,29 @@ class LLMClient:
                             if data_str == "[DONE]":
                                 break
                             delta = self._parse_sse_line(data_str)
-                            if not delta:
-                                continue
-                            full += delta
-                            emitted = True
-                            last_partial = full
-                            if on_delta:
-                                await on_delta(delta)
+                            if delta:
+                                if not ttft_ms:
+                                    ttft_ms = int((time.monotonic() - started) * 1000)
+                                full += delta
+                                emitted = True
+                                last_partial = full
+                                if on_delta:
+                                    await on_delta(delta)
+                            # Native tool calls are collected off-wire: a call is
+                            # not prose, and streaming a JSON blob character by
+                            # character is the exact bug the engine's
+                            # "tool calls are not prose" rule prevents.
+                            for call in self._parse_sse_tool_calls(data_str):
+                                self._merge_tool_call(pending_calls, call)
+
+                    # A native call that arrived only as tool-call deltas left
+                    # `full` empty; render it into the dialect so the contract
+                    # check and the tool gate see the same text they would have
+                    # seen from a model that typed the JSON itself.
+                    rendered_calls = self._render_accumulated_calls(pending_calls)
+                    if rendered_calls:
+                        suffix = "\n".join(rendered_calls)
+                        full = f"{full}\n{suffix}" if full else suffix
 
                     if not full:
                         raise LLMResponseError("stream completed with no content")
@@ -1955,6 +2084,7 @@ class LLMClient:
                         attempt=number, request_id=rid,
                         validation=verdict.verdict,
                         required_capabilities=required,
+                        ttft_ms=ttft_ms,
                     )
                     attempts.append(record)
                     self._emit_model_event(record)
@@ -2161,6 +2291,25 @@ _llm_gate = BoundedGate(
 def llm_gate() -> BoundedGate:
     """The process-wide gate. Exposed for ``/health`` and for tests."""
     return _llm_gate
+
+
+@asynccontextmanager
+async def model_slot() -> "AsyncIterator[None]":
+    """Hold one process-wide model slot, for callers *outside* the agent path.
+
+    ``complete()`` and ``stream()`` take a slot themselves, so every turn is
+    already bounded. A capability *probe* and a "test chat" are also real
+    generations, and they used to run holding none — so a user pressing "test"
+    while a turn was generating put a second load on the same GPU the bound
+    exists to protect, which is exactly the case the bound was written for.
+    Same queue, same honest ``llm_queue_timeout`` refusal.
+
+    Raises :class:`AllModelsUnavailableError` (``kind="llm_queue_timeout"``)
+    when the queue is full for too long; callers report that as the failure it
+    is rather than treating it as a transport error.
+    """
+    async with _gated():
+        yield
 
 
 @asynccontextmanager

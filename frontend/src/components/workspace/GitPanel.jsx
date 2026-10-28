@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useState } from "react";
 import * as api from "../../lib/api";
+import { translate } from "../../i18n/strings";
 
 /**
  * Source control for the open project.
@@ -85,6 +86,13 @@ function GitPanel({ path = ".", language = "en", onError }) {
   /** The merge target row is open (armed, nothing sent) and its branch. */
   const [merging, setMerging] = useState(false);
   const [mergeTarget, setMergeTarget] = useState("");
+  /**
+   * The parked preview of a consequential verb: `{confirm, summary, action, …}`.
+   * `run()` puts it there after step 1 and clears it on confirm, cancel, or a
+   * fresher preview. A cached token is never replayed silently — the row is
+   * the second half of the two-step approval the server now enforces.
+   */
+  const [confirmRow, setConfirmRow] = useState(null);
 
   const refresh = useCallback(async () => {
     setLoadError(null);
@@ -159,11 +167,21 @@ function GitPanel({ path = ".", language = "en", onError }) {
   }, [present, path, loadBranches]);
 
   const run = useCallback(
-    async (action) => {
+    async (action, confirmToken = null) => {
       setBusy(true);
       setError("");
       setArmed("");
-      const result = await action();
+      const result = await action(confirmToken);
+      if (!confirmToken && result.requires_confirmation) {
+        // Step 1 answered with the server's preview — `{requires_confirmation,
+        // confirm, summary}`, nothing has run. Park it with the panel's own
+        // thunk (the frame's `action` is the server's action name); the
+        // confirmation row below either replays the token or drops it.
+        setBusy(false);
+        setConfirmRow({ ...result, runAction: action });
+        return result;
+      }
+      setConfirmRow(null);
       setBusy(false);
       if (result.error) {
         onError?.(result.error);
@@ -361,7 +379,7 @@ function GitPanel({ path = ".", language = "en", onError }) {
             value={status.branch}
             onChange={(e) => {
               if (e.target.value && e.target.value !== status.branch) {
-                run(() => api.gitCheckout(e.target.value, { path }));
+                run((confirm) => api.gitCheckout(e.target.value, { path, confirm }));
               }
             }}
             style={{
@@ -402,7 +420,7 @@ function GitPanel({ path = ".", language = "en", onError }) {
           type="button"
           className="hud-micro"
           disabled={busy}
-          onClick={() => run(() => api.gitPush({ path }))}
+          onClick={() => run((confirm) => api.gitPush({ path, confirm }))}
           style={busy ? disabledStyle : actionButton}
           title={ar ? "دفع إلى المستودع البعيد" : "Push to the remote"}
         >
@@ -488,7 +506,7 @@ function GitPanel({ path = ".", language = "en", onError }) {
             }
             onClick={() => {
               setMerging(false);
-              run(() => api.gitMerge(mergeTarget, { path }));
+              run((confirm) => api.gitMerge(mergeTarget, { path, confirm }));
             }}
             style={{ color: "var(--hud-amber)" }}
           >
@@ -502,6 +520,49 @@ function GitPanel({ path = ".", language = "en", onError }) {
             style={{ color: "var(--hud-text-mute)" }}
           >
             {ar ? "إلغاء" : "CANCEL"}
+          </button>
+        </div>
+      )}
+
+      {/* The two-step approval: the server's own preview, then the token.
+          The summary and note are the backend's words — it describes what the
+          recorded operation will do, and what runs is exactly what was recorded
+          (the confirming call cannot change it), so there is no UI-side
+          paraphrase to drift from the effect. */}
+      {confirmRow && (
+        <div
+          className="flex-none flex items-center gap-2 flex-wrap"
+          role="alertdialog"
+          aria-label={translate(language, "git.confirm_dialog")}
+          style={{
+            padding: "var(--space-1) var(--space-2)",
+            borderTop: "var(--border-w) solid var(--hud-edge-faint)",
+          }}
+        >
+          <span
+            className="hud-micro flex-1"
+            style={{ color: "var(--hud-amber)", direction: "ltr", textAlign: "left" }}
+            dir="ltr"
+          >
+            {confirmRow.summary}
+          </span>
+          <button
+            type="button"
+            className="hud-micro"
+            disabled={busy}
+            onClick={() => run(confirmRow.runAction, confirmRow.confirm)}
+            style={{ color: "var(--hud-amber)" }}
+          >
+            {translate(language, "git.confirm_action")}
+          </button>
+          <button
+            type="button"
+            className="hud-micro"
+            disabled={busy}
+            onClick={() => setConfirmRow(null)}
+            style={{ color: "var(--hud-text-mute)" }}
+          >
+            {translate(language, "common.cancel")}
           </button>
         </div>
       )}
@@ -570,7 +631,9 @@ function GitPanel({ path = ".", language = "en", onError }) {
                       disabled={busy}
                       aria-label={`Confirm discard ${entry.path}`}
                       onClick={() =>
-                        run(() => api.gitRestore([entry.path], { staged: false, path }))
+                        run((confirm) =>
+                          api.gitRestore([entry.path], { staged: false, path, confirm })
+                        )
                       }
                       style={{ color: "var(--hud-red)" }}
                     >
@@ -681,7 +744,7 @@ function GitPanel({ path = ".", language = "en", onError }) {
           // staged is always wrong, and letting someone press it only to be
           // told so wastes the interaction.
           disabled={busy || status.staged === 0 || !commitMessage.trim()}
-          onClick={() => run(() => api.gitCommit(commitMessage.trim(), { path }))}
+          onClick={() => run((confirm) => api.gitCommit(commitMessage.trim(), { path, confirm }))}
           style={{
             color:
               status.staged > 0 && commitMessage.trim() ? "var(--hud-cyan)" : "var(--hud-text-mute)",

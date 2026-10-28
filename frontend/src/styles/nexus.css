@@ -1,0 +1,794 @@
+/* ============================================================================
+   NEXUS home screen — scoped design system.
+
+   Implements the Jarvis "NEXUS AI" Figma Make reference (dashboard, orb states,
+   command console, app dock). Everything lives under `.nexus` with its own
+   `--nx-*` tokens so the reference is faithful in one place while the rest of
+   the product keeps the HUD tokens it already shares with the desktop shell
+   (parity tests pin those values; they are not part of this screen's scope).
+
+   Data rules this styling cannot break:
+   - a value the backend does not report renders as "—", never a zero,
+   - the palette is decoration: every number on screen comes from real
+     telemetry (GET /system, GET /health, the WebSocket session).
+   ========================================================================== */
+
+.nexus {
+  /* surfaces: blue-black void with a cyan cast — the same ground as the
+     global --hud-* tokens (which the Figma reference retarget moved to these
+     values), kept as --nx-* so this screen's layout stays self-contained */
+  --nx-void: #010812;
+  --nx-deep: #020d1a;
+  --nx-panel: rgba(0, 8, 20, 0.5);
+  --nx-panel-solid: #041020;
+  --nx-line: rgba(0, 245, 255, 0.14);
+  --nx-line-strong: rgba(0, 245, 255, 0.32);
+
+  /* accents */
+  --nx-cyan: #00f5ff;
+  --nx-blue: #0ea5e9;
+  --nx-purple: #a855f7;
+  --nx-green: #22c55e;
+  --nx-amber: #f59e0b;
+  --nx-red: #ec4899;
+
+  /* type + text */
+  --nx-text: #c6d4e7;
+  --nx-dim: #94a8c4;
+  --nx-mute: #6b809c;
+  --nx-mono: var(--font-mono);
+  --nx-display: var(--font-display);
+
+  /* motion + glow */
+  --nx-glow: 0 0 14px rgba(0, 245, 255, 0.22);
+  --nx-glow-soft: 0 0 8px rgba(0, 245, 255, 0.16);
+  --nx-radius: 14px;
+  --nx-ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: radial-gradient(
+      1100px 620px at 50% 42%,
+      rgba(0, 245, 255, 0.05),
+      transparent 62%
+    ),
+    linear-gradient(180deg, var(--nx-deep), var(--nx-void) 78%);
+  color: var(--nx-text);
+  font-family: var(--nx-mono);
+}
+
+/* fine dotted grid + vignette behind the deck */
+.nexus::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(
+      rgba(148, 197, 224, 0.055) 1px,
+      transparent 1px
+    );
+  background-size: 26px 26px;
+  pointer-events: none;
+}
+.nexus::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    120% 90% at 50% 40%,
+    transparent 55%,
+    rgba(2, 5, 10, 0.55)
+  );
+  pointer-events: none;
+}
+
+/* ============================================================================
+   chrome: top bar
+   ========================================================================== */
+
+.nx-topbar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: none;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--nx-line);
+  background: rgba(4, 9, 16, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.nx-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.nx-brand-orb {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--nx-line-strong);
+  background: radial-gradient(circle at 35% 35%, #2af5e0 0%, #0a6f7d 55%, #04222b 100%);
+  box-shadow: 0 0 12px rgba(0, 245, 255, 0.4);
+}
+.nx-brand-name {
+  font-family: var(--nx-display);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.28em;
+  color: var(--nx-cyan);
+  text-shadow: var(--nx-glow-soft);
+  white-space: nowrap;
+}
+.nx-brand-sub {
+  font-size: 8px;
+  letter-spacing: 0.22em;
+  color: var(--nx-mute);
+  white-space: nowrap;
+}
+
+.nx-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--nx-line);
+  background: rgba(9, 20, 34, 0.6);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--nx-cyan);
+  white-space: nowrap;
+}
+.nx-pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--nx-hue, var(--nx-cyan));
+  box-shadow: 0 0 7px var(--nx-hue, var(--nx-cyan));
+}
+.nx-pill[data-hue="green"] { color: var(--nx-green); --nx-hue: var(--nx-green); }
+.nx-pill[data-hue="purple"] { color: var(--nx-purple); --nx-hue: var(--nx-purple); }
+.nx-pill[data-hue="amber"] { color: var(--nx-amber); --nx-hue: var(--nx-amber); }
+.nx-pill[data-hue="red"] { color: var(--nx-red); --nx-hue: var(--nx-red); }
+.nx-pill[data-hue="mute"] { color: var(--nx-mute); --nx-hue: var(--nx-mute); }
+
+/* the live metric strip in the middle of the bar */
+.nx-metrics {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-inline: auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.nx-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--nx-mute);
+  white-space: nowrap;
+}
+.nx-metric b {
+  font-family: var(--nx-mono);
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--nx-text);
+}
+
+.nx-clock {
+  flex: none;
+  text-align: end;
+  line-height: 1.05;
+}
+.nx-clock-time {
+  font-family: var(--nx-mono);
+  font-weight: 700;
+  font-size: 21px;
+  letter-spacing: 0.12em;
+  color: var(--nx-blue);
+  text-shadow: 0 0 10px rgba(14, 165, 233, 0.45);
+  font-variant-numeric: tabular-nums;
+}
+.nx-clock-date {
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--nx-mute);
+  text-transform: uppercase;
+}
+
+.nx-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.nx-iconbtn {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid var(--nx-line);
+  background: rgba(9, 20, 34, 0.55);
+  color: var(--nx-dim);
+  cursor: pointer;
+  transition: color 120ms var(--nx-ease), border-color 120ms var(--nx-ease),
+    box-shadow 120ms var(--nx-ease);
+}
+.nx-iconbtn:hover,
+.nx-iconbtn:focus-visible {
+  color: var(--nx-cyan);
+  border-color: var(--nx-line-strong);
+  box-shadow: var(--nx-glow);
+  outline: none;
+}
+.nx-iconbtn[aria-pressed="true"] {
+  color: var(--nx-cyan);
+  border-color: var(--nx-line-strong);
+  box-shadow: var(--nx-glow);
+}
+
+/* ============================================================================
+   deck: the three columns
+   ========================================================================== */
+
+.nx-deck {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(280px, 320px) minmax(0, 1fr) minmax(300px, 380px);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+  padding: 12px 18px;
+  overflow: hidden;
+}
+
+.nx-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.nx-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ============================================================================
+   panels
+   ========================================================================== */
+
+.nx-panel {
+  position: relative;
+  border: 1px solid var(--nx-line);
+  border-radius: var(--nx-radius);
+  background: linear-gradient(180deg, rgba(9, 20, 33, 0.86), rgba(5, 12, 21, 0.9));
+  box-shadow: 0 12px 34px rgba(2, 6, 12, 0.55);
+  padding: 14px;
+  min-width: 0;
+}
+.nx-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.nx-panel-title {
+  font-family: var(--nx-display);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  color: var(--nx-cyan);
+  text-shadow: var(--nx-glow-soft);
+  white-space: nowrap;
+}
+.nx-panel-sub {
+  margin-inline-start: auto;
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--nx-mute);
+  white-space: nowrap;
+}
+.nx-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--nx-green);
+}
+.nx-live::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--nx-green);
+  box-shadow: 0 0 6px var(--nx-green);
+  animation: nx-breathe 2.2s var(--nx-ease) infinite;
+}
+@keyframes nx-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+@keyframes nx-rot {
+  to { transform: rotate(360deg); }
+}
+
+/* ============================================================================
+   health gauge + metric tiles
+   ========================================================================== */
+
+.nx-gauge-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px;
+  border: 1px solid var(--nx-line);
+  border-radius: 12px;
+  background: rgba(6, 14, 24, 0.55);
+}
+.nx-gauge-copy { min-width: 0; }
+.nx-gauge-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--nx-text);
+  white-space: nowrap;
+}
+.nx-gauge-status {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--nx-green);
+  font-weight: 700;
+}
+.nx-gauge-sub {
+  font-family: var(--nx-mono);
+  font-size: 9px;
+  color: var(--nx-mute);
+  margin-top: 3px;
+  white-space: nowrap;
+}
+
+.nx-tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.nx-tile {
+  border: 1px solid var(--nx-line);
+  border-radius: 12px;
+  background: rgba(6, 14, 24, 0.55);
+  padding: 10px 12px;
+  min-width: 0;
+}
+.nx-tile-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  color: var(--nx-mute);
+}
+.nx-tile-value {
+  margin-top: 2px;
+  font-family: var(--nx-mono);
+  font-weight: 700;
+  font-size: 19px;
+  color: var(--nx-hue, var(--nx-cyan));
+  text-shadow: 0 0 9px rgba(0, 245, 255, 0.25);
+  font-variant-numeric: tabular-nums;
+}
+.nx-tile[data-hue="purple"] { --nx-hue: var(--nx-purple); }
+.nx-tile[data-hue="blue"] { --nx-hue: var(--nx-blue); }
+.nx-tile[data-hue="amber"] { --nx-hue: var(--nx-amber); }
+.nx-tile[data-hue="green"] { --nx-hue: var(--nx-green); }
+.nx-tile[data-hue="mute"] { --nx-hue: var(--nx-mute); }
+.nx-tile-value[data-flat="true"] {
+  color: var(--nx-mute);
+  text-shadow: none;
+}
+.nx-spark {
+  margin-top: 6px;
+  width: 100%;
+  height: 30px;
+  display: block;
+}
+
+/* activity list (real tracked objects, never invented rows) */
+.nx-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nx-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--nx-mono);
+  font-size: 10px;
+  color: var(--nx-dim);
+  white-space: nowrap;
+}
+.nx-row b { color: var(--nx-text); font-weight: 600; }
+.nx-row .nx-row-aux {
+  font-size: 9px;
+  color: var(--nx-mute);
+}
+
+/* ============================================================================
+   the core (orb)
+   ========================================================================== */
+
+.nx-core-btn {
+  position: relative;
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  display: block;
+}
+.nx-core-btn:focus-visible {
+  outline: 2px solid var(--nx-line-strong);
+  outline-offset: 6px;
+  border-radius: 50%;
+}
+.nx-core-hint {
+  font-size: 8px;
+  letter-spacing: 0.32em;
+  color: var(--nx-mute);
+  text-transform: uppercase;
+  text-align: center;
+}
+.nx-core-state {
+  font-family: var(--nx-display);
+  font-size: clamp(20px, 2.4vw, 30px);
+  font-weight: 700;
+  letter-spacing: 0.42em;
+  text-align: center;
+  color: var(--nx-hue, var(--nx-cyan));
+  text-shadow: 0 0 16px var(--nx-hue, var(--nx-cyan));
+  text-indent: 0.42em; /* balances the trailing tracking */
+  white-space: nowrap;
+}
+.nx-core-bar {
+  display: flex;
+ gap: 10px;
+  justify-content: center;
+}
+
+/* sector meters under the state word (real counters, direction not data) */
+.nx-segments {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+}
+.nx-segment {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.nx-segment-bar {
+  width: 54px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(0, 245, 255, 0.12);
+  overflow: hidden;
+}
+.nx-segment-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--nx-hue, var(--nx-cyan));
+  box-shadow: 0 0 6px var(--nx-hue, var(--nx-cyan));
+  transition: width 600ms var(--nx-ease);
+}
+.nx-segment-label {
+  font-size: 7px;
+  letter-spacing: 0.18em;
+  color: var(--nx-mute);
+}
+
+/* ============================================================================
+   command console
+   ========================================================================== */
+
+.nx-console {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
+}
+.nx-transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+  scrollbar-width: thin;
+}
+.nx-msg {
+  position: relative;
+  max-width: 92%;
+  padding: 9px 12px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--nx-text);
+}
+.nx-msg-assistant {
+  align-self: flex-start;
+  border: 1px solid var(--nx-line);
+  background: rgba(8, 18, 30, 0.85);
+  border-start-start-radius: 4px;
+}
+.nx-msg-user {
+  align-self: flex-end;
+  border: 1px solid rgba(168, 85, 247, 0.35);
+  background: rgba(88, 28, 135, 0.28);
+  border-start-end-radius: 4px;
+}
+.nx-msg-system {
+  align-self: stretch;
+  border: 1px dashed var(--nx-line);
+  background: transparent;
+  color: var(--nx-dim);
+  font-size: 10.5px;
+}
+.nx-msg-ts {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--nx-mono);
+  font-size: 8.5px;
+  color: var(--nx-mute);
+  text-align: end;
+}
+.nx-msg[data-dir="rtl"] { text-align: start; }
+
+.nx-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 8px;
+}
+.nx-chip {
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--nx-line);
+  background: rgba(9, 20, 34, 0.5);
+  color: var(--nx-cyan);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: all 120ms var(--nx-ease);
+}
+.nx-chip:hover,
+.nx-chip:focus-visible {
+  border-color: var(--nx-line-strong);
+  box-shadow: var(--nx-glow);
+  outline: none;
+}
+
+.nx-console-input {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* `.nexus` re-skins the shared InputBar's wrapper classes within this scope */
+.nexus .hud-input {
+  border-color: var(--nx-line);
+  background: rgba(9, 20, 34, 0.6);
+  color: var(--nx-text);
+  border-radius: 10px;
+}
+.nexus .hud-input:focus-within {
+  border-color: var(--nx-line-strong);
+  box-shadow: var(--nx-glow);
+}
+.nexus .hud-input::placeholder { color: var(--nx-mute); }
+
+/* ============================================================================
+   bottom band: dock + voice meter
+   ========================================================================== */
+
+.nx-bottom {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 18px 12px;
+}
+
+.nx-meter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+.nx-meter-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 22px;
+}
+.nx-meter-bars > span {
+  width: 3px;
+  border-radius: 2px;
+  background: var(--nx-hue, var(--nx-cyan));
+  opacity: 0.85;
+  transition: height 140ms var(--nx-ease), opacity 140ms var(--nx-ease);
+}
+.nx-meter-caption {
+  margin-inline-start: 10px;
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--nx-mute);
+  white-space: nowrap;
+}
+
+.nx-dock {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--nx-line);
+  border-radius: 16px;
+  background: rgba(5, 12, 21, 0.85);
+  box-shadow: 0 10px 30px rgba(2, 6, 12, 0.5);
+}
+.nx-dc {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--nx-dim);
+  cursor: pointer;
+  transition: all 120ms var(--nx-ease);
+}
+.nx-dc:hover,
+.nx-dc:focus-visible {
+  color: var(--nx-cyan);
+  border-color: var(--nx-line);
+  box-shadow: var(--nx-glow-soft);
+  outline: none;
+}
+.nx-dc[aria-current="true"] {
+  color: #f0eaff;
+  border-color: rgba(0, 245, 255, 0.4);
+  background: linear-gradient(160deg, rgba(0, 245, 255, 0.22), rgba(168, 85, 247, 0.28));
+  box-shadow: 0 0 16px rgba(0, 245, 255, 0.3);
+}
+.nx-dc[data-dest="settings"] {
+  color: var(--nx-purple);
+}
+.nx-dc-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 4px 4px;
+  background: var(--nx-line);
+}
+.nx-dock-side {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--nx-mute);
+}
+
+/* ============================================================================
+   launchpad overlay (open folder / file / commands — carried over from Home)
+   ========================================================================== */
+
+.nx-launch {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 5, 10, 0.62);
+  backdrop-filter: blur(4px);
+}
+.nx-launch-card {
+  width: min(420px, calc(100vw - 48px));
+  border: 1px solid var(--nx-line-strong);
+  border-radius: var(--nx-radius);
+  background: var(--nx-panel-solid);
+  box-shadow: 0 24px 70px rgba(2, 6, 12, 0.7);
+  padding: 16px;
+}
+.nx-launch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.nx-launch-close {
+  margin-top: 12px;
+  text-align: center;
+}
+
+/* ============================================================================
+   toast lane (bottom right, above the mic meter) — port of $toast pattern
+   ========================================================================== */
+
+.nx-toast {
+  border: 1px solid var(--nx-line-strong);
+  border-radius: 10px;
+  background: rgba(7, 16, 27, 0.94);
+  color: var(--nx-text);
+  padding: 8px 12px;
+  font-size: 10px;
+  box-shadow: var(--nx-glow);
+  max-width: 280px;
+}
+.nx-toast-small {
+  display: block;
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  color: var(--nx-cyan);
+  margin-bottom: 2px;
+}
+
+/* ============================================================================
+   responsive: under 1200px the rails fold into a scrolling stack
+   ========================================================================== */
+
+@media (max-width: 1199px) {
+  .nx-deck {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto minmax(320px, 1fr);
+    overflow-y: auto;
+  }
+  .nx-rail { overflow: visible; }
+  .nx-center { min-height: 300px; }
+  .nx-metrics { display: none; }
+  .nx-clock-time { font-size: 16px; }
+  .nx-bottom { grid-template-columns: auto 1fr; }
+  .nx-meter { justify-content: flex-start; }
+}
+
+/* ============================================================================
+   reduced motion: motion is decoration, data is not
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  .nx-live::before { animation: none; }
+  .nx-segment-bar > span,
+  .nx-meter-bars > span { transition: none; }
+}

@@ -114,6 +114,17 @@ import weakref  # noqa: E402
 
 _LIVE_AGENTS: "weakref.WeakSet" = weakref.WeakSet()
 
+# `tests/` is not reliably on `sys.path` at conftest-import time (it depends on
+# which special root pytest derived), so insert this directory explicitly —
+# already-present-first, so an already-inserted path stays in front.
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_HERE = str(_Path(__file__).resolve().parent)
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+from _sqlite_sweeper import release_stray_threads  # noqa: E402
+
 
 def _track_memory_agents() -> None:
     """Record agents as they are constructed, without touching production code.
@@ -158,3 +169,14 @@ async def _close_import_time_memory_agent():
     for agent in list(_LIVE_AGENTS):
         if getattr(agent, "_db", None) is not None:
             await agent.close()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Last resort for connections a test left referenced ``after`` teardown.
+
+    The autouse fixture above covers the common case; this one catches whatever
+    pytest itself retains past fixture teardown (traceback frames hold the
+    objects they refer to). Without it the interpreter waits for the leaked
+    worker in ``threading._shutdown`` after the summary has printed.
+    """
+    release_stray_threads()

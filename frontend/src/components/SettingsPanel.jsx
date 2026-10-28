@@ -390,6 +390,9 @@ function SettingsPanel({ open, onClose, language = "en" }) {
           <h2 className="font-bold tracking-[0.25em]" style={{ fontSize: "var(--font-md)", color: "var(--hud-cyan)" }}>
             {ar ? "الإعدادات" : "SETTINGS"}
           </h2>
+          <p className="hud-micro" style={{ fontSize: "var(--font-sm)", color: "var(--hud-text-mute)", marginTop: "var(--space-1)" }}>
+            {ar ? "ضبط التفضيلات وتكوين المزودين" : "Configure AI provider and workspace"}
+          </p>
         </div>
 
         <div

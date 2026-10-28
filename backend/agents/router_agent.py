@@ -55,6 +55,12 @@ KEYWORD_ROUTES: list[tuple[re.Pattern, str, float]] = [
     # `vm_guest_check`, and routing it to `chat` makes the VM workflow
     # unreachable without an LLM.
     (re.compile(r"(vmware|vmrun|virtual machines?|\bvms?\b|\bguest\b|hypervisor|ubuntu|parrot|افتراضي)"), "tools", 0.92),
+    # File/folder search by name. These sit above the generic "open" rule
+    # because "دورلي على ملف" and "فين ملف report" contain verbs that the open
+    # rule would otherwise claim, and a search answered by opening the wrong
+    # file is worse than no answer. `test_router_routing.py` pins the ordering.
+    (re.compile(r"(فين|لاقي|هاتلي|where is|where's|find|locate)\s+.*(ملف|فايل|فولدر|مجلد|file|folder)"), "tools", 0.92),
+    (re.compile(r"(دورلي|دور لي|دوّرلي|دوّر لي|ابحث عن|ابحثلي|ابحث لي|search for|look for)\s+\S+"), "tools", 0.9),
     # `شغّل` (with shadda) is the everyday imperative "start it" — the plain
     # `شغل` alternative never matches it, so every Egyptian "شغّل X" phrasing
     # fell through to the LLM.

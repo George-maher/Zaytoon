@@ -395,7 +395,8 @@ mystery bug while the user edits the checkout.
 /events           GET  recent — the core bus's ring buffer, bounded (≤100)
                   and redacted on the way out (diagnostics, §33)
 /git              GET  status | diff | log | branches | remotes
-                  POST add | commit | checkout | push
+                  POST add | commit | checkout | push | merge | restore
+                  (commit/checkout/push/merge/restore-discard are two-step)
 /models/tiers     GET  POST  per-tier model pins (fast/coding/reasoning/default)
 /settings         existing workspace + ai (POST /settings/ai/pull is explicit
                   and single-flight; /settings/ai/probe records capabilities)
@@ -404,9 +405,16 @@ mystery bug while the user edits the checkout.
 `/git/*` has **no permission gate**, like `/files/*`, and for the same reason:
 these are the user's own editor and source-control panel, not the model. The gate
 exists to stop the model acting without a human; here the human is the caller.
-Containment is unaffected — `resolve_workspace` runs unconditionally, because
-"the browser tab asked nicely" is not authorisation and the browser's origin is
-not authenticated at all.
+What REST *does* need — and has — is the two-step approval-token flow on the
+non-reversible verbs (`POST /git/commit|checkout|push|merge`, `POST /git/restore`
+with `staged: false`, and `POST /terminal`): a browser POST carries no proof of
+a human having seen what it asks for, so the first call is an effect-free
+preview bound to a single-use token and the second call replays exactly the
+recorded operation (see A6 in the backend's AGENTS.md). The reversible ones
+(`add`, `fetch`, unstaging, `pull` with its own `ff-only` intent) stay one-step.
+Containment is unaffected — `resolve_workspace` runs unconditionally at preview
+time too, because "the browser tab asked nicely" is not authorisation and the
+browser's origin is not authenticated at all.
 
 Realtime stays on the WebSocket. New frames: `task_created`, `task_updated`,
 `task_step`, `task_log`, `terminal_output`, `file_changed`, `skill_changed`.

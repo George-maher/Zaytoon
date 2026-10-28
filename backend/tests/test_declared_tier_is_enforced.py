@@ -28,6 +28,16 @@ not by an attacker's cleverness.
 The fix is that the manager no longer guesses: `request_with_assessment` takes
 the already-reconciled assessment. `request` is unchanged, because the channel
 is duck-typed and widening its signature broke nineteen existing doubles.
+
+The same bug had a **second seat, one layer up**, and the tests below pin it:
+on the agent path the engine correctly asks the *registry* whether a call
+reaches the gate (`AgentEngine._needs_approval`), then consulted its approval
+callback — but `ToolAgent._make_approval` answered that callback via
+`ConfirmationManager.request`, the very re-derivation fixed above. The engine
+was told "prompt required", asked the callback, and the callback silently said
+yes. `ToolAgent` now passes the registry's reconciled assessment through
+`_ask_with_reconciled_tier`, and the engine refuses — rather than executes — a
+gated call when no approval callback exists at all.
 """
 
 from __future__ import annotations
@@ -36,6 +46,9 @@ import asyncio
 
 import pytest
 
+from agents.engine import AgentEngine, ToolCall
+from agents.events import NullBus
+from agents.tool_agent import ToolAgent
 from tools.base import BaseTool, ToolResult
 from tools.registry import ToolRegistry
 from tools.safety import ConfirmationManager, RiskAssessor
@@ -45,6 +58,11 @@ class _Channel(BaseTool):
     """A tool shaped like one a skill would register: no table entry."""
 
     permission = "confirm"
+
+    def __init__(self):
+        #: Set by `execute`, so a test can assert the tool *did not run*
+        #: rather than inferring it from the outcome's shape.
+        self.ran = False
 
     def name(self) -> str:
         return "skill_style_tool"
@@ -56,6 +74,7 @@ class _Channel(BaseTool):
         return {"type": "object", "properties": {}, "additionalProperties": False}
 
     async def execute(self, **_kwargs) -> ToolResult:
+        self.ran = True
         return ToolResult.ok("ran", {})
 
 
@@ -196,3 +215,151 @@ class TestTheFloorStillApplies:
         channel = _Recorder()
         await registry.execute("skill_style_tool", {}, confirmation_manager=channel)
         assert channel.prompt_text() == "skill_style_tool"
+
+
+@pytest.fixture
+def registry_and_probe():
+    """A registry holding a declared-confirm tool that records its execution."""
+    reg = ToolRegistry()
+    tool = _Channel()
+    reg.register(tool)
+    return reg, tool
+
+
+def _auto_manager(Decision: bool):
+    """A real ConfirmationManager whose notifier answers immediately."""
+    manager = ConfirmationManager(notify=None, timeout=5.0)
+
+    async def notify(pending):
+        asyncio.get_running_loop().call_soon(
+            manager.resolve, pending.request_id, Decision
+        )
+
+    manager.set_notifier(notify)
+    return manager
+
+
+class TestTheAgentPathAsksToo:
+    """The engine seam — where production traffic actually goes.
+
+    The engine already asked the registry (`_needs_approval`), so it knew the
+    call reached the gate; the hole was the *callback's* answer, which came
+    from the name-keyed re-derivation and returned True without a prompt.
+    These tests drive `AgentEngine._invoke` with the real
+    `ToolAgent._make_approval` callback and a real `ConfirmationManager`.
+    """
+
+    @staticmethod
+    def _pair(registry):
+        agent = ToolAgent(risk_assessor=registry.assessor, registry=registry)
+        engine = AgentEngine(llm=None, registry=registry)
+        return engine, agent
+
+    async def test_a_declared_confirm_tool_prompts_on_the_agent_path(
+        self, registry_and_probe
+    ):
+        registry, tool = registry_and_probe
+        engine, agent = self._pair(registry)
+        manager = _auto_manager(True)
+        shown: list = []
+
+        original = manager._notify
+
+        async def notify(pending):
+            shown.append(pending.action)
+            await original(pending)
+
+        manager._notify = notify
+
+        outcome = await engine._invoke(
+            ToolCall(name="skill_style_tool", params={}),
+            agent._make_approval(manager, "sess_a1", "en"),
+            NullBus(),
+            "en",
+        )
+
+        assert shown == ["skill_style_tool"], (
+            "the agent path answered the approval callback without prompting"
+        )
+        assert isinstance(outcome, dict) and outcome.get("success") is True, outcome
+        assert tool.ran is True
+
+    async def test_a_decline_on_the_agent_path_stops_the_tool(
+        self, registry_and_probe
+    ):
+        registry, tool = registry_and_probe
+        engine, agent = self._pair(registry)
+        manager = _auto_manager(False)
+
+        outcome = await engine._invoke(
+            ToolCall(name="skill_style_tool", params={}),
+            agent._make_approval(manager, "sess_a1", "en"),
+            NullBus(),
+            "en",
+        )
+
+        assert isinstance(outcome, str), outcome
+        assert "denied" in outcome.lower() or "اتلغت" in outcome, outcome
+        assert tool.ran is False, "a declined tool ran anyway"
+
+    async def test_no_approval_callback_refuses_instead_of_running(
+        self, registry_and_probe
+    ):
+        """`run(approval=None)`'s default used to execute gated calls bare.
+
+        The engine now hands the registry `approval=None`, so the registry
+        refuses for want of a channel — the same answer a caller with no
+        manager gets.
+        """
+        registry, tool = registry_and_probe
+        engine, _agent = self._pair(registry)
+
+        outcome = await engine._invoke(
+            ToolCall(name="skill_style_tool", params={}),
+            approval=None,
+            bus=NullBus(),
+            language="en",
+        )
+
+        assert isinstance(outcome, dict)
+        assert outcome.get("success") is False
+        assert outcome.get("requires_confirmation") is True, outcome
+        assert tool.ran is False, "a gated tool ran with no approval channel"
+
+    async def test_a_safe_tool_still_needs_no_prompt_on_the_agent_path(
+        self, registry_and_probe
+    ):
+        """The prompt is for gated calls only — `get_time` must not ask."""
+        registry, _tool = registry_and_probe
+        from tools.system import GetTime
+
+        registry.register(GetTime())
+        engine, agent = self._pair(registry)
+        manager = _auto_manager(False)  # would refuse anything it is asked
+
+        outcome = await engine._invoke(
+            ToolCall(name="get_time", params={}),
+            agent._make_approval(manager, "sess_a1", "en"),
+            NullBus(),
+            "en",
+        )
+
+        assert isinstance(outcome, dict) and outcome.get("success") is True, outcome
+
+    async def test_a_duck_typed_channel_still_works_on_the_agent_path(
+        self, registry_and_probe
+    ):
+        """Doubles implement only `request`; the closure must fall back."""
+        registry, _tool = registry_and_probe
+        engine, agent = self._pair(registry)
+        channel = _Recorder(approve=True)
+
+        outcome = await engine._invoke(
+            ToolCall(name="skill_style_tool", params={}),
+            agent._make_approval(channel, "sess_a1", "en"),
+            NullBus(),
+            "en",
+        )
+
+        assert channel.prompt_text() == "skill_style_tool"
+        assert isinstance(outcome, dict) and outcome.get("success") is True, outcome

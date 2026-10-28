@@ -1212,3 +1212,78 @@ class TestAuditRoutes:
         body = client.request("DELETE", "/audit").json()
         assert "cleared" in body
         assert isinstance(body["cleared"], int)
+
+
+# ---------------------------------------------------------------------------
+# Request resource limits (A4)
+# ---------------------------------------------------------------------------
+class TestRequestResourceLimits:
+    """The three routes that hand work to a heavy model or a JSON blob.
+
+    `/stt` read the whole upload into memory and then transcribed it *on the
+    event loop*; `/tts` accepted an unbounded string with no deadline; and
+    `/preferences` accepted arbitrarily many, arbitrarily large entries. Each
+    bound is asserted through the route, because the bound is what a client
+    actually experiences.
+    """
+
+    def test_an_oversized_stt_upload_is_refused(self, client, monkeypatch):
+        monkeypatch.setattr(main_module, "MAX_STT_UPLOAD_BYTES", 64)
+        response = client.post(
+            "/stt",
+            files={"file": ("clip.webm", b"x" * 256, "audio/webm")},
+        )
+        assert response.status_code == 413
+
+    def test_an_over_long_tts_request_is_refused(self, client, monkeypatch):
+        monkeypatch.setattr(main_module, "MAX_TTS_CHARS", 20)
+        response = client.post("/tts", json={"text": "a" * 100})
+        assert response.status_code == 413
+
+    def test_too_many_preference_keys_are_refused(self, client, monkeypatch):
+        monkeypatch.setattr(main_module, "MAX_PREFERENCE_KEYS", 2)
+        response = client.post("/preferences", json={"a": 1, "b": 2, "c": 3})
+        assert response.status_code == 413
+
+    def test_an_over_large_preference_value_is_refused(self, client, monkeypatch):
+        monkeypatch.setattr(main_module, "MAX_PREFERENCE_VALUE_BYTES", 32)
+        response = client.post("/preferences", json={"k": "x" * 100})
+        assert response.status_code == 413
+
+    def test_the_transcription_path_still_works(self, client, monkeypatch):
+        """A bound must not become a break: the happy path must still answer.
+
+        Transcription now runs in an executor under `wait_for`, which is exactly
+        the kind of change that works for the over-limit case and fails for the
+        normal one, so the normal one is asserted.
+        """
+
+        class _Stt:
+            def transcribe(self, raw, language=None):
+                self.seen = (raw, language)
+                return "hello there"
+
+        stub = _Stt()
+        monkeypatch.setattr(main_module, "stt", stub)
+        response = client.post(
+            "/stt", files={"file": ("clip.webm", b"RIFFfake", "audio/webm")}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["text"] == "hello there"
+        assert stub.seen == (b"RIFFfake", None)
+
+    def test_the_synthesis_path_still_works(self, client, monkeypatch):
+        class _Tts:
+            async def synthesize(self, text, voice=None, rate=None, volume=None):
+                self.seen = (text, voice)
+                return b"ID3audio"
+
+        stub = _Tts()
+        monkeypatch.setattr(main_module, "tts", stub)
+        response = client.post("/tts", json={"text": "hello", "lang": "en"})
+
+        assert response.status_code == 200
+        assert response.content == b"ID3audio"
+        assert stub.seen[0] == "hello"
+

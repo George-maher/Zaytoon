@@ -208,15 +208,18 @@ class TestDuplicateSideEffects:
         assert tool.calls == 1
 
     async def test_different_arguments_are_not_a_duplicate(self):
+        # Both apps are on the launch allow-list: an off-list name is now a
+        # confirmation case (`RiskAssessor`), which would refuse the call for a
+        # reason that has nothing to do with the duplicate guard under test.
         two = "\n".join(
             json.dumps({"action": "open_app", "params": {"app": app}})
-            for app in ("spotify", "code")
+            for app in ("spotify", "chrome")
         )
         tool = _Counter("open_app")
         eng, _ = _build([two], tool)
-        await eng.run("open spotify and code")
+        await eng.run("open spotify and chrome")
         assert tool.calls == 2
-        assert [p["app"] for p in tool.seen] == ["spotify", "code"]
+        assert [p["app"] for p in tool.seen] == ["spotify", "chrome"]
 
     async def test_read_only_tools_may_be_polled(self):
         """`process_logs` twice is a legitimate loop, not a repeat side effect."""
@@ -279,10 +282,12 @@ class TestClaimVerification:
         assert not any("success claim" in e for e in result.errors)
 
     async def test_a_clean_turn_gets_no_caveat(self):
-        call = json.dumps({"action": "open_app", "params": {"app": "x"}})
+        # An allow-listed app, so the call is not a confirmation case: the test
+        # is about the *claim* check, not about app policy.
+        call = json.dumps({"action": "open_app", "params": {"app": "spotify"}})
         tool = _Counter("open_app")
         eng, _ = _build([call, "Done — opened."], tool)
-        result = await eng.run("open x")
+        result = await eng.run("open spotify")
         assert "did not complete" not in result.text
         assert tool.calls == 1
 

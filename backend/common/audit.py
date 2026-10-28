@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS execution_audit (
 )
 """
 
+#: Read-path indexes. `id` is already the rowid, but the audit page's useful
+#: questions are "what ran in this window" and "everything this tool did", and
+#: both are a full scan without these. Created once per *database file* (they are
+#: `IF NOT EXISTS`, so a second process racing here is harmless) rather than on
+#: every write — `_connect()` runs on every tool invocation — and keyed by path
+#: so a relocated/other database still gets them.
+_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_execution_audit_ts ON execution_audit(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_audit_tool ON execution_audit(tool);
+"""
+
+_indexed_paths: set = set()
+
 
 def _db_path() -> str:
     """The audit database file — **deliberately not** the memory database.
@@ -132,6 +145,10 @@ async def _connect() -> aiosqlite.Connection:
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     await conn.execute(_SCHEMA)
+    path = _db_path()
+    if path not in _indexed_paths:
+        await conn.executescript(_INDEXES)
+        _indexed_paths.add(path)
     await conn.commit()
     return conn
 

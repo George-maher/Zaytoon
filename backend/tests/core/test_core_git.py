@@ -60,6 +60,20 @@ def run(args, cwd, **env):
     )
 
 
+def confirmed(client, route, payload, **overrides):
+    """The two-step dance the panel performs: preview, then replay the token.
+
+    `overrides` lets a test lie in the confirming body — the way to prove the
+    token, not the second request's body, decides what runs.
+    """
+    session = client.post(route, json=payload)
+    assert session.status_code == 200, (route, session.text)
+    frame = session.json()
+    assert frame["requires_confirmation"] is True, (route, frame)
+    returning = {**payload, "confirm": frame["confirm"], **overrides}
+    return frame, client.post(route, json=returning)
+
+
 @pytest.fixture
 def repo(temp_workspace):
     """A real repository with one commit and a known file.
@@ -493,9 +507,10 @@ class TestTheRestRoutes:
         assert client.post(
             "/git/add", json={"path": str(repo), "files": ["http.txt"]}
         ).status_code == 200
-        response = client.post(
-            "/git/commit", json={"path": str(repo), "message": "over http"}
-        )
+        response = confirmed(
+            client, "/git/commit",
+            {"path": str(repo), "message": "over http"},
+        )[1]
         assert response.status_code == 200
         # The commit response carries the refreshed status, so the panel does not
         # need a second round trip to see its own change.
@@ -522,6 +537,139 @@ class TestTheRestRoutes:
         # 409, not 422: the value passed the transport's shape check and git is
         # what objected. Either way it is not 200 and not 500.
         assert response.status_code in (409, 422)
+
+
+class TestTheApprovalStep:
+    """The consequential verbs ask twice, and the token decides what runs.
+
+    The property under test: a single POST — the shape an unauthenticated page
+    could produce — can preview a consequence but never carry one out, and the
+    confirming call is bound to the operation that was previewed, not to
+    whatever its own body says.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from api.main import app
+
+        return TestClient(app)
+
+    def test_a_commit_needs_two_calls_and_the_first_is_an_effect_free_preview(
+        self, client, repo
+    ):
+        before = run(["git", "rev-list", "--count", "HEAD"], repo).stdout.decode()
+        session = client.post(
+            "/git/commit", json={"path": str(repo), "message": "previews only"}
+        )
+        assert session.status_code == 200
+        frame = session.json()
+        assert frame["requires_confirmation"] is True
+        assert frame["action"] == "commit"
+        assert frame["confirm"].startswith("git")
+        assert frame["tier"] == "confirm"
+        assert "previews only" in frame["summary"]
+        # The preview happened without a commit existing for it to describe.
+        after = run(["git", "rev-list", "--count", "HEAD"], repo).stdout.decode()
+        assert after == before
+
+    def test_the_confirming_body_cannot_change_what_was_approved(self, client, repo):
+        (repo / "bound.txt").write_text("x", encoding="utf-8")
+        client.post("/git/add", json={"path": str(repo), "files": ["bound.txt"]})
+        _, response = confirmed(
+            client, "/git/commit",
+            {"path": str(repo), "message": "the reviewed message"},
+            message="SMUGGLED - the reviewed message",
+        )
+        assert response.status_code == 200
+        log = client.get("/git/log", params={"path": str(repo)}).json()
+        assert log["commits"][0]["subject"] == "the reviewed message"
+
+    def test_a_token_is_single_use(self, client, repo):
+        session = client.post(
+            "/git/commit", json={"path": str(repo), "message": "once only"}
+        )
+        token = session.json()["confirm"]
+        replay = client.post(
+            "/git/commit", json={"path": str(repo), "message": "once only", "confirm": token}
+        )
+        assert replay.status_code == 409  # nothing staged in a clean tree: git's own refusal carries it
+        spent = client.post(
+            "/git/commit", json={"path": str(repo), "message": "once only", "confirm": token}
+        )
+        assert spent.status_code == 409
+
+    def test_a_token_from_another_verb_is_refused(self, client, repo):
+        session = client.post(
+            "/git/checkout", json={"path": str(repo), "ref": "feature-x", "create": True}
+        )
+        token = session.json()["confirm"]
+        response = client.post(
+            "/git/commit", json={"path": str(repo), "message": "crossed", "confirm": token}
+        )
+        assert response.status_code == 409
+        # And the minted-but-unspent checkout token still works for its own verb.
+        assert confirmed(
+            client, "/git/checkout",
+            {"path": str(repo), "ref": "feature-y", "create": True},
+        )[1].status_code == 200
+
+    def test_garbage_and_empty_tokens_are_409(self, client, repo):
+        response = client.post(
+            "/git/commit", json={"path": str(repo), "message": "x", "confirm": "git-nope"}
+        )
+        assert response.status_code == 409
+
+    def test_tier_reads_the_live_registry_where_one_exists(self, client, repo):
+        session = client.post(
+            "/git/push", json={"path": str(repo), "remote": "origin", "branch": "main"}
+        )
+        assert session.json()["tier"] == "confirm"
+
+    def test_discard_is_gated_but_unstaging_is_not(self, client, repo):
+        # Unstaging a staged new file is reversible: single-step.
+        (repo / "fresh.txt").write_text("new\n", encoding="utf-8")
+        assert client.post(
+            "/git/add", json={"path": str(repo), "files": ["fresh.txt"]}
+        ).status_code == 200
+        unstage = client.post(
+            "/git/restore",
+            json={"path": str(repo), "files": ["fresh.txt"], "staged": True},
+        )
+        assert unstage.status_code == 200
+        assert "requires_confirmation" not in unstage.json()
+
+        # Modifying a committed file and then discarding the change is not:
+        # the preview must come first, and the token confirm must carry it out.
+        (repo / "readme.md").write_text("changed\n", encoding="utf-8")
+        frame, discard = confirmed(
+            client, "/git/restore",
+            {"path": str(repo), "files": ["readme.md"], "staged": False},
+        )
+        assert frame["action"] == "restore"
+        assert "readme.md" in frame["summary"]
+        assert discard.status_code == 200
+        assert (repo / "readme.md").read_text(encoding="utf-8") == "hello\n"
+
+    def test_a_push_preview_failures_on_confirm_still_speak_git(self, client, repo):
+        _, response = confirmed(
+            client, "/git/push",
+            {"path": str(repo), "remote": "origin", "branch": "main"},
+        )
+        # No remote in this fixture: git refuses at step 2, with its own words.
+        assert response.status_code == 409
+
+    def test_an_outside_path_never_lives_long_enough_to_be_a_preview(
+        self, client, tmp_path
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        response = client.post(
+            "/git/commit", json={"path": str(outside), "message": "x"}
+        )
+        assert response.status_code == 403
+        assert "requires_confirmation" not in response.json()
 
 
 class TestNetworkVerbs:
@@ -710,8 +858,8 @@ class TestNetworkRestRoutes:
         run(["git", "commit", "-q", "-m", "feature work"], repo)
         run(["git", "checkout", "-q", trunk], repo)
 
-        response = client.post(
-            "/git/merge", json={"path": str(repo), "branch": "feature"}
+        _, response = confirmed(
+            client, "/git/merge", {"path": str(repo), "branch": "feature"}
         )
         assert response.status_code == 200
         assert (repo / "feature.txt").exists()

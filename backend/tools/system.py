@@ -374,13 +374,21 @@ async def _read_volume(backend: str) -> ToolResult:
             {"backend": backend, "level": level, "muted": muted},
         )
     try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        # Off the event loop: this is a *blocking* process spawn with a 10 s
+        # timeout, and it runs inside an async tool. On the loop it froze every
+        # other request for as long as PowerShell took, which is the same class
+        # of defect as any other synchronous call in an `async def`.
+        proc = await asyncio.to_thread(
+            subprocess.run,  # noqa: S603 - fixed argv, no shell
             [
                 "powershell", "-NoProfile", "-NonInteractive", "-Command",
                 "(Get-CimInstance Win32_SoundDevice | Select-Object -First 1 "
                 "Name).Name",
             ],
-            capture_output=True, text=True, timeout=10, shell=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            shell=False,
         )
         device = (proc.stdout or "").strip() or "unknown"
     except (subprocess.SubprocessError, OSError):

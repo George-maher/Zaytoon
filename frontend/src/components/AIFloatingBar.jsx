@@ -30,6 +30,7 @@ function AIFloatingBar({
   onVoiceStart,
   onVoiceStop,
   voiceMode,
+  voiceState = "disabled",
   onStop,
   busy = false,
 }) {
@@ -55,6 +56,7 @@ function AIFloatingBar({
         onVoiceStart={onVoiceStart}
         onVoiceStop={onVoiceStop}
         voiceMode={voiceMode}
+        voiceState={voiceState}
         onStop={onStop}
         busy={busy}
       />

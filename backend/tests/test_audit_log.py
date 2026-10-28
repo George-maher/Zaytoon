@@ -145,6 +145,30 @@ class TestReadAndClear:
     async def test_clearing_an_empty_table_is_zero_not_an_error(self):
         assert await audit.clear() == 0
 
+    async def test_the_read_path_is_indexed(self, isolated_db):
+        """`ts` and `tool` are what the audit page filters on, not `id`.
+
+        A missing index here is invisible until the table is large — the page
+        still works, it just scans — so the index is asserted rather than
+        assumed to have been created.
+        """
+        import sqlite3
+
+        # Force a connection so the schema + indexes exist.
+        await audit.record(tool="probe")
+        conn = sqlite3.connect(str(isolated_db))
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+        finally:
+            conn.close()
+        assert "idx_execution_audit_ts" in names
+        assert "idx_execution_audit_tool" in names
+
 
 # ---------------------------------------------------------------------------
 # The failure path: this is the actual point of the module

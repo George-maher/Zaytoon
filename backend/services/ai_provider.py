@@ -160,8 +160,15 @@ class OllamaProvider(AIProvider):
     async def _get_model_capabilities(self, model: str) -> List[str]:
         if model in self._capabilities_cache:
             return self._capabilities_cache[model]
-        
-        caps = await self._client.probe_capabilities(model)
+
+        # A probe is two real generations, so it takes a process-wide model
+        # slot like any other: it must not run alongside a live turn on the
+        # same GPU. A full queue surfaces as an honest failure, not a silent
+        # "no capabilities".
+        from services.llm_client import model_slot
+
+        async with model_slot():
+            caps = await self._client.probe_capabilities(model)
         result = []
         if caps.supports_streaming:
             result.append("streaming")

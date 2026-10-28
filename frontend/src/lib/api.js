@@ -389,33 +389,37 @@ export async function gitAdd(files, { all = false, path = "." } = {}) {
   return data;
 }
 
-export async function gitCommit(message, { path = "." } = {}) {
+export async function gitCommit(message, { confirm = null, path = "." } = {}) {
   const res = await fetch(`${API_BASE}/git/commit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, path }),
+    // `confirm` is the server's preview token: the second call of the two-step
+    // approval every consequential verb here performs. Null on the first call,
+    // which answers with `{requires_confirmation, confirm, summary}` instead of
+    // an effect — see GitPanel's confirmation row.
+    body: JSON.stringify({ message, path, confirm: confirm || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
   return data;
 }
 
-export async function gitCheckout(ref, { create = false, path = "." } = {}) {
+export async function gitCheckout(ref, { create = false, confirm = null, path = "." } = {}) {
   const res = await fetch(`${API_BASE}/git/checkout`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ref, create, path }),
+    body: JSON.stringify({ ref, create, path, confirm: confirm || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
   return data;
 }
 
-export async function gitPush({ remote = "origin", branch = "", path = "." } = {}) {
+export async function gitPush({ remote = "origin", branch = "", confirm = null, path = "." } = {}) {
   const res = await fetch(`${API_BASE}/git/push`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ remote, branch, path }),
+    body: JSON.stringify({ remote, branch, path, confirm: confirm || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
@@ -447,11 +451,11 @@ export async function gitPull({ remote = "", branch = "", ffOnly = true, path = 
   return data;
 }
 
-export async function gitMerge(branch, { message = "", path = "." } = {}) {
+export async function gitMerge(branch, { message = "", confirm = null, path = "." } = {}) {
   const res = await fetch(`${API_BASE}/git/merge`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ branch, message, path }),
+    body: JSON.stringify({ branch, message, path, confirm: confirm || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
@@ -459,12 +463,13 @@ export async function gitMerge(branch, { message = "", path = "." } = {}) {
 }
 
 // `staged: true` unstages (reversible). `staged: false` discards working-tree
-// changes (not reversible) — the caller must have confirmed with the user.
-export async function gitRestore(files, { staged = false, path = "." } = {}) {
+// changes (not reversible) — the server gates only the discard behind the
+// two-step approval, so a plain unstage call needs no `confirm`.
+export async function gitRestore(files, { staged = false, confirm = null, path = "." } = {}) {
   const res = await fetch(`${API_BASE}/git/restore`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ files, staged, path }),
+    body: JSON.stringify({ files, staged, path, confirm: confirm || undefined }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) return { error: data.detail || data.error || `HTTP ${res.status}` };
@@ -482,14 +487,21 @@ export async function getTerminals() {
 }
 
 /**
- * Open a session. A 403 means the sandbox refused the command — chaining,
- * metacharacters — which is a policy decision rather than a typo, so the UI
- * says so rather than inviting a retry.
+ * Open a session — in two steps without `confirm`: the first call answers
+ * with `{requires_confirmation, confirm, summary}` (nothing has run) and the
+ * caller must show that preview and re-call with the token. A 403 means the
+ * sandbox refused the command — chaining, metacharacters — which is a policy
+ * decision rather than a typo, so the UI says so rather than inviting a
+ * retry.
  */
-export async function openTerminal(command, { cwd = "", name = "", env = null, timeout = null } = {}) {
+export async function openTerminal(
+  command,
+  { cwd = "", name = "", env = null, timeout = null, confirm = null } = {},
+) {
   const payload = { command, cwd, name };
   if (env && Object.keys(env).length) payload.env = env;
   if (timeout != null) payload.timeout = timeout;
+  if (confirm) payload.confirm = confirm;
   const res = await fetch(`${API_BASE}/terminal`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

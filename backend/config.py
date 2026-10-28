@@ -263,13 +263,6 @@ class Config:
     #: transport retries, this is the total across every model.
     OPENROUTER_MAX_ATTEMPTS: int = _env_int("OPENROUTER_MAX_ATTEMPTS", 3)
 
-    #: Minimum seconds to wait on a 429 that advertises no ``Retry-After``.
-    #: Deliberately short: with a contended free tier the goal is to *move to a
-    #: different free model*, not to sit on one and retry it.
-    OPENROUTER_RATE_LIMIT_BACKOFF: float = _env_float(
-        "OPENROUTER_RATE_LIMIT_BACKOFF", 0.75
-    )
-
     # OpenRouter attribution headers (required for their dashboard/ranking).
     OPENROUTER_SITE_URL: str = _env_str(
         "OPENROUTER_SITE_URL", "https://github.com/zaytoon-ai"
@@ -719,10 +712,6 @@ class Config:
     RATE_LIMIT_MAX: int = _env_int("RATE_LIMIT_MAX", 120)
     RATE_LIMIT_WINDOW: int = _env_int("RATE_LIMIT_WINDOW", 60)
 
-    # WebSocket rate limit (per session) - more generous for interactive use
-    WS_RATE_LIMIT_MAX: int = _env_int("WS_RATE_LIMIT_MAX", 60)
-    WS_RATE_LIMIT_WINDOW: int = _env_int("WS_RATE_LIMIT_WINDOW", 60)
-
     # -- WebSocket handshake policy (see api/ws_security.py) --------------
     #: Extra `Origin` values a browser client may connect from, comma
     #: separated, each a regex matched against the full origin. The loopback
@@ -746,10 +735,13 @@ class Config:
     PAIRING_SECRET: str = _env_str("ZAYTOON_PAIRING_SECRET", "")
 
     MAX_MESSAGE_LENGTH: int = 8000
-    MAX_CONTEXT_MESSAGES: int = 50
-    REMINDER_CHECK_INTERVAL: int = 15
+    #: Hard ceiling on the history list handed to an agent (see
+    #: `AgentService.dispatch`). Env-configurable because it is a real bound.
+    MAX_CONTEXT_MESSAGES: int = _env_int("MAX_CONTEXT_MESSAGES", 50)
+    #: How often `SchedulerManager` looks for due reminders. Env-configurable
+    #: because `SchedulerManager` reads it — a knob nothing reads is a lie.
+    REMINDER_CHECK_INTERVAL: int = _env_int("REMINDER_CHECK_INTERVAL", 15)
 
-    ASSISTANT_NAME: str = os.getenv("ASSISTANT_NAME", "Zaytoon")
     WAKE_SESSION_TIMEOUT: float = _env_float("WAKE_SESSION_TIMEOUT", 10.0)
     # Master switch for the wake-word gate. With the gate ON, an utterance that
     # does not start with "Zaytoon" is discarded with only a "listening" status,
@@ -760,6 +752,14 @@ class Config:
     # When an utterance is dropped by the gate, tell the client it was dropped
     # instead of silently replying "listening".
     WAKE_WORD_HINT: bool = _env_bool("WAKE_WORD_HINT", True)
+    # The legacy `isManualVoice` flag lets a client declare one utterance
+    # explicitly requested. It was sent unconditionally by the browser's
+    # continuous VAD, which made every background sentence actionable. It is
+    # therefore *not* trusted by default: a client must opt into the old
+    # push-to-talk bypass explicitly, and continuous voice mode never uses it.
+    WAKE_WORD_ALLOW_MANUAL_BYPASS: bool = _env_bool(
+        "WAKE_WORD_ALLOW_MANUAL_BYPASS", False
+    )
 
 
 config = Config()

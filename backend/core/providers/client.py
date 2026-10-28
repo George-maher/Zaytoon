@@ -323,7 +323,7 @@ class OpenAICompatibleClient:
 
                 # The stream closed normally — render what was accumulated.
                 rendered = [
-                    _render_call(slot["name"].strip(), slot["arguments"])
+                    render_tool_call(slot["name"].strip(), slot["arguments"])
                     for index in sorted(pending)
                     if (slot := pending[index])["name"].strip()
                 ]
@@ -471,7 +471,7 @@ def _json(response) -> Dict[str, Any]:
         ) from exc
 
 
-def _render_call(name: str, arguments: Any) -> str:
+def render_tool_call(name: str, arguments: Any) -> str:
     """One native tool call -> one line of the engine's JSON-in-text dialect.
 
     ``{"action": name, "params": args}`` is the documented dialect
@@ -482,6 +482,10 @@ def _render_call(name: str, arguments: Any) -> str:
     (Ollama's native shape gives a dict); anything unparseable becomes
     ``params._raw`` rather than being dropped, so the contract reports bad
     arguments instead of silently losing the call.
+
+    Public because there is exactly one rendering of a native call and the
+    OpenRouter chain's SSE reader (``services.llm_client``) needs the same
+    one: a second copy is how two dialects drift apart again.
     """
     if isinstance(arguments, str):
         try:
@@ -507,7 +511,7 @@ def _render_tool_calls(message: Dict[str, Any]) -> str:
         name = str(function.get("name") or "").strip()
         if not name:
             continue
-        lines.append(_render_call(name, function.get("arguments")))
+        lines.append(render_tool_call(name, function.get("arguments")))
     return "\n".join(lines)
 
 
@@ -644,4 +648,5 @@ __all__ = [
     "ProviderTransportError",
     "RETRYABLE_STATUS",
     "STREAM_IDLE_TIMEOUT",
+    "render_tool_call",
 ]

@@ -628,3 +628,99 @@ class TestToolExecutorRiskGate:
         ):
             result = await executor.execute(action, params)
             assert "requires_confirmation" not in result
+
+
+# ---------------------------------------------------------------------------
+# One application policy (A3)
+# ---------------------------------------------------------------------------
+class TestOneApplicationPolicy:
+    """Launching and closing are governed by one allow-list, in one place.
+
+    Two defects motivated this:
+
+    * `POST /command/open-app` kept its own copy of the allow-list while the
+      agent's `open_app` tool resolved any name through `shutil.which` and the
+      Start Menu — so the agent could launch what the route refused, and nothing
+      compared the two lists.
+    * `close_app` passed an arbitrary caller-supplied name into
+      ``taskkill /IM <name>.exe /F`` and ``pkill -f <name>``; ``-f`` matches the
+      whole command line, so one approved dialog could terminate any process
+      whose command line contained the text.
+    """
+
+    def test_the_rest_allow_list_is_the_tool_allow_list(self):
+        import api.main as main_module
+        from tools.sandbox import APP_LAUNCH_ALLOWLIST
+
+        assert sorted(main_module.APP_WHITELIST) == sorted(APP_LAUNCH_ALLOWLIST)
+
+    def test_an_allow_listed_app_is_not_a_confirmation_case(self):
+        from tools.safety import RiskAssessor
+
+        assessment = RiskAssessor().assess("open_app", {"app": "spotify"})
+        assert assessment.requires_confirmation is False
+
+    def test_an_off_list_app_launch_requires_confirmation(self):
+        from tools.safety import PERMISSION_CONFIRM, RiskAssessor
+
+        assessment = RiskAssessor().assess("open_app", {"app": "code"})
+        assert assessment.requires_confirmation is True
+        assert assessment.permission == PERMISSION_CONFIRM
+        assert any("allow-list" in reason for reason in assessment.reasons)
+
+    def test_an_explicit_path_is_not_resolved_from_path(self):
+        """A path names a real artifact; `OpenApp` requires it to exist."""
+        from tools.safety import RiskAssessor
+
+        assessment = RiskAssessor().assess(
+            "open_app", {"app": r"C:\Tools\myapp.exe"}
+        )
+        assert assessment.requires_confirmation is False
+
+    def test_the_registry_reconciles_the_escalation(self):
+        """The gate the engine consults must agree with the assessor."""
+        from tools.registry import build_default_registry
+
+        registry = build_default_registry()
+        assert registry.assess("open_app", {"app": "spotify"}).requires_confirmation is False
+        assert registry.assess("open_app", {"app": "code"}).requires_confirmation is True
+
+    def test_closing_an_unknown_process_is_refused_never_killed(self):
+        import asyncio
+
+        from tools.applications import CloseApp
+
+        result = asyncio.run(CloseApp().execute(app="lsass"))
+        assert result.success is False
+        assert "not one of Zaytoon's known applications" in (result.error or "")
+
+    def test_closing_uses_an_exact_name_never_a_command_line_pattern(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        from tools.applications import CloseApp
+
+        captured = {}
+
+        class _Done:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", b"")
+
+        async def fake_exec(*argv, **kwargs):
+            captured["argv"] = list(argv)
+            return _Done()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        result = asyncio.run(CloseApp().execute(app="notepad"))
+        assert result.success is True
+
+        argv = captured["argv"]
+        assert "-f" not in argv, "pkill -f matches any command line"
+        if os.name == "nt":
+            assert argv == ["taskkill", "/IM", "notepad.exe", "/F"]
+        else:
+            assert argv == ["pkill", "-x", "notepad"]
+

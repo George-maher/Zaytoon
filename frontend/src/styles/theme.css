@@ -18,41 +18,52 @@
      stylesheet cannot reach, because the browser draws it. */
   color-scheme: dark;
 
-  /* -- surfaces: purple-tinted near-black -------------------------------- */
-  --hud-void: #0a0510;
-  --hud-deep: #110a1a;
-  --hud-raised: #180f24;
-  --hud-line: #1a0e2a;
-  --hud-surface: #140c1e;
+  /* -- surfaces: near-black blue from the Figma reference ----------------
+     Measured page ground: radial-gradient(at 50% 20%, #071428, #020d1a,
+     #010812, #000508). These four are its stops and its hairline colour. */
+  --hud-void: #010812;
+  --hud-deep: #020d1a;
+  --hud-raised: #071428;
+  --hud-line: #0b1d30;
+  --hud-surface: #041020;
 
-  /* -- accents: magenta/purple glow from the HUD reference ---------------- */
-  --hud-cyan: #d946ef;
-  --hud-cyan-core: #c026d3;
-  --hud-blue: #8b2a9e;
-  --hud-indigo: #6b1f8e;
-  --hud-amber: #f2b84b;
-  --hud-green: #35d399;
-  --hud-red: #ff6b6b;
+  /* -- accents: cyan system / purple memory / amber warn / sky network ----
+     The reference's series colours, one hue per subsystem:
+     cyan = system/default, purple = memory, amber = gpu/warn,
+     sky = network, green = ok, pink = destructive. */
+  --hud-cyan: #00f5ff;
+  --hud-cyan-core: #00c2d9;
+  --hud-blue: #0ea5e9;
+  --hud-indigo: #a855f7;
+  --hud-amber: #f59e0b;
+  --hud-green: #22c55e;
+  --hud-red: #ec4899;
 
-  /* -- text ------------------------------------------------------------- */
-  --hud-text: #f3eef9;
-  --hud-text-dim: #b4a7c2;
-  --hud-text-mute: #7a6c8a;
+  /* -- text -------------------------------------------------------------
+     The reference's body text is rgba(220,235,255,.9) over the void; these
+     are that (and its .65/.45 dim rungs) composited to opaque hex, tinted
+     cool to match. Every value keeps its old luminance rung so nothing
+     drops below the contrast it had. */
+  --hud-text: #c6d4e7;
+  --hud-text-dim: #94a8c4;
+  --hud-text-mute: #6b809c;
   /* Alias used by ChatMessage for timestamps: fainter than dim, still a
      real token rather than a var() that resolves to nothing. */
-  --hud-text-faint: #7a6c8a;
+  --hud-text-faint: #6b809c;
 
   /* -- edges and glow ---------------------------------------------------
      All derived from the accent, so a future accent migration moves the
-     whole chrome with it instead of leaving a stale green ring behind. */
-  --hud-edge: rgba(217,70,239,0.15);
-  --hud-edge-strong: rgba(217,70,239,0.35);
-  --hud-edge-faint: rgba(217,70,239,0.07);
-  --hud-glow-soft: rgba(240,171,252,0.20);
-  --hud-glow-hard: rgba(240,171,252,0.45);
-  --hud-amber-glow: rgba(242, 184, 75, 0.26);
-  --hud-red-glow: rgba(255, 107, 107, 0.26);
-  --hud-green-glow: rgba(53, 211, 153, 0.24);
+     whole chrome with it instead of leaving a stale ring behind. The
+     transparency ladder is the reference's: hairlines at .07-.15, strong
+     edges at .35, glow shadows low and wide. */
+  --hud-edge: rgba(0,245,255,0.15);
+  --hud-edge-strong: rgba(0,245,255,0.35);
+  --hud-edge-faint: rgba(0,245,255,0.07);
+  --hud-glow-soft: rgba(170,250,255,0.20);
+  --hud-glow-hard: rgba(170,250,255,0.45);
+  --hud-amber-glow: rgba(245, 158, 11, 0.26);
+  --hud-red-glow: rgba(236, 72, 153, 0.26);
+  --hud-green-glow: rgba(34, 197, 94, 0.24);
 
   /* Legacy aliases. Several components still read --neon-* / --text-*; they
      are mapped here so the palette stays defined in exactly one place rather
@@ -82,36 +93,40 @@
      browser agree on one set of values. The two are deliberately close: the
      hud-* scale is instrument chrome (page ground, hairlines, glow), the
      shared tokens below are cards, dialogs and read-outs. */
-  --bg0: #0a0510;
-  --bg1: #110a1a;
-  --bg2: #180f24;
-  --border: rgba(217,70,239,0.15);
-  --border-strong: rgba(217,70,239,0.35);
-  --text: #f3eef9;
-  --text-mute: #7a6c8a;
-  --text-faint: #5c4f6b;
-  --accent: var(--hud-cyan);   /* #d946ef — the name is legacy, the colour is magenta */
-  --green: var(--hud-green);   /* #35d399 */
-  --amber: var(--hud-amber);   /* #f2b84b */
-  --red: var(--hud-red);       /* #ff6b6b */
+  --bg0: #010812;
+  --bg1: #020d1a;
+  --bg2: #071428;
+  --border: rgba(0,245,255,0.15);
+  --border-strong: rgba(0,245,255,0.35);
+  --text: #c6d4e7;
+  --text-mute: #6b809c;
+  --text-faint: #4d5f78;
+  --accent: var(--hud-cyan);   /* #00f5ff — the reference's system cyan */
+  --green: var(--hud-green);   /* #22c55e */
+  --amber: var(--hud-amber);   /* #f59e0b */
+  --red: var(--hud-red);       /* #ec4899 */
   /* The AI-active accent. In the reference the "hotter" tone is the near
      white-cyan rim on the circular ring, not a second hue — so the AI state
-     reads as *brighter*, which also survives greyscale. */
-  --violet: #e879f9;
-  --hud-violet: #e879f9;
+     reads as *brighter*, which also survives greyscale. Kept as the
+     reference's purple-500 where a second hue is needed (user bubbles). */
+  --violet: #a855f7;
+  --hud-violet: #a855f7;
 
-  /* -- surfaces for overlays (flat fills, never blur) --------------------- */
-  --surface-0: rgba(5, 7, 10, 0.72);   /* header strip over the void      */
-  --surface-1: rgba(8, 11, 17, 0.82);  /* popover / card fill             */
-  --surface-2: rgba(13, 18, 25, 0.97); /* dialog fill                     */
-  --scrim: rgba(2, 3, 6, 0.82);        /* modal backdrop                  */
+  /* -- surfaces for overlays (flat fills, never blur) ---------------------
+     Blue-tinted transparencies of the same void, per the reference's
+     rgba(0,8,20,.5)-style panel fills. */
+  --surface-0: rgba(2, 10, 22, 0.72);   /* header strip over the void      */
+  --surface-1: rgba(4, 14, 28, 0.82);   /* popover / card fill             */
+  --surface-2: rgba(6, 18, 34, 0.97);   /* dialog fill                     */
+  --scrim: rgba(1, 5, 10, 0.82);        /* modal backdrop                  */
 
-  /* -- radii (shared spec: panels 8, cards 6, controls 2 -----------------
-     `--radius-sm` above is the control radius. Panels stay square on
-     purpose -- see docs/DESIGN_SYSTEM.md §2 -- so `--radius-panel` is for
+  /* -- radii (shared spec: panels 16, cards 12, controls 2 ----------------
+     The reference rounds its tiles (14px), dock (16px) and chips (10px);
+     `--radius-sm` above stays the small control radius. Panels stay square
+     on purpose -- see docs/DESIGN_SYSTEM.md §2 -- so `--radius-panel` is for
      modal/dialog shells only, never for `.hud-panel`. */
-  --radius-panel: 8px;
-  --radius-card: 6px;
+  --radius-panel: 16px;
+  --radius-card: 12px;
 
   /* -- shared spacing scale (4/8/12/16/24/32) ----------------------------
      Distinct from the `--space-*` micro-density scale below, which is
@@ -152,12 +167,16 @@
   --state-color: var(--hud-cyan);
   --state-glow: var(--hud-glow-soft);
 
-  /* -- type ------------------------------------------------------------- */
+  /* -- type -------------------------------------------------------------
+     The reference's three faces: Orbitron for display/identity, Rajdhani
+     for UI body and buttons, Share Tech Mono for data, labels and micro
+     copy. JetBrains Mono stays behind Share Tech Mono for anything that
+     needs a coding font's larger glyph set and weights. */
   --font-display: "Orbitron", "Rajdhani", sans-serif;
   /* Body: the designed HUD face first, then the shared spec stack, so text
      still renders in Segoe UI/system-ui where the web font is unavailable. */
   --font-body: "Rajdhani", "Inter", "Segoe UI", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", ui-monospace, "Cascadia Code", Consolas, monospace;
+  --font-mono: "Share Tech Mono", "JetBrains Mono", "Fira Code", ui-monospace, "Cascadia Code", Consolas, monospace;
   /* The shared spec stacks verbatim, for surfaces that must use the system
      faces rather than the HUD web fonts (command blocks, code read-outs). */
   --font-ui: "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -182,8 +201,8 @@
   --zt-bg-elevated: var(--hud-raised);
   --zt-bg-sidebar: var(--hud-deep);
   --zt-bg-input: var(--input-bg);
-  --zt-bg-hover: #1f1430;
-  --zt-bg-active: #28193c;
+  --zt-bg-hover: #0a2238;
+  --zt-bg-active: #0f2e4a;
   --zt-text-primary: var(--hud-text);
   --zt-text-secondary: var(--hud-text-dim);
   --zt-text-muted: var(--hud-text-mute);
@@ -196,7 +215,7 @@
   --zt-accent-ring: var(--hud-glow-soft);
   --zt-ai-accent: var(--hud-violet);
   --zt-ai-soft-bg: color-mix(in srgb, var(--hud-violet) 8%, transparent);
-  --zt-ai-pulse: #e879f9;
+  --zt-ai-pulse: #a855f7;
   --zt-success: var(--hud-green);
   --zt-warning: var(--hud-amber);
   --zt-error: var(--hud-red);
@@ -245,8 +264,8 @@ body {
 }
 
 *::selection {
-  background: rgba(217,70,239,0.28);
-  color: #0a0510;
+  background: rgba(0,245,255,0.28);
+  color: #010812;
 }
 
 :focus-visible {
@@ -275,14 +294,11 @@ body {
    =========================================================================== */
 
 .hud-void {
-  background-color: #0a0510;
-  /* The reference's own structure: a near-black field with a faint radial
-     bloom around the centre chip. Kept at 4–6% so it is felt rather than
-     seen — at the image's own saturation this would be a purple wash, which
-     is exactly the "busy gradient" the brief rules out. */
+  background-color: #010812;
+  /* The reference's own page gradient, measured verbatim: a cool radial
+     bloom high on the centre falling to near-black at the edges. */
   background-image:
-    radial-gradient(90% 55% at 50% 45%, color-mix(in srgb, var(--hud-cyan) 8%, transparent), transparent 70%),
-    radial-gradient(120% 70% at 50% -10%, color-mix(in srgb, #8b2a9e 6%, transparent), transparent 60%);
+    radial-gradient(at 50% 20%, #071428 0%, #020d1a 40%, #010812 70%, #000508 100%);
 }
 
 /* Fine technical grid. 48px cells, both axes, barely there. */
@@ -426,8 +442,8 @@ body {
   background: linear-gradient(
     to bottom,
     transparent,
-    rgba(0, 255, 156, 0.028) 55%,
-    rgba(0, 255, 156, 0.05) 50%,
+    color-mix(in srgb, var(--hud-cyan) 2.8%, transparent) 45%,
+    color-mix(in srgb, var(--hud-cyan) 5%, transparent) 50%,
     transparent
   );
   animation: hud-sweep 9s linear infinite;
@@ -450,9 +466,13 @@ body {
   position: relative;
   background: color-mix(in srgb, var(--hud-deep) 72%, transparent);
   border: var(--border-w) solid var(--hud-edge);
+  /* The Figma reference rounds its panels and tiles (measured 14px on metric
+     tiles, 16px on the dock); `--radius-card` is this scale's 12px rung. The
+     angular-bracket look above was the *previous* reference's language. */
+  border-radius: var(--radius-card);
   /* A 1px inner highlight along the top edge reads as a lit instrument
      surface; the reference gets this from a hard edge, not from a blur. */
-  box-shadow: inset 0 1px 0 rgba(0, 255, 156, 0.05);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--hud-cyan) 5%, transparent);
 }
 
 .hud-panel--flush {
@@ -785,13 +805,13 @@ html[dir="rtl"] .hud-micro {
      The fill is deliberately *darker* than any panel it sits on. An input
      reads as a well — a hole in the surface you type into — and matching it to
      the panel behind it is what makes it disappear on a low-contrast row. */
-  --input-bg: #140c1e;                                /* opaque: a translucent fill over a light parent is how white-on-white happens */
-  --input-text: #f3eef9;                              /* 16.7:1 on --input-bg (AA is 4.5) */
+  --input-bg: #02090f;                                 /* opaque: a translucent fill over a light parent is how white-on-white happens */
+  --input-text: #c6d4e7;                               /* ~11:1 on --input-bg (AA is 4.5) */
   /* 5.0:1 — AA, and still a third of the field text's ratio so it reads as a
      hint. It was #5c4f6b with a comment claiming 8.0:1; the real ratio was
      2.53:1. `input.visibility.test.js` now computes it from the token instead
      of trusting the comment, which is how the discrepancy surfaced. */
-  --input-placeholder: #8b7c9c;
+  --input-placeholder: #7b8fa6;
   --input-border: color-mix(in srgb, var(--hud-cyan) 16%, transparent);
   --input-border-hover: color-mix(in srgb, var(--hud-cyan) 34%, transparent);
   --input-border-focus: color-mix(in srgb, var(--hud-cyan) 70%, transparent);

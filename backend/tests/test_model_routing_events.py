@@ -153,3 +153,21 @@ class TestModelEventsCarryTheTurn:
 
         traces = [e.data["trace_id"] for e in seen.of(CoreEventType.MODEL_COMPLETED)]
         assert traces == ["trace_a", "trace_b"]
+
+    async def test_time_to_first_token_rides_the_same_event(self, client):
+        """A streamed attempt reports how long the bubble sat empty.
+
+        Additive like the trace id: a client that predates the field ignores
+        it, and a blocking attempt reports 0 because the concept needs a
+        stream to have a first token at all.
+        """
+        with _Recorder() as seen:
+            client._emit_model_event(_record(ttft_ms=210))
+            client._emit_model_event(_record(request_id="req_blocking"))
+            await _settle()
+
+        ttfts = [
+            e.data["ttft_ms"] for e in seen.of(CoreEventType.MODEL_COMPLETED)
+        ]
+        assert ttfts == [210, 0]
+

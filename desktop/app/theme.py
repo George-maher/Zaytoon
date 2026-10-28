@@ -37,37 +37,37 @@ import os
 # pixels, lifted only enough that a panel reads as a surface rather than a
 # hole. These names are pinned token-for-token against
 # frontend/src/styles/theme.css by tests/test_design_parity.py.
-# The purple-tinted near-black scale `frontend/src/styles/theme.css` has served
-# since the HUD restyle. These four are pinned token-for-token by
-# `tests/test_design_parity.py`; the shell kept the pre-restyle blue-grey for
-# long enough that only a Windows leg (the one job that runs the desktop suite)
-# reported it.
-VOID = "#0A0510"
-DEEP = "#110A1A"
-RAISED = "#180F24"
-LINE = "#1A0E2A"
+# The near-black blue scale `frontend/src/styles/theme.css` serves since the
+# Figma-reference (NEXUS AI) retarget. These four are pinned token-for-token
+# by `tests/test_design_parity.py`; the shell kept the pre-restyle blue-grey
+# for long enough that only a Windows leg (the one job that runs the desktop
+# suite) reported it.
+VOID = "#010812"
+DEEP = "#020D1A"
+RAISED = "#071428"
+LINE = "#0B1D30"
 
 # --- accents ---------------------------------------------------------------
-# The accent is the reference's own cyan: 96% of its saturated pixels are in
-# the blue/cyan family and its brightest measured accent is #e879f9. The name
-# stays ``CYAN`` because test_design_parity pins it against the stylesheet;
-# renaming it would move the drift, not remove it.
-CYAN = "#D946EF"
-CYAN_CORE = "#C026D3"     # --hud-cyan-core: the fuchsia core, not a cyan
-BLUE = "#8B2A9E"
-INDIGO = "#6B1F8E"
-# Amber is the reference's only warm element (its two orange bars) and is kept
-# deliberately scarce so it still reads as an alert rather than as decoration.
-AMBER = "#F2B84B"
-GREEN = "#35D399"
-RED = "#FF6B6B"
+# The accent is the Figma reference's own system cyan (#00f5ff): cyan is
+# "system/default" there, purple is memory, amber is warn/GPU, sky is network.
+# The name stays ``CYAN`` because test_design_parity pins it against the
+# stylesheet; renaming it would move the drift, not remove it.
+CYAN = "#00F5FF"
+CYAN_CORE = "#00C2D9"     # --hud-cyan-core: a deeper cyan, not a second hue
+BLUE = "#0EA5E9"          # the reference's sky-500 (NETWORK series)
+INDIGO = "#A855F7"        # the reference's purple-500 (MEMORY series)
+# Amber is the reference's warm element and is kept deliberately scarce so it
+# still reads as an alert rather than as decoration.
+AMBER = "#F59E0B"
+GREEN = "#22C55E"
+RED = "#EC4899"           # the reference's destructive pink
 
 ACCENT = CYAN
-# The dim/glow pair used to be Tailwind cyan-700 / cyan-900 under a cyan accent.
-# The accent is magenta now, so they are the same two steps of fuchsia — the
-# relationship (a muted accent, and an accent darkened to a ring) is what the
-# widgets depend on, and it was left behind by the restyle.
-ACCENT_DIM = "#A21CAF"
+# The dim/glow pair used to be Tailwind cyan-700 / cyan-900 under a cyan
+# accent, then fuchsia steps under the magenta one. They are cyan steps again:
+# the relationship (a muted accent, and an accent darkened to a ring) is what
+# the widgets depend on.
+ACCENT_DIM = "#0A7D99"
 SUCCESS = GREEN
 WARNING = AMBER
 DANGER = RED
@@ -76,14 +76,14 @@ DANGER = RED
 BG = VOID
 BG_PANEL = DEEP
 BG_ELEVATED = RAISED
-BORDER = "#182230"
-TEXT = "#F3EEF9"
-# The purple-tinted text ramp that `frontend/src/styles/theme.css` has been
-# serving since the HUD moved to the magenta reference; the tokens above them
-# (CYAN, BLUE) followed that restyle and these two did not, which is what
+BORDER = "#0B1D30"
+TEXT = "#C6D4E7"
+# The cool-tinted text ramp that `frontend/src/styles/theme.css` serves since
+# the palette retarget to the Figma reference; the tokens above them (CYAN,
+# BLUE) followed that retarget and these two did not, which is what
 # `desktop/tests/test_design_parity.py` exists to catch.
-TEXT_MUTED = "#7A6C8A"
-TEXT_DIM = "#B4A7C2"
+TEXT_MUTED = "#6B809C"
+TEXT_DIM = "#94A8C4"
 
 #: Corner radius for instrument chrome. Square is the point: a rounded panel
 #: reads as a card, and the design language is an instrument bay, not a
@@ -100,10 +100,10 @@ RADIUS = 0
 RADIUS_SM = 2
 
 #: Hex colour plus the 1px edge tints used for frames, borders and focus.
-EDGE = "#182230"
-EDGE_STRONG = "#24344A"
+EDGE = "#0E2A35"
+EDGE_STRONG = "#144E63"
 EDGE_FAINT = LINE
-GLOW = "#701A75"
+GLOW = "#155E75"
 
 # --- density: the compact HUD ----------------------------------------------
 # Every spacing / font / thickness decision in the chat panel lives here, so
@@ -179,7 +179,7 @@ BG2 = RAISED                   # raised cards
 
 # --- edges ------------------------------------------------------------------
 HAIRLINE = LINE              # 1px separators, card borders
-BORDER_STRONG = "#24344a"      # focused / emphasized frames
+BORDER_STRONG = "#144e63"      # focused / emphasized frames
 
 # --- text -------------------------------------------------------------------
 TEXT_BASE = TEXT             # body copy
@@ -190,11 +190,9 @@ TEXT_FAINT = TEXT_MUTED        # timestamps, disabled — the CSS alias
 # --- accents ----------------------------------------------------------------
 #: The assistant hue. In the reference the "hotter" tone is the near
 #: white-cyan rim on its circular dial rather than a second hue, so the AI
-#: state reads as *brighter* — which also survives greyscale.
-# The "hotter tone" of the accent, i.e. fuchsia-400 under a magenta accent. It
-# was `#8bffff` when the accent was cyan; `tests/test_theme_tokens.py` still
-# asserted that, which is a pin that has outlived the palette it was written for.
-VIOLET = "#e879f9"
+#: state reads as *brighter* — which also survives greyscale. Where a second
+#: hue is needed (user bubbles, memory series) the reference uses purple-500.
+VIOLET = "#a855f7"
 
 #: Every accent the shell may colour something with, in one place.
 ACCENTS: dict[str, str] = {
@@ -249,9 +247,11 @@ def pill_colors(accent: str) -> tuple[str, str, str]:
 
 
 # --- radius scale -----------------------------------------------------------
-RADIUS_PANEL = 8               # window-level panels
-RADIUS_CARD = 6                # raised cards (confirmation, side cards)
-RADIUS_CONTROL = 2             # buttons, pills, inputs — sharp, not pill
+# The Figma reference rounds its tiles (14px), dock (16px) and chips (10px);
+# the scale is the same one theme.css now declares (--radius-panel / card).
+RADIUS_PANEL = 16               # window-level panels
+RADIUS_CARD = 12                # raised cards (confirmation, side cards)
+RADIUS_CONTROL = 2              # buttons, pills, inputs — sharp, not pill
 
 # --- spacing scale ----------------------------------------------------------
 SPACE_1, SPACE_2, SPACE_3 = 4, 8, 12

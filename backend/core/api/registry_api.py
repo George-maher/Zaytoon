@@ -8,7 +8,7 @@ import time
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query, Response
 
 from core.api.approvals import ApprovalTokens, run_approved_tool
 from core.permissions import (
@@ -64,6 +64,21 @@ skills_router = APIRouter()
 providers_router = APIRouter()
 terminal_router = APIRouter()
 system_router = APIRouter()
+
+#: Approval tokens for the terminal surface. Its own store: a token minted for
+#: `/terminal` cannot be spent on the git panel's verbs or the VM actions.
+_TERM_APPROVALS = ApprovalTokens(ttl=60.0, cap=64, prefix="term")
+
+#: token -> the exact operation recorded at preview time. Swept against the
+#: token store, so a pending command cannot outlive its token.
+_TERM_PENDING: Dict[str, Dict[str, Any]] = {}
+
+
+def _sweep_term_pending() -> None:
+    live = _TERM_APPROVALS.tokens
+    for token in list(_TERM_PENDING):
+        if token not in live:
+            _TERM_PENDING.pop(token, None)
 
 
 def _announce_skill_change(manifest: Dict[str, Any]) -> None:
@@ -444,12 +459,30 @@ async def provider_test_chat(
     )
     started = time.monotonic()
     try:
-        reply = await client.complete(
-            [{"role": "user", "content": message}],
-            model=model_id,
-            max_tokens=32,
-            temperature=0.0,
-        )
+        # A test chat is a real generation, so it takes a process-wide model
+        # slot like any turn: pressing "test" during a turn must queue rather
+        # than stack a second load on the same GPU.
+        from services.llm_client import AllModelsUnavailableError, model_slot
+
+        async with model_slot():
+            reply = await client.complete(
+                [{"role": "user", "content": message}],
+                model=model_id,
+                max_tokens=32,
+                temperature=0.0,
+            )
+    except AllModelsUnavailableError as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        logger.info("test-chat queued out for %s: %s", provider["name"], exc)
+        return {
+            "ok": False,
+            "connected": False,
+            "provider_id": provider_id,
+            "provider": provider["name"],
+            "model": model_id,
+            "latency_ms": latency,
+            "error": str(exc),
+        }
     except ProviderTransportError as exc:
         latency = int((time.monotonic() - started) * 1000)
         logger.info("test-chat failed for %s: %s", provider["name"], exc)
@@ -724,12 +757,23 @@ async def terminal_list() -> Dict[str, Any]:
 
 
 @terminal_router.post("/terminal", status_code=201)
-async def terminal_open(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """Open a terminal session.
+async def terminal_open(
+    data: Dict[str, Any] = Body(...), response: Response = None
+) -> Dict[str, Any]:
+    """Open a terminal session — in two steps.
 
     Goes through the same ``split_command`` sandbox as every other command
     path, so chaining and metacharacters are refused here too. Output is
     streamed over the WebSocket as ``terminal_output`` frames.
+
+    The ask is two-step because REST has no confirmation channel: a preview
+    (no session opened, no process started) carries a single-use token, and
+    only the request that echoes the token back runs the command — exactly
+    what the VM guest-exec route does for its guest shell, and for the same
+    reason. The token is bound to the whole operation (command, cwd, options)
+    recorded at preview time, so an approved preview cannot be replayed as a
+    different command. The sandbox still runs on the executing call: refusing
+    `a && b` is unconditional, and a confirmation can never override it.
 
     ``env`` overlays the inherited environment (validated and capped — key
     names are echoed back, values never are); ``timeout`` stops the session
@@ -740,13 +784,65 @@ async def terminal_open(data: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     command = (data.get("command") or "").strip()
     if not command:
         raise HTTPException(422, "'command' is required")
+
+    from tools.sandbox import SecurityError, split_command
+
+    confirm = (data.get("confirm") or "").strip()
+    if not confirm:
+        # Preview. `split_command` is pure — no process is touched — and an
+        # unconditional refusal (`a && b`, a metacharacter) happens here, before
+        # anything can be offered a token: confirming never converts a refusal
+        # into an effect. `open()` re-runs the same check on the recorded
+        # command when it executes.
+        try:
+            split_command(command)
+        except SecurityError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        token = _TERM_APPROVALS.issue()
+        _sweep_term_pending()
+        _TERM_PENDING[token] = {
+            "command": command,
+            "cwd": (data.get("cwd") or "").strip(),
+            "name": (data.get("name") or "").strip(),
+            "env": data.get("env"),
+            "timeout": data.get("timeout"),
+        }
+        # `response` is None under direct invocation in tests; a preview frame
+        # is 200 either way — 201 is the code for a session that now exists,
+        # and on this path none does.
+        if response is not None:
+            response.status_code = 200
+        return {
+            "requires_confirmation": True,
+            "confirm": token,
+            "action": "terminal",
+            "tier": "confirm",
+            "command": command,
+            "summary": f"Open a terminal session that runs: {command}",
+            "note": "Nothing has run yet. Confirming starts this command.",
+        }
+
+    _sweep_term_pending()
+    if not _TERM_APPROVALS.consume(confirm):
+        raise HTTPException(
+            409, "Unknown or expired confirmation token. Preview the command again."
+        )
+    pending = _TERM_PENDING.pop(confirm, None)
+    if pending is None:
+        raise HTTPException(
+            409, "This approval is no longer attached to a command. Preview it again."
+        )
+    # The recorded command is what runs, whatever the confirming body says —
+    # the preview is what was shown to a human, and what runs must be exactly
+    # what was shown. `open()` re-runs the sandbox on it, so the enforcement
+    # path is single and the refusal is never the confirming body's to bypass.
     try:
         session = await get_manager().open(
-            command,
-            cwd=(data.get("cwd") or "").strip(),
-            name=(data.get("name") or "").strip(),
-            env=data.get("env"),
-            timeout=data.get("timeout"),
+            pending["command"],
+            cwd=pending["cwd"],
+            name=pending["name"],
+            env=pending["env"],
+            timeout=pending["timeout"],
         )
     except TerminalError as exc:
         # A sandbox refusal is a policy decision, not a malformed request, so it

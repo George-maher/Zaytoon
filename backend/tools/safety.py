@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from config import config
 from common.reporting import safe_error
 from core.events import CoreEventType, bus
+from tools.sandbox import APP_LAUNCH_ALLOWLIST, is_allowed_app
 
 logger = logging.getLogger("Zaytoon.ToolSafety")
 
@@ -307,6 +308,18 @@ class RiskAssessor:
             return value
         return " ".join(str(v) for v in value) if isinstance(value, (list, tuple)) else str(value)
 
+    @staticmethod
+    def _looks_like_path(name: str) -> bool:
+        """Whether an app argument names an explicit path, not a bare name.
+
+        An explicit path is validated and required to exist by `OpenApp`
+        (`validate_app_target` + `os.path.exists`), so it is not the
+        "launch whatever PATH resolves" case the allow-list check exists for.
+        A bare name — with or without an `.exe` — is resolved against `PATH`
+        and the Start Menu, so it stays subject to the check.
+        """
+        return bool(re.search(r"[\\/]", name))
+
     def _is_protected_path(self, path: str) -> bool:
         if not path:
             return False
@@ -432,6 +445,13 @@ class RiskAssessor:
                 # dialog would render "SAFE" and *then* ask for approval.
                 if permission == PERMISSION_SAFE:
                     permission = PERMISSION_DANGEROUS
+            elif app and not is_allowed_app(app):
+                # `CloseApp` will refuse this outright; the reason here makes
+                # the refusal legible in the dialog too, and escalates the
+                # bare-assessor path (which cannot see the tool's own tables).
+                reasons.append(f"'{app}' is not on the application allow-list")
+                if permission == PERMISSION_SAFE:
+                    permission = PERMISSION_CONFIRM
             summary = f"Close application: {app or 'unknown'}"
 
         elif action_l in ("vm_stop",):
@@ -457,6 +477,18 @@ class RiskAssessor:
 
         elif action_l in ("open_app", "start_app"):
             app = self._as_text(params.get("app") or params.get("name")).strip()
+            # A bare name outside the allow-list is a launch of "whatever is on
+            # PATH by that name" — the D-04 shape. It is still allowed (the
+            # user asked), but it prompts, and the dialog says why. An explicit
+            # path is a different case: the caller named a real artifact, which
+            # `OpenApp` validates and requires to exist.
+            if app and not is_allowed_app(app) and not self._looks_like_path(app):
+                reasons.append(
+                    f"'{app}' is not on the application allow-list "
+                    "(launched from PATH or a Start Menu shortcut)"
+                )
+                if permission == PERMISSION_SAFE:
+                    permission = PERMISSION_CONFIRM
             summary = f"Open application: {app or 'unknown'}"
 
         elif action_l in ("file_delete", "delete_file", "file_remove",

@@ -22,10 +22,26 @@ MAX_CONCURRENT_DELIVERIES = 4
 
 
 class SchedulerManager:
-    def __init__(self, reminder_service: ReminderService, notification_mgr: NotificationManager):
+    def __init__(
+        self,
+        reminder_service: ReminderService,
+        notification_mgr: NotificationManager,
+        check_interval: Optional[float] = None,
+    ):
         self._reminder_service = reminder_service
         self._notification_mgr = notification_mgr
-        self._check_interval = 15
+        #: How often the loop looks for due reminders. `REMINDER_CHECK_INTERVAL`
+        #: was a config knob nothing read while this hard-coded 15 s beside it —
+        #: so tuning the environment variable appeared to do nothing. An explicit
+        #: argument still wins, which is what tests drive a tick with.
+        if check_interval is None:
+            try:
+                from config import config
+
+                check_interval = float(config.REMINDER_CHECK_INTERVAL)
+            except Exception:  # noqa: BLE001 - never let config stop scheduling
+                check_interval = 15.0
+        self._check_interval = max(0.05, float(check_interval))
         self._running = False
         self._task: Optional[asyncio.Task] = None
 

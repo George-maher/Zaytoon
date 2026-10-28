@@ -57,6 +57,43 @@ _ERROR = {
 }
 
 
+async def _ask_with_reconciled_tier(
+    manager: ConfirmationManager,
+    registry: ToolRegistry,
+    tool_name: str,
+    params: dict,
+    session_id: str,
+) -> bool:
+    """Ask the channel with the **registry's** assessment, not a re-derivation.
+
+    `ConfirmationManager.request` re-derives the tier from bare name-keyed
+    tables, which cannot see a tool's own declared tier or a registry floor.
+    A tool like that — `play_media`, `security_probe`, `port_scan`, the
+    `vm_*` family, and **every skill-registered tool** — was therefore
+    assessed `safe` and answered "approved" *without ever showing a prompt*,
+    while `ToolRegistry.assess` had already reconciled the declaration and
+    correctly decided a prompt was required. The registry's own docstring
+    records fixing exactly this bug on its side of the seam; this helper is
+    the fix on this side.
+
+    `request_with_assessment` takes the already-judged assessment so the
+    prompt shows the real reasons ("'play_media' is declared confirm-level")
+    instead of an empty list. Confirmation channels are duck-typed — test
+    doubles and embedders implement `request(action, params, session_id)`
+    and nothing else — so a channel without the newer method falls back to
+    `request`, exactly as before.
+    """
+    aware = getattr(manager, "request_with_assessment", None)
+    if callable(aware):
+        try:
+            assessment = registry.assess(tool_name, params)
+        except Exception:  # noqa: BLE001 - unknown tool/params: fall back
+            assessment = None
+        if assessment is not None:
+            return await aware(assessment, tool_name, params, session_id)
+    return await manager.request(tool_name, params, session_id)
+
+
 class ToolAgent(BaseAgent):
     """Turns a model's JSON tool call into a gated, executed tool result.
 
@@ -163,7 +200,9 @@ class ToolAgent(BaseAgent):
             if manager is None:
                 return _DECLINED.get(language, _DECLINED["en"])
             try:
-                if await manager.request(tool_name, params, session_id):
+                if await _ask_with_reconciled_tier(
+                    manager, self.registry, tool_name, params, session_id
+                ):
                     return True
             except asyncio.CancelledError:
                 raise
@@ -265,7 +304,16 @@ class ToolAgent(BaseAgent):
         language: str,
     ) -> Optional[str]:
         """Return ``None`` to proceed, or a refusal string to skip execution."""
-        assessment = self.assessor.assess(tool_name, params)
+        # The reconciled assessment — the stricter of the tool's declared
+        # tier and any registry floor — comes from the registry. The bare
+        # `self.assessor` cannot see a declared tier, so a declared-confirm
+        # tool (`play_media`, every skill tool) used to skip this prompt
+        # entirely. Fall back to the bare assessor only if the registry
+        # cannot assess the name at all.
+        try:
+            assessment = self.registry.assess(tool_name, params)
+        except Exception:  # noqa: BLE001 - unknown tool: bare assessor
+            assessment = self.assessor.assess(tool_name, params)
         if assessment.level is not RiskLevel.HIGH:
             return None
 
@@ -278,7 +326,9 @@ class ToolAgent(BaseAgent):
             return _UNAVAILABLE.get(language, _UNAVAILABLE["en"])
 
         try:
-            approved = await manager.request(tool_name, params, session_id)
+            approved = await _ask_with_reconciled_tier(
+                manager, self.registry, tool_name, params, session_id
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:

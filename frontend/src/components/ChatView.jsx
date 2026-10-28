@@ -172,6 +172,7 @@ export default memo(function ChatView({
   onVoiceStart,
   onVoiceStop,
   voiceMode = false,
+  voiceState = "disabled",
   onStop,
   pendingConfirmation = null,
 }) {
@@ -334,6 +335,7 @@ export default memo(function ChatView({
           onVoiceStart={onVoiceStart}
           onVoiceStop={onVoiceStop}
           voiceMode={voiceMode}
+          voiceState={voiceState}
           onStop={onStop}
           busy={isTyping || isSpeaking || !!pendingConfirmation}
           multiline

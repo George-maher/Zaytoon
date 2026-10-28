@@ -421,14 +421,44 @@ class TestHandshakePolicy:
         asyncio.run(run_handler(ws, config=config))
         assert ws.accepted
 
-    def test_a_null_origin_is_not_treated_as_allow_listed(self):
-        # `Origin: null` comes from a sandboxed iframe or a file:// page. It is
-        # accepted only because it cannot be produced by a remote site; it must
-        # never be *matched against* the allow-list.
+    def test_a_null_origin_is_refused_without_a_device_token(self):
+        # `Origin: null` is an opaque origin: a sandboxed iframe on *any* site
+        # (or a local file:// page) produces it, and the TCP peer for such a
+        # frame is still loopback. It therefore proves nothing about who is
+        # calling, and is refused unless the client also authenticates as a
+        # paired device. Previously it was admitted as a "Local session",
+        # which let a drive-by iframe reach the full tool surface.
         config = make_config(WS_ALLOWED_ORIGINS=["null"])
         ws = FakeWebSocket(headers={"origin": "null"})
         asyncio.run(run_handler(ws, config=config))
+        assert not ws.accepted
+        assert ws.closed["code"] == 1008
+
+    def test_origin_allowed_refuses_the_opaque_origin_directly(self):
+        # The predicate itself, so the policy cannot regress in a caller that
+        # forgets `authorize_websocket`'s special case.
+        from api.ws_security import origin_allowed
+
+        assert origin_allowed("null", make_config()) is False
+        assert origin_allowed("NULL", make_config()) is False
+        # An absent Origin is a non-browser client, not an opaque one.
+        assert origin_allowed("", make_config()) is True
+
+    def test_a_null_origin_with_a_paired_device_is_admitted(self):
+        # The supported path for a genuinely local opaque-origin client: pair
+        # once, then present the token. The token is the proof the origin is
+        # not.
+        from services.auth import PermissionScope
+
+        device_id, token = _pair("local-file", PermissionScope.CHAT)
+        config = make_config(WS_ALLOWED_ORIGINS=[])
+        ws = FakeWebSocket(
+            headers={"origin": "null"},
+            query={"device_id": device_id, "token": token},
+        )
+        asyncio.run(run_handler(ws, config=config))
         assert ws.accepted
+        assert ws.one("status")["authenticated"] is True
 
     def test_the_handshake_reports_honest_authentication_state(self):
         ws = FakeWebSocket()

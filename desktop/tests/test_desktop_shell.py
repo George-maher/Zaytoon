@@ -46,7 +46,14 @@ def _free_port() -> int:
 
 
 class _ListeningPort:
-    """A real TCP listener standing in for an already-running backend.
+    """A real listener standing in for an already-running backend.
+
+    It answers ``GET /health`` with HTTP 200 JSON by default, because "the
+    backend is up" means *health*, not a bare TCP accept: readiness, adoption
+    and the port-conflict report all ask ``/health`` first, and a fake that
+    only accepts connections would make every one of those checks see a
+    foreign process. Pass ``serve_health=False`` for the port-conflict case —
+    something that listens but is not the Zaytoon backend.
 
     It accepts and closes in a background thread on purpose. A bare
     ``listen(backlog)`` socket fills its accept queue after a single
@@ -55,7 +62,8 @@ class _ListeningPort:
     continuously, so the fake must too.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, serve_health: bool = True) -> None:
+        self.serve_health = serve_health
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
@@ -72,7 +80,34 @@ class _ListeningPort:
                 conn, _ = self.sock.accept()
             except (socket.timeout, OSError):
                 continue
-            conn.close()
+            try:
+                if self.serve_health:
+                    self._answer_health(conn)
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _answer_health(conn) -> None:
+        """Read the request (however it is split across packets) and answer 200."""
+        conn.settimeout(1.0)
+        try:
+            request = b""
+            while b"\r\n\r\n" not in request and len(request) < 16 * 1024:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+        except OSError:
+            return
+        if not request.startswith(b"GET "):
+            return
+        body = b'{"status":"ok","tools_loaded":0}'
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
 
     @property
     def addr(self) -> str:
@@ -280,10 +315,10 @@ class TestBackendCommandResolution:
 
         resolved = resolve_backend_command(cfg)
         assert resolved is not None
-        python_exe, main_script, cwd = resolved
-        assert python_exe == sys.executable
-        assert Path(main_script) == repo / "backend" / "main.py"
-        assert Path(cwd) == repo / "backend"
+        assert resolved.argv[0] == sys.executable
+        assert Path(resolved.argv[1]) == repo / "backend" / "main.py"
+        assert Path(resolved.cwd) == repo / "backend"
+        assert resolved.kind == "override"
 
     def test_falls_back_to_the_repo_venv(self, clean_env, tmp_path):
         repo = tmp_path / "repo"
@@ -295,7 +330,8 @@ class TestBackendCommandResolution:
 
         resolved = resolve_backend_command(self._config(repo))
         assert resolved is not None
-        assert Path(resolved[0]) == venv_python
+        assert Path(resolved.argv[0]) == venv_python
+        assert resolved.kind == "venv"
 
     def test_falls_back_to_the_running_interpreter(self, clean_env, tmp_path):
         repo = tmp_path / "repo"
@@ -303,7 +339,8 @@ class TestBackendCommandResolution:
         (repo / "backend" / "main.py").write_text("", encoding="utf-8")
         resolved = resolve_backend_command(self._config(repo))
         assert resolved is not None
-        assert resolved[0] == sys.executable
+        assert resolved.argv[0] == sys.executable
+        assert resolved.kind == "source"
 
     def test_returns_none_when_the_backend_is_absent(self, clean_env, tmp_path):
         """A missing ``main.py`` must produce an actionable ``None``."""
@@ -318,7 +355,22 @@ class TestBackendCommandResolution:
         cfg = self._config(repo, backend_python=sys.executable, backend_main=str(custom_main))
         resolved = resolve_backend_command(cfg)
         assert resolved is not None
-        assert Path(resolved[1]) == custom_main
+        assert Path(resolved.argv[1]) == custom_main
+
+    def test_a_frozen_build_runs_its_own_serve_mode(self, clean_env, monkeypatch):
+        """One artifact, no checkout, no second Python: ``Zaytoon.exe --serve``.
+
+        The bundle's backend is imported *in-process* by that mode, so the
+        resolved command names this executable and nothing else — the old
+        ``[sys.executable, <bundle>/backend/main.py]`` form pasted a script
+        argument onto a windowed exe and could never start.
+        """
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        cfg = self._config(Path("/nonexistent-repo"))
+        resolved = resolve_backend_command(cfg)
+        assert resolved is not None
+        assert tuple(resolved.argv) == (sys.executable, "--serve")
+        assert resolved.kind == "bundled"
 
 
 class TestBackendNeverTouchesAForeignProcess:
@@ -357,6 +409,27 @@ class TestBackendNeverTouchesAForeignProcess:
             proc.ensure_running()
             proc.shutdown()
             assert backend_is_up("127.0.0.1", listener.port) is True
+        finally:
+            listener.close()
+
+    def test_a_listener_that_never_answers_health_is_a_conflict_not_a_backend(
+        self, clean_env, monkeypatch
+    ):
+        """A TCP accept is not readiness: some *other* app owns this port.
+
+        Adopting it would report a green status for a backend that does not
+        exist, and spawning would only fail to bind — so it is a stated
+        conflict, with nothing touched.
+        """
+        listener = _ListeningPort(serve_health=False)
+        spawned: list = []
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: spawned.append(a) or _FakeChild())
+        try:
+            proc = BackendProcess(self._cfg_for(listener.addr))
+            status = proc.ensure_running()
+            assert status.running is False
+            assert "in use by another application" in status.hint
+            assert spawned == [], "must not spawn against a port that is already held"
         finally:
             listener.close()
 
@@ -495,7 +568,7 @@ class TestBackendSpawnFailure:
         """A half-dead child must not block a later attempt."""
         child = _FakeChild()
         monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: child)
-        monkeypatch.setattr(backend_mod, "wait_for_backend", lambda *a, **k: False)
+        monkeypatch.setattr(backend_mod, "wait_for_ready", lambda *a, **k: False)
 
         cfg = self._dead_config()
         cfg.repo_root = REPO_ROOT
@@ -525,7 +598,7 @@ class TestSpawnIsArgumentVector:
             return _FakeChild()
 
         monkeypatch.setattr(subprocess, "Popen", _capture)
-        monkeypatch.setattr(backend_mod, "wait_for_backend", lambda *a, **k: True)
+        monkeypatch.setattr(backend_mod, "wait_for_ready", lambda *a, **k: True)
 
         BackendProcess(self._live_config()).ensure_running()
 
@@ -539,7 +612,7 @@ class TestSpawnIsArgumentVector:
         # TestBackendCommandResolution; this test owns the hand-off.
         resolved = resolve_backend_command(self._live_config())
         assert resolved is not None
-        assert captured["argv"][0] == resolved[0]
+        assert captured["argv"][0] == resolved.argv[0]
         assert captured["argv"][0].lower().endswith(
             ("python", "python.exe")
         ), "argv[0] must be an interpreter path, not arbitrary text"
@@ -556,7 +629,7 @@ class TestSpawnIsArgumentVector:
             return _FakeChild()
 
         monkeypatch.setattr(subprocess, "Popen", _capture)
-        monkeypatch.setattr(backend_mod, "wait_for_backend", lambda *a, **k: True)
+        monkeypatch.setattr(backend_mod, "wait_for_ready", lambda *a, **k: True)
 
         BackendProcess(self._live_config()).ensure_running()
 

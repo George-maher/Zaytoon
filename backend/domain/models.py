@@ -8,6 +8,18 @@ import hashlib
 import uuid
 
 
+def _new_voice_session():
+    """Build the per-session voice state without an import cycle.
+
+    ``services.voice_session`` is deliberately dependency-free (no domain, no
+    transport), but importing it at module scope would still put the services
+    package in domain's import path — a direction this tree keeps one-way.
+    """
+    from services.voice_session import VoiceSession
+
+    return VoiceSession()
+
+
 class Intent(str, Enum):
     CHAT = "chat"
     CODE = "code"
@@ -141,11 +153,32 @@ class SessionState:
     is_responding: bool = False
     spoken_tracker: SpokenSentenceTracker = field(default_factory=SpokenSentenceTracker)
     current_response_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    awaiting_command: bool = False
-    last_active_ts: float = 0.0
+    #: The voice lifecycle (state, wake arming, utterance idempotency). It owns
+    #: `awaiting_command`/`last_active_ts`; the properties below are the
+    #: backwards-compatible spelling used by the wake gate, so the two cannot
+    #: disagree about whether the follow-up window is armed.
+    voice: "VoiceSession" = field(default_factory=_new_voice_session)
     confirmation_manager: Optional[object] = None
     _sent_hashes: set = field(default_factory=set)
     _created_at: float = field(default_factory=time.time)
+
+    #: Compatibility spellings for the wake gate and its tests. The state is
+    #: stored exactly once, on `voice`.
+    @property
+    def awaiting_command(self) -> bool:
+        return self.voice.awaiting_command
+
+    @awaiting_command.setter
+    def awaiting_command(self, value: bool) -> None:
+        self.voice.awaiting_command = bool(value)
+
+    @property
+    def last_active_ts(self) -> float:
+        return self.voice.last_active_ts
+
+    @last_active_ts.setter
+    def last_active_ts(self, value: float) -> None:
+        self.voice.last_active_ts = float(value or 0.0)
 
     def is_current(self, response_id: Optional[str]) -> bool:
         """Whether ``response_id`` is still the turn this session is running.

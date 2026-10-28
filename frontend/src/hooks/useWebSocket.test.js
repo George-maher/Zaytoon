@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import useWebSocket from './useWebSocket'
+import { canCapture } from '../lib/voiceState'
 
 /**
  * Minimal scriptable WebSocket double.
@@ -555,6 +556,61 @@ describe('inbound: voice', () => {
     expect(
       result.current.messages.some((m) => m.role === 'system')
     ).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+describe('outbound: voice controls', () => {
+  // These replace `useWebSocket.voice.test.js`, which called the hook as a
+  // plain function (`useWebSocket({...ws})`) — so it exercised nothing and
+  // asserted against a mock object it had assigned to itself.
+
+  it('disabling voice tells the server but keeps the socket open', async () => {
+    const { result, socket } = await mount()
+    act(() => result.current.stopVoiceMode())
+    expect(socket.sentOfType('voice').at(-1)).toMatchObject({ action: 'disable' })
+    // Voice is a mode, not a connection.
+    expect(socket.closed).toBeNull()
+    expect(socket.readyState).toBe(FakeSocket.OPEN)
+    expect(result.current.voiceMode).toBe(false)
+    expect(result.current.voiceState).toBe('disabled')
+  })
+
+  it('cancelling a command asks the server to cancel and keeps the socket', async () => {
+    const { result, socket } = await mount()
+    act(() => result.current.cancelVoiceCommand())
+    expect(socket.sentOfType('voice').at(-1)).toMatchObject({ action: 'cancel' })
+    expect(socket.closed).toBeNull()
+  })
+
+  it('never sends the legacy isManualVoice bypass flag', async () => {
+    // It used to be attached to every VAD segment as `true`, which told the
+    // backend to skip its wake-word gate — the reported root cause of
+    // ordinary speech executing.
+    const { result, socket } = await mount()
+    act(() => result.current.sendMessage('hello'))
+    act(() => result.current.stopVoiceMode())
+    act(() => result.current.cancelVoiceCommand())
+    expect(socket.sent.length).toBeGreaterThan(0)
+    expect(socket.sent.some((frame) => 'isManualVoice' in frame)).toBe(false)
+  })
+
+  it('adopts the server voice_state and derives the capture gate from it', async () => {
+    const { result, socket } = await mount()
+    act(() => socket.emit({ type: 'voice_state', state: 'speaking', enabled: true }))
+    expect(result.current.voiceState).toBe('speaking')
+    expect(canCapture(result.current.voiceState, { speaking: true })).toBe(false)
+
+    act(() => socket.emit({ type: 'voice_state', state: 'standby', enabled: true }))
+    expect(result.current.voiceState).toBe('standby')
+    expect(canCapture(result.current.voiceState)).toBe(true)
+  })
+
+  it('maps a state this bundle does not know to recovering', async () => {
+    const { result, socket } = await mount()
+    act(() => socket.emit({ type: 'voice_state', state: 'teleporting', enabled: true }))
+    expect(result.current.voiceState).toBe('recovering')
+    expect(canCapture(result.current.voiceState)).toBe(false)
   })
 })
 

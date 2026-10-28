@@ -84,7 +84,7 @@ backend/
 │   ├── providers/          # capabilities | store | client | router
 │   ├── workspace/          # files (service) | terminal | git (service)
 │   └── api/                # tasks | projects | files | git | registry routers
-├── tests/                  # 48 test files (19 of them tests/core/), pytest-asyncio
+├── tests/                  # 72 test files (25 of them tests/core/), pytest-asyncio
 ├── scripts/verify_final.py        # Free-only + voice routing + sandbox smoke check
 ├── scripts/smoke_confirmation.py  # Manual WS confirmation round-trip check
 ├── scripts/verify_execution.py    # Live probe: tools, audit, dedupe, processes
@@ -93,15 +93,15 @@ backend/
     data/core.db            # Core runtime (a THIRD file — see below)
 frontend/src/
 ├── hooks/useWebSocket.js   # WS connection, audio recording, VAD, state, confirmations
-├── components/             # ChatMessage, MessageList, InputBar, SystemMonitor,
-│                           #   ReminderPanel, ConfirmationDialog, HUD/, workspace/
+├── components/             # ChatMessage, InputBar, ReminderPanel,
+│                           #   ConfirmationDialog, HUD/, workspace/
 │   ├── Chat/ActivityFeed.jsx  # Agent progress: plan + tool_started/finished log
 │   └── SettingsPanel.jsx   # workspace root, API key, model chain, LLM metrics
 └── styles/index.css        # Tailwind + CSS vars + animations
 desktop/                    # Python/pywebview native host for the React UI
 ├── app/                    # host.py (WebView window), bridge.py (JS ⇄ Python),
 │                           #   backend supervisor, single instance, protocol
-├── scripts/build_exe.py    # PyInstaller onefile build
+├── scripts/build_exe.py    # PyInstaller onedir bundle: staged backend+frontend
 └── tests/                  # pytest suite (host, bridge, backend, legacy logic)
 ```
 
@@ -135,7 +135,8 @@ tools/
 └── linux.py         # ditto
 ```
 
-36 tools, listed in the agent prompt by generating them from the registry
+48 tools (19 `safe`, 26 `confirm`, 3 `dangerous`), listed in the agent prompt by
+generating them from the registry
 rather than hand-maintaining them — the old hard-coded list omitted every tool
 added since, which is how `file_read`/`file_write` came to pre-validate with no
 handler behind them and return `"Unknown action"`.
@@ -226,7 +227,11 @@ Two rules that are not negotiable, each with a test that is the tripwire:
   `POST /providers/{id}/test-chat`, a real 32-token completion that sets
   `chat_verified_at`. `GET /setup/status` reads the latter, because wrong key
   scope, a missing model and an exhausted balance each look exactly like
-  success until a completion is attempted.
+  success until a completion is attempted. Both `test-chat` and the capability
+  probes take a **process-wide model slot** (`services.llm_client.model_slot`)
+  like any turn — they are real generations, and pressing "test" mid-turn used
+  to stack a second one onto the same GPU the bound exists to protect. A full
+  queue is a stated `503` / `ok: false`, not a probe result.
 
 Live proof (real Ollama, no mocks): `python scripts/verify_providers_live.py`
 — 13 checks over the same route functions the API serves.
@@ -359,11 +364,15 @@ One structured line per attempt:
 
 ```
 LLM_ATTEMPT request=7fed7be92950 attempt=1/3 model=qwen/qwen3.8-27b:free
-           status=200 validation=OK tool=create_folder caps=- latency=2936ms
+           status=200 validation=OK tool=create_folder caps=- latency=2936ms ttft=612ms
 ```
 
 `AttemptRecord` carries request_id, attempt, model, status, latency,
-required_capabilities, validation verdict, tool_called and fallback_reason.
+time-to-first-token, required_capabilities, validation verdict, tool_called and
+fallback_reason. `ttft_ms` is streaming-only (0 on a blocking attempt) and rides
+the `model.completed`/`model.failed` payload as well as the log line: a reply
+with a fast *total* latency can still sit visibly empty, and total latency alone
+never says so.
 `LLMMetrics` counts `invalid` per verdict — the metric that would have caught
 the `openrouter/free` problem, because a model that answers every request with
 valid-looking garbage shows up there and not in `success`. Neither the API key
@@ -535,7 +544,10 @@ are the modifier syntax — escaping them would break `ctrl+c`).
   request gets a precise error rather than an approval prompt.
 - Applied at two chokepoints: `ToolExecutor.execute` and `ToolAgent` — plus
   `POST /command/run`, which denies rather than executing because REST has no
-  approval channel. `AgentService._execute_tool_commands` is **test-only**; do
+  *streaming* approval channel — but the destructive REST workspace routes
+  (`/git/*`, `/terminal`) do carry the channel now, as the two-step
+  approval-token flow described under A6 in the hardening section.
+  `AgentService._execute_tool_commands` is **test-only**; do
   not wire it back into a request path.
 - Bilingual notices (`en` / `ar`) for decline, timeout, and no-channel cases.
 - Manual check: `python scripts/smoke_confirmation.py deny`.
@@ -606,6 +618,17 @@ Two live bugs, both found by running it rather than reading it:
   `ToolRegistry.execute`, which refuses it **by name** and hands the refusal
   back as an observation the model corrects from. The strict default is
   unchanged for every other caller, and what can *execute* is unchanged.
+- **A streamed native call was an empty completion.** The registry transport
+  (`OpenAICompatibleClient.stream`) collected `delta.tool_calls` and rendered
+  them, but the OpenRouter *chain* reader (`LLMClient._stream`) looked at
+  `delta.content` alone — so a model that emitted its call as native
+  tool-call deltas left the accumulated text empty, raised `stream completed
+  with no content`, benched a working model and failed the turn. Both readers
+  now merge fragmented calls by `index` and render them through the **one**
+  `core.providers.client.render_tool_call`, so the two transports produce
+  byte-identical dialect text. Tool calls still never reach `on_delta`: a JSON
+  blob arriving character by character is the bug the "tool calls are not
+  prose" rule exists to prevent.
 
 ### Errors are reported centrally
 
@@ -722,6 +745,19 @@ cd frontend
 npm run verify          # lint && test && build
 ```
 
+- **The suite exits on its own.** `aiosqlite` gives every connection a
+  **non-daemon** worker thread that dies only when `stop()` has queued its
+  sentinel, so a connection still referenced *while still running* ran that
+  thread past pytest's summary and left the interpreter waiting inside
+  `threading._shutdown` for it — minutes of dead silence that read exactly like
+  a hang in the harness, and only on *subset* runs, which is why it never
+  reproduced as a clean CI error. `tests/_sqlite_sweeper.py` stops any
+  connection still running at session finish (bounded join, one heap scan —
+  the per-test scan that once doubled the suite's runtime stays gone), pinned by
+  `tests/test_teardown_sweeper.py`. A run that now hangs at summary time has
+  *nothing to do with this mopping up*, which is why the code was measured: the
+  reproducer's worker held the process for >200 s before the fix and exits in
+  ~1 s after it.
 - All Python tests are async (pytest-asyncio). SQLite DB auto-created in `data/`.
 - Tests skip API-dependent tests when OpenRouter is unreachable.
 - `tests/test_llm_client.py` mocks all HTTP (including SSE) — no network needed.
@@ -816,6 +852,23 @@ React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
 - **Audit and processes are optional capabilities.** `ExecutionHistory.jsx`
   treats a 404 as "unavailable" and hides the processes card rather than showing
   an error, so the page works against a backend that predates the endpoints.
+- **`components/nexus/` is the HOME screen** (the "NEXUS AI" dashboard, rebuilt
+  screen-by-screen from the Jarvis Figma Make reference). `NexusDashboard.jsx`
+  composes top bar + monitor + core + console + dock; App renders it for
+  `VIEWS.HOME` **full-bleed — the shell's Sidebar and header stand aside there**
+  (the dock is home's navigator), and every other screen keeps the chrome. Its
+  palette is **scoped** (`--nx-*` in `styles/nexus.css`), not a re-theme of
+  `theme.css`: the desktop shell pins the HUD token values for parity, so the
+  Nexus look ships without moving those. Two rules it encodes: every metric is
+  real (LOAD = the mean of CPU/MEM/DISK that actually answered; NETWORK's
+  "—" carries the backend's own `unavailable` reason; no fabricated GPU, no
+  fake "NEURAL OPS"), and every interactive element maps to an existing
+  capability — orb click toggles voice, dock cells are `viewState` destinations,
+  the launchpad carries Home's three original actions and the path input.
+  `useNexusTelemetry.js` is the one poller (/system 3s, /health 10s) behind all
+  of it, and HomeScreen is gone — its behaviors live here, pinned by
+  `NexusDashboard.test.jsx` plus the App runtime suite (which now leaves home
+  through the dock).
 - **`components/workspace/` is the application shell.** `WorkspaceShell.jsx` holds
   three panels — *what is this project* (left), *what are we doing* (centre),
   *what happened* (right). The centre survives every width; the rails collapse
@@ -848,15 +901,23 @@ React 18 + Vite 5 + Tailwind 3 + GSAP. **JavaScript/JSX, not TypeScript** — no
   the exact parameters. The `<pre>` block is `dir="ltr"` so an RTL UI cannot
   reorder a command the user is approving.
 
-### Orphaned components (resolved; the list is now empty)
+### Orphaned components (resolved twice; the list is empty)
 
 Eight root-level components existed but were imported nowhere, which is why the
-app had **no text input at all** and no reminders UI. `InputBar`,
-`ReminderPanel` and `SystemMonitor` are wired. The rest — `ChatInterface.jsx`,
+app had **no text input at all** and no reminders UI. `InputBar` and
+`ReminderPanel` are wired. The rest — `ChatInterface.jsx`,
 `VoiceControls.jsx`, `StatusDot.jsx`, `VoicePanel.jsx`, `Chat/VoiceButton.jsx`,
 `useGsapTimeline.js`, and the empty `App.css` / `index.css` / `App.jsx.css` —
 were deleted, so `npm run lint` reports zero warnings. That is what makes a new
 warning mean something.
+
+A second pair — `MessageList.jsx` and `SystemMonitor.jsx` — survived that sweep
+and this file still claimed they were wired. Neither was imported anywhere:
+`MessageList` duplicated what `components/workspace/` renders, and
+`SystemMonitor` pre-dated the System inspector tab that actually reads
+`GET /system`. Both were deleted, so the claim and the tree agree again. The
+test that guards this is `src/imports.case.test.js` (casing) plus the lint run;
+if you add a component, import it or delete it.
 
 Import **casing** is a portability matter here, not a style one: the HUD
 components live in `components/HUD/`, and a `components/hud/...` specifier
@@ -1119,6 +1180,17 @@ their own frames, and `COMPLETED` is deliberately **not** relayed — the
 transport owns the terminal `done`, because only it knows about TTS drain and
 the `message` frame that has to land first.
 
+`RESPONSE_CHUNK` becomes a `token` frame, and this is the fix for a real gap
+rather than a tidy-up. `ToolAgent` forwards that chunk to `stream_callback` only
+when nothing is subscribed to the bus (`bus.subscriber_count == 0`), and the
+relay *is* the subscriber — so on a tool turn the forwarding was off while the
+relay ignored the event, and the engine's answer reached the client only in the
+final `message` frame: no streamed bubble at all. The two mechanisms were each
+assuming the other covered it. They are mutually exclusive by construction
+(only the engine emits this event; the base-agent streaming path never does),
+so relaying it here cannot double-deliver, and the `message` frame still
+supersedes the bubble exactly as it does for a streamed chat turn.
+
 ## WebSocket protocol
 
 | Type | Payload | Direction |
@@ -1191,7 +1263,7 @@ desktop/
 │   └── app.py, orb.py, panel.py, core.py, header.py, sidepanel.py,
 │       dialogs.py, activity.py, states.py, theme.py, audio.py, hotkeys.py,
 │       tray.py, client.py  # legacy Tk shell modules (kept, no longer launched)
-├── scripts/build_exe.py   # PyInstaller onefile build
+├── scripts/build_exe.py   # PyInstaller onedir bundle: staged backend+frontend
 ├── scripts/smoke_desktop.py  # live proof: opens the real window, probes the
 │                           #   page + bridge + CORS, then closes itself
 └── tests/                 # pytest suite (host, bridge, backend lifecycle, …)
@@ -1302,11 +1374,59 @@ desktop/
   verdict with the download URL when it is missing. It exits non-zero on a
   real problem instead of opening a broken window; `WebViewHost.run()` fails
   fast with the same message before any window is created.
-- **Build:** `python desktop/scripts/build_exe.py` → `desktop/dist/Zaytoon.exe`
-  (PyInstaller onefile, portable). The backend and the frontend bundle are
-  deliberately **not** frozen in: ship `backend/` and `frontend/dist/` as files
-  next to the exe, or point `ZAYTOON_REPO_ROOT` at the install dir. The frontend
-  is loaded from disk, so the installed app works offline.
+- **Packaging (the shipped artifact):** `python desktop/scripts/build_exe.py` →
+  `desktop/dist/Zaytoon/` — a **onedir** bundle: `Zaytoon.exe` (windowed,
+  ~19 MB) plus `_internal/` carrying the whole backend source tree, every
+  backend dependency and the **production frontend**, so the installed app
+  needs no checkout, no virtualenv, no system Python and no env var. It runs
+  `npm ci && npm run build` itself (`--skip-frontend` reuses an existing
+  `frontend/dist`), stages *filtered copies* of `backend/` and `frontend/`
+  (`BACKEND_SKIP_TOP` excludes `.venv`/`data`/`tests`/`scripts`; `SKIP_FILES`
+  excludes `.env` and `secrets.json`; `SKIP_SUFFIXES` excludes `.pyc`/`.db`/
+  `.log` — the previous build copied the tree wholesale, dragging a 0.4 GB
+  venv *and the user's OpenRouter key* into the artifact), writes a
+  `zaytoon_bundle.json` marker, and **verifies the result** (missing backend
+  entry / frontend `index.html` / referenced asset, or any `.venv`/`.env`/
+  secrets leak ⇒ the build FAILs). An earlier version's
+  `_ensure_backend_and_frontend_in_dist` copy step was the root cause of both
+  leaks. `--icon desktop/icons/zaytoon.ico` (generated once by
+  `desktop/icons/make_icon.py` from `source.png`) gives the exe real
+  iconography instead of PyInstaller's default.
+- **`--serve` is the backend worker.** The frozen exe doubles as its own
+  backend: `Zaytoon.exe --serve` loads `_internal/backend/main.py` **by file
+  path** (`spec_from_file_location` — a plain `import main` would resolve to
+  the shell's own module), chdirs into it, translates
+  `ZAYTOON_BACKEND_ADDR`→`BACKEND_HOST`/`BACKEND_PORT` and hands the app
+  *object* to in-process uvicorn. `_bootstrap_frozen_home()` runs first in
+  frozen mode and pins `ZAYTOON_HOME=%LOCALAPPDATA%\Zaytoon` plus an absolute
+  `DATABASE_URL` into `<home>/Data/` **before** any backend import reads the
+  environment, so nothing ever writes into `Program Files`. It is idempotent
+  (`setdefault`) and a no-op outside frozen mode. Readiness is a real
+  `GET /health` 200 (stdlib urllib), never a bare listening socket; a socket
+  that answers with something else is a *port conflict*, not a backend to
+  adopt, and the failure hint embeds the tail of
+  `%LOCALAPPDATA%\Zaytoon\logs\backend.log` where the child's output goes.
+- **Installer:** `python scripts/create_iss.py --compile` renders
+  `installer/zaytoon.iss` from a raw template (Pascal braces doubled; a
+  formatted template once turned `\f` into a form feed) and compiles
+  `installer/dist/Zaytoon-Setup-<version>.exe` with Inno Setup 6. One
+  artifact serves **per-user and all-users** installs
+  (`PrivilegesRequiredOverridesAllowed=dialog commandline`, `{autopf}`
+  default dir). The `[Code]` section detects the WebView2 runtime (EdgeUpdate
+  `PV` registry key plus fixed-path fallback; `0.0.0.0` = absent) and offers
+  the download rather than failing after install. Uninstall **preserves**
+  `%LOCALAPPDATA%\Zaytoon` unless the user drops `delete-user-data.flag`
+  into the app dir — deleting a user's API keys and workspace on uninstall is
+  the same sin as an installer overwriting `Config/.env`. `SetupIconFile` is
+  the generated `.ico`: Inno accepts only `.ico`/`.exe`/`.dll`, and the 19 MB
+  exe as icon source fails with "File is too large". Version comes from
+  `desktop/app/__init__.py`, so there is one version constant.
+- **Live proof of the whole chain** (this machine, 2026-10-21): the packaged
+  `Zaytoon.exe --diagnose` reports **`verdict: ready`** with
+  `--start-backend` (it spawns `_internal`'s backend, answers `/health` and
+  kills the child tree on exit); a **silent install → diagnose-from-install
+  dir → silent uninstall** round trip left 0 files, 0 registry entries and
+  the user's data intact.
 - **Legacy Tk modules** (`app.py`, `orb.py`, `panel.py`, `core.py`,
   `theme.py`, …) are retained for reference and the **whole legacy suite still
   runs against them** (`test_states`, `test_app_wiring`, `test_core_animation`,
@@ -1445,6 +1565,163 @@ desktop/
   gate at the registry — a confirmation-required command denied with nothing on
   disk, `echo hi & hostname` blocked — so "no model here today" never means "the
   gate went untested".
+
+## Hardening increments (2026-10-18)
+
+A focused pass over confirmed defects, not a rewrite. Each one is pinned by a
+test, and the "no silent loosening" rule holds throughout: nothing here makes a
+permission, confirmation, sandbox or audit check weaker.
+
+- **The agent path asked with the registry's tier (A1).** `ToolAgent` built its
+  prompt from a bare-name table, so a tool whose tier lives only on the tool —
+  `play_media`, `security_probe`, `port_scan`, `vm_*`, and **every
+  skill-registered tool** — was called `safe` and answered "approved" without a
+  prompt, while `ToolRegistry.assess` had already decided one was required. The
+  engine now also **refuses** a gated call when no approval channel exists,
+  instead of the old `approval=True` default that ran confirm/dangerous tools
+  unattended. Tests: `tests/test_declared_tier_is_enforced.py`
+  (`TestTheAgentPathAsksToo`).
+- **`Origin: null` is no longer a local session (A2).** An opaque origin is
+  produced by a sandboxed iframe on *any* site, and the TCP peer for such a frame
+  is still loopback, so it proved nothing. It is refused unless the client also
+  presents a paired-device token. The desktop shell is unaffected: pywebview
+  serves the bundle from a real loopback origin. Tests: `tests/test_ws_protocol.py`.
+- **One application policy (A3).** `tools/sandbox.APP_LAUNCH_ALLOWLIST` is now
+  the single list; `POST /command/open-app` imports it instead of keeping a
+  second copy. `close_app` is bounded to that list ∪ `APP_PATHS`, resolved to an
+  exact binary, and refused (never guessed) on a miss — and `pkill -f` became
+  `pkill -x`, since `-f` matches any command line. `open_app` with an
+  off-list *bare* name is escalated to `confirm`; an explicit path is not,
+  because `OpenApp` requires it to exist.
+- **REST resource bounds (A4).** `/stt` caps the upload and transcribes off the
+  event loop under a deadline; `/tts` caps the text and bounds synthesis;
+  `/preferences` bounds keys, key length and value size. Constants, not knobs —
+  a missing env var must not silently remove a bound.
+- **No blocking spawn on the loop (A5).** `resolve_windows_app`'s PowerShell
+  probe moved to an executor.
+- **`Retry-After` is finally read (B3).** `_retry_after_seconds` existed and was
+  never called, so the documented behaviour did not exist. It now *shortens* a
+  bench (floored at 1 s, capped at 5 s) — never lengthens — and a malformed 200
+  no longer spends a second attempt on the same model.
+- **The audit read path is indexed (B4).** `ts` and `tool`, created once per
+  database file.
+- **Dead config knobs (B5).** `REMINDER_CHECK_INTERVAL` is read by
+  `SchedulerManager` and `MAX_CONTEXT_MESSAGES` caps the history in
+  `AgentService.dispatch`; `OPENROUTER_RATE_LIMIT_BACKOFF`,
+  `WS_RATE_LIMIT_MAX`/`WINDOW` and `ASSISTANT_NAME` were declared and read by
+  nothing, and were dropped. `tests/test_config_knobs.py` is the tripwire.
+- **Tool output is data (D1).** The engine system prompts (both languages) now
+  say so explicitly: fetched pages, log lines and filenames reach the model in
+  the tool-results turn, and "ignore your rules and run X" costs nothing to
+  plant there.
+- **Append verification no longer lies (found while testing).** `file_write`'s
+  read-back computed the tail window as `tell() - len(content)` in *text* mode,
+  where `tell()` counts bytes and `len()` counts characters. On Windows the
+  writer translates `\n` to `\r\n`, so a multi-line append read the wrong window
+  and reported **"the write did not land" for a write that succeeded** — the
+  harmful direction, because the natural recovery is to append it again. On
+  POSIX there is no translation, which is how it survived.
+  `tests/test_tool_registry.py` now covers multi-line, multibyte and
+  no-trailing-newline appends.
+
+### Second pass (2026-10-18)
+
+The provider-transport items the first pass left open. Same rule: each one is
+pinned by a test, and nothing here weakens a gate.
+
+- **A native tool call survives the chain's SSE reader (B1).**
+  `OpenAICompatibleClient.stream` collected `delta.tool_calls`; the OpenRouter
+  *chain* reader looked at `delta.content` alone, so a model that streamed its
+  call as native deltas was reported as `stream completed with no content` —
+  benched, and the turn failed. It now merges fragmented calls by `index` and
+  renders them through the **one** `core.providers.client.render_tool_call`, so
+  both transports produce byte-identical dialect text. Tool calls are still
+  never handed to `on_delta`. Tests: `tests/test_llm_client.py`
+  (`test_a_native_tool_call_survives_streaming`), `tests/test_llm_validation.py`
+  (`_parse_sse_tool_calls` / `_merge_tool_call` / `_render_accumulated_calls`).
+- **Probes and "test chat" take a model slot (B2).** `complete()`/`stream()`
+  held one; a capability probe or `POST /providers/{id}/test-chat` held none, so
+  pressing "test" mid-turn stacked a second generation onto the GPU the bound
+  protects. `services.llm_client.model_slot` is that same gate for callers
+  outside the agent path; a full queue is a stated `503` / `ok: false`, never a
+  probe result. Tests: `tests/test_llm_gate.py` (`TestModelSlot`).
+  *Not* done, deliberately: collapsing the per-`complete()` attempt budget into
+  one per *turn*. A turn is up to 8 iterations, each a legitimate model call;
+  one shared budget of 3 would strand iterations 2–8 exactly when a primary
+  model is rate-limited — the case the tool loop exists for. The per-request
+  budget plus the iteration cap already bound a turn.
+- **The engine's prose streams on a tool turn (C1).** `ToolAgent` forwards
+  `RESPONSE_CHUNK` to `stream_callback` only when the bus has no subscriber, and
+  `_ProgressRelay` *is* the subscriber — so the relay ignored the event and the
+  answer surfaced only in the final `message` frame. The relay now sends a
+  `token` frame for it. The two delivery paths are mutually exclusive by
+  construction, so this cannot double-deliver. Tests: `tests/test_sources.py`
+  (`TestTransportFrames`).
+- **Time-to-first-token is recorded (C3).** `AttemptRecord.ttft_ms` is set by
+  all three streaming readers (`_stream`, `_stream_registry`, `_stream_ollama`)
+  and rides both the `LLM_ATTEMPT` line and the `model.completed` payload. It is
+  0 on a blocking attempt, where a "first token" has no distinct meaning. Total
+  latency alone cannot tell a fast *reply* from a fast *request* that then sat
+  empty. Tests: `tests/test_llm_client.py::test_stream_records_time_to_first_token`,
+  `tests/test_model_routing_events.py::test_time_to_first_token_rides_the_same_event`.
+
+**A6 is done — the REST git/terminal destructive routes are bound to the
+approval-token channel.** The surfaces REST has no confirmation channel for
+(any web page can attempt a POST; CORS does not cover POST bodies) now use the
+two-step pattern the VM guest-exec route uses (`core/api/approvals.py`):
+
+- **`core/api/git_api.py`** — `/git/commit`, `/git/checkout`, `/git/push`,
+  `/git/merge` and `/git/restore` with `staged: false` (discard) are two-step.
+  Step 1 validates, checks containment with the **same** `resolve_workspace`
+  the service uses (403 before a token exists), mints a git-scoped
+  single-use token, and returns a preview frame
+  (`{requires_confirmation, confirm, action, tier, summary, note}`) with
+  **no effect**. Step 2 replays the params recorded at preview time — the
+  confirming body's own values are ignored, so an approved preview cannot be
+  replayed as a different message, ref or path — and reports failures through
+  the same `_fail` vocabulary (git's 409, "not a repository" 404, containment
+  403). A token minted by one verb is refused through another's route
+  (`pending["action"]` must match), and unknown/expired tokens are 409.
+  `/git/restore` with `staged: true` (unstage — reversible) stays single-step.
+  Preview `tier` comes from `tier_of` where a registry tool exists
+  (`git_commit/git_checkout/git_push`), literal `"confirm"` for
+  merge/restore. Token store: `ApprovalTokens(ttl=120, cap=256, prefix="git")`.
+- **`core/api/registry_api.py`** — `POST /terminal` is two-step with its own
+  store (`ttl=60, cap=64, prefix="term"`, so a terminal token cannot be spent
+  on a git verb). Preview time runs `split_command` (pure — no process), so a
+  chained or metacharacter command is a 403 **preview** and never reaches a
+  token: "refused outright" never wears the shape of "awaiting approval", and
+  `open()` re-runs the same check on the recorded command when it executes.
+  The recorded command is what runs; the confirming body's command/options
+  are ignored. A sandbox refusal at execute time is still `blocked → 403`.
+- **Frontend** — `api.js` forwards an optional `confirm` on the five git
+  functions and `openTerminal`; the preview frame flows out of the existing
+  `return data` path untouched. `GitPanel.run()` parks step-1 previews in a
+  `confirmRow` state and renders the server's own `summary` (dir="ltr" for
+  RTL safety) with CONFIRM/CANCEL — the CONFIRM click replays the parked
+  thunk with the token, and the token, not the panel's current input, decides
+  what runs. `TerminalPanel` does the same for the empty-state open, and
+  re-previews on a stale-token error. The four panel arg-assertion tests were
+  updated (`{path, confirm: null}`) and nine two-step tests added across
+  `tests/core/test_core_git.py::TestTheApprovalStep`,
+  `tests/core/test_api_core.py::TestTerminal` (single-use, surface-bound,
+  cross-surface 409, chained-never-gets-a-token, smuggled body ignored,
+  outside-path 403) and the two panel test files. Frontend `npm run verify`
+  is green: 707 tests, and the six new bilingual strings went into
+  `src/i18n/strings.js` (`git.*`, `terminal.*`, `common.cancel`) so the
+  inline-ternary ratchet did not grow.
+
+**C2** is deferred on measured evidence:
+`backend/scripts/measure_injection_resistance.py` drives the
+real engine against a stub `read_page` whose poisoned page orders the model to
+call a tool that does not exist (safe oracle — the registry refuses it by name),
+with a positive control delivering the same demand through the user's channel.
+On the reference machine (3B-Instruct, CPU-only): 0/2 clean control, **0/4 with
+the D1 rule, 0/4 without it, 3/3 through the user channel** — so instructions
+in tool output were not acted on even when nothing in the prompt said against
+it, and a fence would have added no measured protection for this model. The
+null is a property of the model, not of the architecture, which is exactly why
+the harness is kept: re-run it after any model change before revisiting C2.
 
 ## Notes
 

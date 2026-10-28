@@ -52,11 +52,20 @@ logger = logging.getLogger("Zaytoon.WSAuth")
 #: "Policy Violation"). The client must not retry blindly on this one.
 CLOSE_POLICY_VIOLATION = 1008
 
-#: Undocumented-but-observed: some browsers send the literal string ``null``
-#: as the origin of a ``file://`` page or a sandboxed iframe. It is not an
-#: origin, so it is treated as "no origin" and judged by address and token —
-#: never as an allow-listed value.
-_NULL_ORIGINS = {"null", ""}
+#: The literal string a browser sends for an **opaque origin** — a sandboxed
+#: iframe, a `data:` document, or a `file://` page. It is not an origin: it
+#: carries no host to match and, critically, a *remote* page can produce one
+#: while its TCP peer is still loopback (the sandboxed iframe targets
+#: `ws://127.0.0.1:8000`). So it is neither matched against the allow-list nor
+#: trusted by address alone — `authorize_websocket` admits it only as an
+#: authenticated device. This is why `origin_allowed("null", ...)` is False.
+#:
+#: Note the deliberate distinction from *no* Origin header at all (``""``): a
+#: native client — the websockets library, a CLI probe, the desktop shell's
+#: non-browser transports — sends none, and is judged by address and token as
+#: before. Conflating the two was the hole: an opaque browser origin was given
+#: a native client's trust.
+_OPAQUE_ORIGIN = "null"
 
 #: Defaults for a browser origin. Ports are matched as a range because the dev
 #: frontend (5173), ``vite preview`` (4173), the desktop host's pinned range
@@ -67,10 +76,8 @@ _NULL_ORIGINS = {"null", ""}
 _LOOPBACK_HOSTS = r"(?:localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)"
 _DEFAULT_ORIGIN_PATTERNS = (
     rf"^https?://{_LOOPBACK_HOSTS}(?::\d+)?$",
-    # The packaged desktop shell loads the UI from disk; Electron/pywebview
-    # variants report either no origin or ``null``, both handled above. A
-    # ``file://`` origin is accepted for the same reason a loopback one is:
-    # it can only be produced by software already running on this machine.
+    # A literal `file://` origin (as opposed to the opaque `null` a browser
+    # actually sends for a local file) can only be produced by a local client.
     r"^file://",
 )
 
@@ -206,12 +213,27 @@ def allowed_origin_patterns(config: Any) -> List[str]:
     return list(_DEFAULT_ORIGIN_PATTERNS) + extra_items
 
 
+def is_opaque_origin(origin: str) -> bool:
+    """True for a browser's opaque origin (``Origin: null``).
+
+    Distinct from an absent Origin (``""``), which means a non-browser client.
+    """
+    return bool(origin) and origin.strip().lower() == _OPAQUE_ORIGIN
+
+
 def origin_allowed(origin: str, config: Any) -> bool:
-    """Whether a browser-supplied ``Origin`` may open this socket."""
+    """Whether a browser-supplied ``Origin`` may open this socket.
+
+    An **absent** Origin (``""``) is a non-browser client and is allowed here;
+    it is judged by address and token instead. An **opaque** Origin (``null``)
+    is refused: it carries no authority to match, and a remote page can produce
+    one over a loopback peer. ``authorize_websocket`` admits an opaque origin
+    only when the client also presents a valid paired-device token.
+    """
     if not origin:
         return True  # not a browser; judged by address and token instead
-    if origin.lower() in _NULL_ORIGINS:
-        return True
+    if is_opaque_origin(origin):
+        return False
     for pattern in allowed_origin_patterns(config):
         try:
             if re.fullmatch(pattern, origin, flags=re.IGNORECASE):
@@ -253,13 +275,28 @@ def authorize_websocket(websocket: Any, config: Any) -> AuthDecision:
     host = peer_host(websocket)
     local = is_loopback(host)
 
-    if not origin_allowed(origin, config):
+    device_id, token = _token_from_handshake(websocket)
+
+    if is_opaque_origin(origin):
+        # `Origin: null` — a sandboxed iframe or a local file. A remote page
+        # can produce one while the TCP peer is still loopback, so it carries
+        # no authority on its own: it is admitted only as an authenticated
+        # device. A client that sends no Origin at all (below) is a native
+        # client and keeps the address/token path unchanged.
+        if not token:
+            logger.warning(
+                "Refused WebSocket handshake: opaque Origin %r without a "
+                "device token", origin,
+            )
+            return AuthDecision(
+                False, "Opaque origin requires a paired device", origin=origin
+            )
+    elif not origin_allowed(origin, config):
         logger.warning(
             "Refused WebSocket handshake: origin %r is not allow-listed", origin
         )
         return AuthDecision(False, "Origin not allowed", origin=origin)
 
-    device_id, token = _token_from_handshake(websocket)
     if token:
         from services.auth import PermissionScope, get_device_auth
 
@@ -317,6 +354,7 @@ __all__ = [
     "allowed_origin_patterns",
     "authorize_websocket",
     "is_loopback",
+    "is_opaque_origin",
     "new_session_id",
     "origin_allowed",
     "peer_host",

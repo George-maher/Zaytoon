@@ -156,15 +156,16 @@ class TestHudMapping:
     def test_accents_come_from_the_theme(self):
         # Deliberately literal: `allowed = set(theme.ACCENTS.values())` would be
         # `accent()` applied to itself and could never fail. The values are the
-        # accent's current ones (the reference's accent turned out to be magenta
-        # `#d946ef`, not the cyan `#22d3ee` this list used to assert), and updating
-        # them is the reviewable half of a palette change.
+        # accent's current ones (the reference's accent turned out to be the
+        # system cyan `#00f5ff` after the Figma retarget, following an earlier
+        # magenta `#d946ef` chapter), and updating them is the reviewable half
+        # of a palette change.
         #
         # Green is in the set on its own account. It used to be omitted because
         # CYAN and GREEN shared a value, so a distinct entry would have been
         # redundant; the reference-derived palette separates them, and
         # `listening` legitimately paints green.
-        allowed = {"#d946ef", "#35d399", "#f2b84b", "#ff6b6b", "#e879f9"}
+        allowed = {"#00f5ff", "#22c55e", "#f59e0b", "#ec4899", "#a855f7"}
         for state in UiState:
             assert states.accent(state).lower() in allowed, (state, states.accent(state))
         # The property that is not a restatement of `accent()`: the vocabulary of

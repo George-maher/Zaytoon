@@ -118,16 +118,68 @@ def build(*tools):
     return registry
 
 
-async def run_round(registry, first_reply):
-    """Run exactly one tool round; returns (result, llm)."""
+def _grant(name, params):
+    """An approval channel that approves — a channel must exist to proceed."""
+    return True
+
+
+async def run_round(registry, first_reply, approval=None):
+    """Run exactly one tool round; returns (result, llm).
+
+    The channel defaults to one that grants. A confirm-tier call with **no**
+    channel is refused by design (see
+    ``test_agent_engine.py::TestLoopApproval::test_no_approval_callback_means_a_blocked_tool_is_refused``),
+    so a test that wants a gated call to be a *barrier* has to satisfy the gate
+    it is asserting rather than sidestep it.
+    """
     llm = ScriptedLLM([first_reply, "finished"])
-    result = await AgentEngine(llm, registry).run("do the thing")
+    result = await AgentEngine(llm, registry).run(
+        "do the thing", approval=approval or _grant
+    )
     return result, llm
 
 
 # ---------------------------------------------------------------------------
 class TestSafeCallsRunTogether:
     async def test_three_safe_calls_cost_one_calls_worth_of_time(self):
+        """Three safe calls overlap; the wall time proves it *and* so does the order.
+
+        The original form of this test asserted an absolute `elapsed < 0.45`
+        for three 0.2 s sleeps. That is a claim about the machine as much as
+        about the engine: on a loaded box the same correct batch measured
+        0.47 s and failed, which is a test reporting its own host's load. Two
+        changes make it honest without weakening it.
+
+        * **The interleaving is the assertion.** Every probe appends to one
+          shared list, so "they ran together" is literally `start, start,
+          start, end, end, end`. That is deterministic, needs no clock, and is
+          a stronger statement than a stopwatch: a fast sequential run could
+          beat a wall-clock bound, but it can never produce that sequence.
+        * **The timing is calibrated, not guessed.** The baseline is the same
+          three probes with the same delay run through the *same engine* as
+          confirm-tier calls, which are barriers by design — so both numbers
+          carry the same per-round overhead and only the difference is being
+          judged. Overhead cancels; a loaded machine moves both figures.
+        """
+        # Baseline: identical work, forced sequential by the tier gate.
+        sequential_events = []
+        baseline_tools = [
+            _Probe(f"s{i}", sequential_events, tier="confirm", delay=0.2)
+            for i in range(3)
+        ]
+        sequential_started = asyncio.get_running_loop().time()
+        await run_round(
+            build(*baseline_tools),
+            "\n".join(call(t.name()) for t in baseline_tools),
+        )
+        sequential = asyncio.get_running_loop().time() - sequential_started
+        # Sanity: the baseline really is sequential, or the comparison is void.
+        assert sequential_events == [
+            ("start", "s0"), ("end", "s0"),
+            ("start", "s1"), ("end", "s1"),
+            ("start", "s2"), ("end", "s2"),
+        ]
+
         events = []
         tools = [_Probe(f"p{i}", events, delay=0.2) for i in range(3)]
         registry = build(*tools)
@@ -139,8 +191,21 @@ class TestSafeCallsRunTogether:
         elapsed = asyncio.get_running_loop().time() - started
 
         assert result.tool_calls == ["p0", "p1", "p2"]
-        # Sequential would be >= 0.6s plus overhead.
-        assert elapsed < 0.45, f"batch took {elapsed:.2f}s — still sequential?"
+        # Deterministic proof of overlap: no probe finished before its siblings
+        # started, so the three windows are one window.
+        assert events == [
+            ("start", "p0"), ("start", "p1"), ("start", "p2"),
+            ("end", "p0"), ("end", "p1"), ("end", "p2"),
+        ], f"probes did not overlap: {events}"
+
+        # Calibrated timing: three 0.2 s sleeps overlapped must save roughly two
+        # of them (0.4 s). A sequential batch saves none, so the margin is wide
+        # on both sides and does not depend on how fast this host is today.
+        saved = sequential - elapsed
+        assert saved > 0.25, (
+            f"batch saved only {saved:.2f}s of {sequential:.2f}s — "
+            f"elapsed {elapsed:.2f}s looks sequential"
+        )
 
     async def test_the_number_of_simultaneous_tools_is_capped(self):
         counter = {"active": 0, "peak": 0}

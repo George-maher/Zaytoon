@@ -37,10 +37,14 @@ describe("design token system", () => {
     expect(css).not.toMatch(/backdrop-filter:\s*blur/);
   });
 
-  it("keeps panel corners square", () => {
-    // A rounded panel is the single clearest "this is a card, not an
-    // instrument" signal.
-    expect(css).not.toMatch(/\.hud-panel\s*\{[^}]*border-radius/);
+  it("gives panels the reference's radius, not a square card", () => {
+    // The Figma Make reference (NEXUS AI) rounds every panel and tile —
+    // measured 14px on metric tiles, 16px on the dock. This ratchet used to
+    // pin the *previous* reference's square-cornered look; it now pins the
+    // radius to the shared scale so a component cannot invent its own.
+    const panel = css.slice(css.indexOf(".hud-panel {"));
+    const body = panel.slice(0, panel.indexOf("}"));
+    expect(body).toContain("border-radius: var(--radius-card)");
   });
 
   it("animates transforms and opacity, not layout properties", () => {

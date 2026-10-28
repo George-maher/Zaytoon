@@ -68,12 +68,15 @@ everything glows has no focal point.
 
 ## 2. Panel geometry
 
-Panels are **angular**, never rounded cards.
+Panels are **soft rectangles** — the Figma reference (NEXUS AI) rounds every
+panel and tile.
 
-- Border: 1px `--hud-edge`. No `border-radius` above 2px.
-- Corners: clipped via `clip-path` notch, or bracketed with 8px L-shaped
-  corner rules. The bracket is the default — it reads as instrumentation
-  rather than decoration.
+- Border: 1px `--hud-edge`. Radius comes from the shared scale
+  (`--radius-panel` 16px for shells, `--radius-card` 12px for panels/tiles,
+  10px chips, 14px action buttons); a component never invents its own.
+- Corners may additionally be bracketed with 8px L-shaped corner rules on
+  full-bleed instrument views; the bracket reads as instrumentation rather
+  than decoration.
 - Fill: `--hud-deep` at 0.72 alpha over the void, **no** `backdrop-filter`.
   Panels are meant to look like glass over a dark instrument bay, which the
   reference achieves with flat fill plus a 1px lit edge, not with blur.

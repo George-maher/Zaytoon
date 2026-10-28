@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from domain.models import Intent
+from config import config
 from scheduler.parser import TimeParser
 from reminder.service import ReminderService
 from reminder.notification import NotificationManager
@@ -69,6 +70,16 @@ class AgentService:
         what lets the UI show "Creating the project" / "Running tests" while a
         multi-step tool turn is in flight, instead of a single spinner.
         """
+        # The hard ceiling on the history the transport hands in, applied
+        # *before* the per-agent windows below. Those windows (the last 2–4
+        # turns) are about one reply's prompt size; this is the bound for the
+        # list itself, and `MAX_CONTEXT_MESSAGES` was a config knob nothing
+        # read. Short-term memory holds up to 100 entries, so this genuinely
+        # caps what reaches a model on a long session.
+        ceiling = int(getattr(config, "MAX_CONTEXT_MESSAGES", 0) or 0)
+        if ceiling > 0 and context and len(context) > ceiling:
+            context = context[-ceiling:]
+
         if intent == Intent.ACTION.value or intent == Intent.TOOLS.value:
             return await self.tool.process(
                 message, context[-4:],

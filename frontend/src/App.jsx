@@ -18,7 +18,7 @@ import ReminderPanel from "./components/ReminderPanel";
 import SettingsPanel from "./components/SettingsPanel";
 import SetupWizard from "./components/providers/SetupWizard";
 import WorkspaceShell from "./components/workspace/WorkspaceShell";
-import HomeScreen from "./components/HomeScreen";
+import NexusDashboard from "./components/nexus/NexusDashboard";
 import ComputerView from "./components/ComputerView";
 import TaskFlowView from "./components/TaskFlowView";
 import AIFloatingBar from "./components/AIFloatingBar";
@@ -127,6 +127,7 @@ export default memo(function App() {
   const {
     messages, isConnected, everConnected, isTyping, status, language, setLanguage,
     subtitle, voiceMode, awaitingCommand, isListening, isSpeaking, reminders,
+    voiceState, stopRecording, cancelVoiceCommand,
     sendMessage, sendReminderCmd, refreshReminders, clearChat,
     startVoiceMode, stopVoiceMode, pendingConfirmation, respondToConfirmation,
     speakingVoice, plan, activeTool, activity, intent, requestStop,
@@ -192,6 +193,29 @@ export default memo(function App() {
     },
     [wide],
   );
+
+  /**
+   * The mic's off-click means two different things, and conflating them is how
+   * both halves broke: while speech is being captured it must *finish* the
+   * utterance (send it, keep listening), and while the listener is idle it must
+   * turn the listener off. Discarding a finished sentence loses the command;
+   * sending a half-spoken one turns "stop" into a ghost turn.
+   */
+  const handleVoiceStop = useCallback(() => {
+    if (isListening) stopRecording();
+    else stopVoiceMode();
+  }, [isListening, stopRecording, stopVoiceMode]);
+
+  /**
+   * STOP. A voice turn is cancelled through the voice channel, which also
+   * returns the microphone to standby; a typed turn uses the plain interrupt.
+   * Using the plain interrupt during a voice turn left the client's capture
+   * gate latched in PROCESSING until the server's own frame happened to land.
+   */
+  const handleStop = useCallback(() => {
+    if (voiceMode) cancelVoiceCommand();
+    else requestStop();
+  }, [voiceMode, cancelVoiceCommand, requestStop]);
 
   // Which strip button reads as active: the inspector when wide, the shared
   // drawer tab when not. Centre jumps have no persistent panel and so never
@@ -308,9 +332,10 @@ export default memo(function App() {
       isSpeaking,
       isTyping,
       pendingConfirmation,
+      voiceState,
       language,
     });
-  }, [messages, isConnected, everConnected, status, intent, plan, activeTool, isSpeaking, isTyping, pendingConfirmation, language]);
+  }, [messages, isConnected, everConnected, status, intent, plan, activeTool, isSpeaking, isTyping, pendingConfirmation, voiceState, language]);
 
   // Hue for the line: amber while blocked on a person, red without a link,
   // cyan while the system is simply working.
@@ -426,17 +451,24 @@ export default memo(function App() {
       <div className="hud-ticks" aria-hidden="true" />
       <div className="hud-scan" aria-hidden="true" />
 
-      {/* Sidebar — the product's only navigation. */}
-      <Sidebar
-        view={screen}
-        language={language}
-        onNavigate={navigate}
-        onOpenProject={handleOpenProject}
-        isConnected={isConnected}
-      />
+      {/* Sidebar — the product's only navigation. On HOME the Nexus dashboard
+          is its own navigator (its dock), so the rail stands aside there. */}
+      {screen !== VIEWS.HOME && (
+        <Sidebar
+          view={screen}
+          language={language}
+          onNavigate={navigate}
+          onOpenProject={handleOpenProject}
+          isConnected={isConnected}
+        />
+      )}
 
       {/* ---------------------------------------------------------------- */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
+      {/* On HOME the Nexus dashboard owns the whole deck — its top bar and
+          dock replace the shell chrome, by design. Any other screen keeps the
+          chrome below unchanged. */}
+      {screen !== VIEWS.HOME && (
       <header
         className="flex-none flex items-center justify-between"
         style={{
@@ -479,6 +511,7 @@ export default memo(function App() {
           <StatusIndicator state={state} language={language} compact={narrow} />
         </div>
       </header>
+      )}
 
       {/* ---------------------------------------------------------------- */}
       <ViewTransition viewKey={screen} className="flex-1 flex flex-col min-h-0">
@@ -579,13 +612,14 @@ export default memo(function App() {
             isConnected={isConnected}
             language={language}
             onVoiceStart={startVoiceMode}
-            onVoiceStop={stopVoiceMode}
+            onVoiceStop={handleVoiceStop}
             voiceMode={voiceMode}
+            voiceState={voiceState}
             isListening={isListening}
             subtitle={subtitle}
             statusText={statusText}
             statusTone={statusTone}
-            onStop={requestStop}
+            onStop={handleStop}
             onSettingsToggle={() => setSettingsOpen((v) => !v)}
             settingsOpen={settingsOpen}
             onLanguageToggle={() => setLanguage((l) => (l === "en" ? "ar" : "en"))}
@@ -608,9 +642,10 @@ export default memo(function App() {
           activity={activity}
           onSend={sendMessage}
           onVoiceStart={startVoiceMode}
-          onVoiceStop={stopVoiceMode}
+          onVoiceStop={handleVoiceStop}
           voiceMode={voiceMode}
-          onStop={requestStop}
+          voiceState={voiceState}
+          onStop={handleStop}
           isSpeaking={isSpeaking}
           pendingConfirmation={pendingConfirmation}
         />
@@ -635,18 +670,34 @@ export default memo(function App() {
       ) : screen === VIEWS.MODELS ? (
         <ModelsView language={language} />
       ) : (
-        <HomeScreen
+        <NexusDashboard
           language={language}
           isConnected={isConnected}
+          state={state}
+          isListening={isListening}
+          isSpeaking={isSpeaking}
+          isTyping={isTyping}
+          messages={messages}
+          sendMessage={sendMessage}
+          startVoiceMode={startVoiceMode}
+          stopVoiceMode={stopVoiceMode}
+          voiceMode={voiceMode}
+          voiceState={voiceState}
+          requestStop={requestStop}
+          clearChat={clearChat}
           onOpenFolder={handleOpenFolder}
           onOpenFile={handleOpenFile}
           onOpenProject={handleOpenProject}
-          onSendCommand={sendMessage}
           onOpenCommands={() => setPaletteOpen(true)}
-          onVoiceStart={startVoiceMode}
-          onVoiceStop={stopVoiceMode}
-          voiceMode={voiceMode}
-          isBusy={isTyping || isSpeaking}
+          onSettingsToggle={() => setSettingsOpen((v) => !v)}
+          onNavigate={navigate}
+          remindersProps={{
+            reminders,
+            onRefresh: refreshReminders,
+            onDelete: (id) => sendReminderCmd("delete", id),
+            onDone: (id) => sendReminderCmd("done", id),
+            language,
+          }}
         />
       )}
       </ViewTransition>
@@ -654,9 +705,10 @@ export default memo(function App() {
       {/* Every screen can be talked to, and the guarantee is structural: App
           mounts this rather than each screen doing so, so a destination added
           later gets a composer by default instead of by remembering. Home has
-          its prompt and the workspace has the console — there the strip would
-          be a second field for the same job, which is why it is absent. */}
-      {screen !== VIEWS.HOME && screen !== VIEWS.WORKSPACE && (
+          its prompt, the workspace has the console, and Chat carries its own
+          multiline composer — there the strip would be a second field for the
+          same job, which is why it is absent. */}
+      {screen !== VIEWS.HOME && screen !== VIEWS.CHAT && screen !== VIEWS.WORKSPACE && (
         <AIFloatingBar
           language={language}
           isConnected={isConnected}
@@ -664,9 +716,10 @@ export default memo(function App() {
           statusTone={statusTone}
           onSend={sendMessage}
           onVoiceStart={startVoiceMode}
-          onVoiceStop={stopVoiceMode}
+          onVoiceStop={handleVoiceStop}
           voiceMode={voiceMode}
-          onStop={requestStop}
+          voiceState={voiceState}
+          onStop={handleStop}
           busy={isTyping || isSpeaking || !!pendingConfirmation}
         />
       )}

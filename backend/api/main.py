@@ -1,10 +1,12 @@
 import os
 import re
+import json
 import time
 import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict
 
@@ -24,11 +26,17 @@ from scheduler import SchedulerManager
 from reminder import ReminderService, NotificationManager
 from tools.base import OSToolkit
 from tools.executor import ToolExecutor, build_shortcut_index, resolve_app_detail
+from tools.sandbox import APP_LAUNCH_ALLOWLIST
 from config import config, PROVIDER_OLLAMA, TIER_FAST, TIER_REASONING
 from arabic import detect_language, get_tts_voice, clean_and_detect
 from agents.base_agent import close_shared_client
 from services.auth import get_device_auth, PermissionScope
-from services.llm_client import get_llm_client, llm_gate
+from services.llm_client import (
+    AllModelsUnavailableError,
+    get_llm_client,
+    llm_gate,
+    model_slot,
+)
 from services.ai_provider import get_provider, OllamaProvider
 from tools.safety import ConfirmationManager, RiskAssessor
 from tools.metrics import get_tool_metrics
@@ -64,6 +72,19 @@ from core.orchestrator import Orchestrator
 from core.providers import ensure_builtins as ensure_builtin_providers
 from core.skills import sync_to_db as sync_skills_to_db
 from core.workspace.terminal import get_manager as get_terminal_manager
+from core.discovery import (
+    DeviceDiscoveryCoordinator,
+    PermissionManager,
+    DeviceInventoryRepository,
+    FirstRunOnboarding,
+    generate_device_identifier,
+)
+from core.inventory import (
+    DeviceInventory,
+    DeviceInventoryRepository as InventoryRepository,
+    default_inventory,
+    inventory_state,
+)
 
 logger = logging.getLogger("Zaytoon")
 
@@ -95,6 +116,32 @@ notification_mgr = NotificationManager()
 reminder_service = ReminderService(memory_agent)
 
 scheduler = SchedulerManager(reminder_service, notification_mgr)
+
+# ---------------------------------------------------------------------------
+# Request resource limits.
+#
+# These routes are reachable without a session and are the two that hand work
+# to a heavy local model (Whisper / edge-tts) or write to a JSON blob. The
+# limits are explicit constants rather than config knobs because a missing env
+# var must not silently remove a bound — the WebSocket path has its own
+# (`TTS_TIMEOUT`, `MAX_MESSAGE_LENGTH`); these close the REST gap.
+# ---------------------------------------------------------------------------
+
+#: Upload cap for `POST /stt`. 25 MB is several minutes of the webm/opus audio
+#: the browser recorder produces; the point is a ceiling, not a target.
+MAX_STT_UPLOAD_BYTES = 25 * 1024 * 1024
+#: Deadline for one transcription. Whisper on CPU can take tens of seconds for
+#: a long clip; past this the request is refused rather than left hanging.
+STT_TIMEOUT_S = 120.0
+#: Characters accepted by `POST /tts`. A spoken reply is a sentence or three;
+#: the cap stops an unbounded string reaching the synthesiser.
+MAX_TTS_CHARS = 4000
+#: Deadline for one synthesis.
+TTS_TIMEOUT_S = 60.0
+#: Preference-blob bounds for `POST /preferences`.
+MAX_PREFERENCE_KEYS = 200
+MAX_PREFERENCE_KEY_CHARS = 128
+MAX_PREFERENCE_VALUE_BYTES = 16 * 1024
 
 # One live registry for the whole process: `GET /tools`, `/health`'s
 # `tools_loaded`, the agent's tool catalogue and every execution all read the
@@ -256,6 +303,40 @@ async def lifespan(app):
             )
     except Exception as e:
         safe_error(e, operation="startup.skill_tools", component="api.startup")
+
+    # Device discovery and inventory setup
+    try:
+        device_id = generate_device_identifier()
+        pm = PermissionManager()
+        repo = InventoryRepository()
+        
+        # Check if we have a saved inventory for this device
+        saved_inventory = asyncio.get_event_loop().run_until_complete(
+            repo.load(device_id)
+        )
+        
+        if saved_inventory is not None:
+            logger.info("Loaded existing device inventory from %s", device_id)
+            # Update last scan time
+            asyncio.get_event_loop().run_until_complete(
+                repo.save(saved_inventory, device_id)
+            )
+        else:
+            # First run: run onboarding to discover the device
+            logger.info("First-run device onboarding for %s", device_id)
+            onboarding = FirstRunOnboarding(pm, repo)
+            inventory = asyncio.get_event_loop().run_until_complete(
+                onboarding.run_onboarding()
+            )
+            # Save the initial inventory
+            asyncio.get_event_loop().run_until_complete(
+                repo.save(inventory, device_id)
+            )
+            logger.info("Initial device inventory saved with %d applications, %d projects",
+                       len(inventory.applications), len(inventory.projects))
+    except Exception as e:
+        safe_error(e, operation="startup.discovery", component="api.startup")
+        logger.warning("Device discovery initialization failed, continuing with limited capabilities")
 
     # Skill changes take effect at runtime: enable, disable and delete all
     # publish `SKILL_CHANGED`, and this subscriber re-syncs the skill tool
@@ -780,8 +861,29 @@ async def mark_reminder_done(task_id: int):
 
 @app.post("/stt")
 async def speech_to_text_endpoint(file: UploadFile = File(...), language: str | None = None):
-    audio_data = await file.read()
-    text = stt.transcribe(audio_data, language=language)
+    # Bounded before it is read: the previous version held the whole upload in
+    # memory (``await file.read()`` with no limit) and then transcribed it
+    # synchronously on the event loop, so one large body could exhaust memory
+    # *and* stall every other task for the length of the transcription. Read
+    # one byte past the cap so "over" is distinguishable from "exactly at".
+    raw = await file.read(MAX_STT_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_STT_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"Audio upload too large. Max {MAX_STT_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    loop = asyncio.get_running_loop()
+    try:
+        text = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: stt.transcribe(raw, language=language)
+            ),
+            timeout=STT_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504, f"Transcription did not finish within {int(STT_TIMEOUT_S)}s."
+        ) from None
     detected = detect_language(text) if text else "en"
     return {"text": text, "detected_language": detected}
 
@@ -843,8 +945,23 @@ async def text_to_speech_endpoint(data: dict):
     lang = data.get("lang") or data.get("language") or detect_language(text) or "en"
     if not text:
         return Response(content=b"", status_code=400)
+    # Bounded input and a deadline: the WebSocket path has both
+    # (`TTS_TIMEOUT`), this REST path had neither, so an unbounded string was
+    # handed to the synthesiser with no way to give up on it.
+    if len(text) > MAX_TTS_CHARS:
+        raise HTTPException(
+            413, f"Text too long for speech. Max {MAX_TTS_CHARS} characters."
+        )
     voice = get_tts_voice(lang)
-    audio = await tts.synthesize(text, voice=voice, rate=config.TTS_RATE, volume=config.TTS_VOLUME)
+    try:
+        audio = await asyncio.wait_for(
+            tts.synthesize(text, voice=voice, rate=config.TTS_RATE, volume=config.TTS_VOLUME),
+            timeout=TTS_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504, f"Speech synthesis did not finish within {int(TTS_TIMEOUT_S)}s."
+        ) from None
     if not audio:
         return Response(content=b"", status_code=503)
     return Response(content=audio, media_type="audio/mpeg")
@@ -857,7 +974,16 @@ async def get_preferences():
 
 @app.post("/preferences")
 async def set_preferences(data: dict):
+    # Bounded: the key/value store is a JSON blob. Accepting an unbounded body
+    # let a caller write arbitrarily many, arbitrarily large entries (and store
+    # non-JSON values).
+    if len(data) > MAX_PREFERENCE_KEYS:
+        raise HTTPException(413, f"Too many preference keys. Max {MAX_PREFERENCE_KEYS}.")
     for key, value in data.items():
+        if len(str(key)) > MAX_PREFERENCE_KEY_CHARS:
+            raise HTTPException(422, "Preference key too long.")
+        if len(json.dumps(value, default=str)) > MAX_PREFERENCE_VALUE_BYTES:
+            raise HTTPException(413, f"Preference '{key}' value too large.")
         await user_prefs.set(key, value)
     return {"status": "saved"}
 
@@ -901,6 +1027,77 @@ async def set_workspace(data: dict):
         "note": note,
         "persisted": persisted,
         **config.describe_workspace(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Device discovery and permissions
+# ---------------------------------------------------------------------------
+
+@app.get("/device/inventory")
+async def get_device_inventory():
+    """Get the device's most recently stored inventory.
+
+    The repository is async, so the endpoint awaits it. The previous version
+    called ``loop.run_until_complete`` *inside* a running event loop, which
+    raises ``RuntimeError: This event loop is already running`` — the route
+    could not answer at all, which is why no client had ever seen an inventory
+    through it.
+    """
+    from core.discovery import DeviceInventoryRepository, generate_device_identifier
+
+    repo = DeviceInventoryRepository()
+    inventory = await repo.load(generate_device_identifier())
+    if inventory is None:
+        return {
+            "inventory": None,
+            "message": "No inventory found. Run a discovery scan first.",
+        }
+    return {"inventory": asdict(inventory)}
+
+
+@app.get("/device/permissions")
+async def get_device_permissions():
+    """Get the discovery permission grants for this device."""
+    from core.discovery import PermissionManager
+    from core.discovery import PermissionScope as DiscoveryScope
+
+    pm = PermissionManager()
+    return {
+        "permissions": pm.list_scopes(),
+        "scopes": DiscoveryScope.all_scopes(),
+    }
+
+
+@app.get("/device/discovery-status")
+async def get_device_discovery_status():
+    """Report whether a scan exists, without performing one.
+
+    A status read must not be a scan: this route used to run the full discovery
+    pipeline on every poll (Start Menu walk, registry enumeration, process
+    list) and then crashed because ``generate_device_identifier`` and the
+    discovery ``PermissionScope`` were never imported. The scan belongs to an
+    explicit request; this answers what is already known.
+    """
+    from core.discovery import (
+        DeviceInventoryRepository,
+        PermissionManager,
+        PermissionScope as DiscoveryScope,
+        generate_device_identifier,
+    )
+    from core.inventory import InventoryState
+
+    device_id = generate_device_identifier()
+    repo = DeviceInventoryRepository()
+    inventory = await repo.load(device_id)
+    pm = PermissionManager()
+    scopes = pm.list_scopes()
+    return {
+        "device_id": device_id,
+        "state": InventoryState.READY if inventory else InventoryState.NOT_SCANNED,
+        "discovery_scopes": DiscoveryScope.all_scopes(),
+        "granted_scopes": {k: v for k, v in scopes.items() if v},
+        "inventory": asdict(inventory) if inventory else None,
     }
 
 
@@ -1185,6 +1382,24 @@ async def pull_status(model: str = ""):
     }
 
 
+async def _probe_capabilities_gated(client, model: str):
+    """Probe a model's capabilities holding one process-wide model slot.
+
+    ``probe_capabilities`` runs two real generations (a stream and a tool
+    call), so it belongs behind the same :data:`model_slot` the agent path
+    takes. Without it, pressing "probe" during a turn stacked a second
+    generation onto the GPU the bound exists to protect. A full queue is
+    reported as the honest 503 it is, not as a probe failure.
+    """
+    from services.llm_client import model_slot
+
+    try:
+        async with model_slot():
+            return await client.probe_capabilities(model)
+    except AllModelsUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
 @app.post("/settings/ai/probe")
 async def probe_model(data: dict):
     """Probe a model's real capabilities and record them in the registry.
@@ -1251,7 +1466,7 @@ async def probe_model(data: dict):
                 f"Model {wanted} is not installed on {base_url} — pull it "
                 "first with POST /settings/ai/pull",
             )
-        caps = await client.probe_capabilities(installed)
+        caps = await _probe_capabilities_gated(client, installed)
     finally:
         await client.aclose()
 
@@ -1453,15 +1668,11 @@ async def update_device_scope(device_id: str, data: dict):
     return perm.to_dict()
 
 
-APP_WHITELIST = [
-    "chrome", "google chrome", "firefox", "edge", "microsoft edge",
-    "vscode", "vs code", "visual studio code",
-    "notepad", "notepad++", "calculator", "cmd", "powershell",
-    "terminal", "command prompt", "file explorer", "explorer",
-    "spotify", "discord", "slack", "zoom", "teams", "microsoft teams",
-    "outlook", "word", "excel", "powerpoint", "paint", "regedit",
-    "task manager", "control panel", "settings", "fxsound",
-]
+#: The launch allow-list, imported rather than re-declared. It lives in
+#: `tools.sandbox` beside `sanitize_app_name`/`validate_app_target` so the
+#: agent's `open_app` tool, this route and the Computer view all read one set:
+#: a second copy here is how the tool came to launch names the route refused.
+APP_WHITELIST = sorted(APP_LAUNCH_ALLOWLIST)
 
 #: Display metadata for the allow-list above.
 #:

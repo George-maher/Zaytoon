@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -112,11 +113,16 @@ def _deps(captured: dict):
 
 
 def _audio_frame(hint):
-    """Exactly the frame the browser client builds (`useWebSocket.js`)."""
+    """The frame the browser client builds (`useWebSocket.js`) after the voice fix.
+
+    It used to carry ``isManualVoice: True`` on every VAD segment, which is what
+    made the server's wake-word gate a decoration. The client no longer claims
+    the manual path; ``utterance_id`` is what makes a resend idempotent.
+    """
     frame = {
         "type": "audio",
         "audio": base64.b64encode(b"x" * 400).decode(),
-        "isManualVoice": True,
+        "utterance_id": uuid.uuid4().hex,
     }
     if hint is not None:
         frame["language"] = hint
@@ -163,7 +169,10 @@ async def _run_audio_turn(*, hint, stt_result):
 
 
 ARABIC = TranscriptionResult(
-    text="عامل إيه يا زيتون",
+    # The wake word leads, because the gate is on by default in this config and
+    # ordinary speech must not dispatch. The assertion under test is the
+    # language handshake, not the gate (that lives in test_voice_session.py).
+    text="زيتون عامل إيه",
     language="ar",
     detected=False,  # the client sent a hint, so this is False by definition
     duration=1.4,

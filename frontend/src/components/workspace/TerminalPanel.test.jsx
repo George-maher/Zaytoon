@@ -65,6 +65,67 @@ describe("TerminalPanel", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("previews a command first and runs it only on the token", async () => {
+    const onOpen = vi.fn(async (command, _cwd, confirm) =>
+      confirm
+        ? { id: "s1" }
+        : {
+            requires_confirmation: true,
+            confirm: "term_t1",
+            action: "terminal",
+            tier: "confirm",
+            command,
+            summary: `Open a terminal session that runs: ${command}`,
+            note: "Nothing has run yet. Confirming starts this command.",
+          },
+    );
+    const handlers = renderPanel({ onOpen });
+    const prevWatch = handlers.onWatch;
+    const input = screen.getByLabelText("New command");
+    fireEvent.change(input, { target: { value: "npm run dev" } });
+    fireEvent.submit(input.closest("form"));
+
+    // The preview is visible and the input is still there; nothing to watch.
+    expect(await screen.findByRole("alertdialog")).toHaveTextContent(
+      "Open a terminal session that runs: npm run dev",
+    );
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(prevWatch).not.toHaveBeenCalled();
+
+    // RUN reproduces the previewed command with the server's token, not
+    // whatever the input happens to hold now.
+    fireEvent.change(input, { target: { value: "rm -rf /" } });
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    await waitFor(() =>
+      expect(onOpen).toHaveBeenLastCalledWith("npm run dev", "", "term_t1"),
+    );
+    await waitFor(() => expect(prevWatch).toHaveBeenCalledWith("s1"));
+    // The previewed command was the approved one — the input's text never ran.
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancelling a preview runs nothing and drops the token", async () => {
+    const onOpen = vi.fn(async () => ({
+      requires_confirmation: true,
+      confirm: "term_t2",
+      action: "terminal",
+      tier: "confirm",
+      command: "npm run dev",
+      summary: "Open a terminal session that runs: npm run dev",
+      note: "Nothing has run yet. Confirming starts this command.",
+    }));
+    const handlers = renderPanel({ onOpen });
+    const input = screen.getByLabelText("New command");
+    fireEvent.change(input, { target: { value: "npm run dev" } });
+    fireEvent.submit(input.closest("form"));
+    await screen.findByRole("alertdialog");
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(handlers.onWatch).not.toHaveBeenCalled();
+  });
+
   it("shows a refusal in the backend's own words and keeps the input", async () => {
     const handlers = renderPanel({
       onOpen: vi.fn(async () => ({ error: "Command chaining is not allowed" })),

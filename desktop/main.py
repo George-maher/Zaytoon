@@ -3,13 +3,23 @@
 
     python desktop/main.py                # normal launch
     python desktop/main.py --diagnose     # print what it can see, then exit
+    python desktop/main.py --diagnose --start-backend
+                                          # diagnose, and spawn the backend so
+                                          # the health answer is a real one
     python desktop/main.py --no-backend   # never spawn FastAPI
     python desktop/main.py --dev          # connect to Vite dev server
+    Zaytoon.exe --serve                   # packaged: run ONLY the backend
 
 The desktop application hosts the React/Vite UI through a native WebView
 (pywebview + WebView2 on Windows). The React app is the primary interface;
 this host provides native window management, backend lifecycle, and OS
 integration through a secure bridge.
+
+A packaged build is one executable with two roles: launching it normally opens
+the window, and ``--serve`` — the mode the shell spawns for itself — runs the
+FastAPI backend in-process. There is no second artifact whose path could go
+stale, and an installed machine needs no checkout, no virtualenv and no system
+Python.
 """
 
 from __future__ import annotations
@@ -25,11 +35,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import __version__  # noqa: E402
 from app.backend import (  # noqa: E402
+    BackendProcess,
+    backend_health,
     backend_is_up,
     resolve_backend_command,
-    wait_for_backend,
 )
-from app.config import DesktopConfig, default_repo_root  # noqa: E402
+from app.config import (  # noqa: E402
+    DesktopConfig,
+    bundle_dir,
+    default_repo_root,
+    default_state_dir,
+    is_frozen,
+)
 from app.host import WEBVIEW2_DOWNLOAD_URL, webview2_runtime_present  # noqa: E402
 
 
@@ -41,89 +58,347 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-def _diagnose(config: DesktopConfig) -> int:
-    """Print everything a first-run problem could be, then report a verdict."""
+# ---------------------------------------------------------------------------
+# Frozen-build bootstrap and the backend-worker role
+# ---------------------------------------------------------------------------
+def _bootstrap_frozen_home() -> None:
+    """Point every backend subsystem at per-user state before they read env.
+
+    A frozen build has no writable checkout: ``backend/data`` would resolve to
+    ``<install>/_internal/backend/data``, which is read-only under Program
+    Files and wiped by a repair. ``ZAYTOON_HOME`` selects the portable layout
+    (``Data/ Config/ Logs/ …``) under the platform state directory instead, and
+    ``DATABASE_URL`` is set to an **absolute** path because backend config
+    resolves a relative SQLite URL against the process cwd — which differs
+    between this process and the backend worker it spawns.
+
+    Idempotent (``setdefault`` everywhere) and a no-op outside frozen builds, so
+    a development checkout keeps its ``backend/data`` behaviour exactly.
+    """
+    if not is_frozen():
+        return
+    home = default_state_dir()  # honours an explicit ZAYTOON_HOME, else platform dir
+    os.environ.setdefault("ZAYTOON_HOME", str(home))
+    data_dir = home / "Data"
+    os.environ.setdefault("DATABASE_URL", f"sqlite:///{data_dir / 'zaytoon.db'}")
+
+
+def _serve_backend() -> int:
+    """Backend-worker mode: run the FastAPI app in this process, then block.
+
+    Frozen builds ship the backend's own ``.py`` files as *data* and import
+    them straight from the file tree. Baking the backend into the frozen module
+    graph instead would require PyInstaller to predict the entire backend
+    import closure, and every module it missed would be an import error on a
+    user's machine that no test in this repository — which all import from
+    source — could see.
+
+    The import is by **path**, not by name: when the shell runs as a script this
+    module is already called ``main``, so a plain ``import main`` would hand
+    back this very file.
+    """
+    _bootstrap_frozen_home()  # also when `Zaytoon.exe --serve` is run standalone
+
+    if is_frozen():
+        backend_cwd = (bundle_dir() or Path(sys.executable).resolve().parent) / "backend"
+    else:
+        backend_cwd = default_repo_root() / "backend"
+    main_py = backend_cwd / "main.py"
+    if not main_py.exists():
+        print(f"backend worker: no backend entry point at {main_py}", file=sys.stderr)
+        return 3
+
+    # The shell may be configured on a non-default port; the backend reads
+    # BACKEND_HOST/BACKEND_PORT, so translate before its config is imported.
+    # An explicit BACKEND_PORT still wins — setdefault, not assignment.
+    addr = os.environ.get("ZAYTOON_BACKEND_ADDR", "")
+    host_part, _, port_part = addr.rpartition(":")
+    if host_part and port_part.isdigit():
+        os.environ.setdefault("BACKEND_HOST", host_part)
+        os.environ.setdefault("BACKEND_PORT", port_part)
+
+    # The backend assumes it is launched from its own directory (sys.path and
+    # relative data paths), exactly as `cd backend && python main.py` does.
+    os.chdir(backend_cwd)
+    sys.path.insert(0, str(backend_cwd))
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("zaytoon_backend_main", main_py)
+    if spec is None or spec.loader is None:
+        print(f"backend worker: cannot load {main_py}", file=sys.stderr)
+        return 3
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - report, do not traceback into a log file
+        print(f"backend worker: importing the backend failed: {exc!r}", file=sys.stderr)
+        return 4
+
+    # backend/main.py binds these itself when run directly; here uvicorn is
+    # handed the app *object* so nothing re-imports by name.
+    configure = getattr(module, "configure_logging", None)
+    if callable(configure):
+        configure()
+
+    backend_config = getattr(module, "config", None)
+    host = getattr(backend_config, "BACKEND_HOST", None) or "127.0.0.1"
+    port = getattr(backend_config, "BACKEND_PORT", None) or 8000
+
+    try:
+        import uvicorn
+    except ImportError as exc:
+        print(f"backend worker: uvicorn is not bundled ({exc})", file=sys.stderr)
+        return 4
+
+    uvicorn.run(
+        module.app,
+        host=host,
+        port=int(port),
+        log_level=(os.environ.get("LOG_LEVEL", "info") or "info").lower(),
+        reload=False,
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+def _probe_health(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> dict | None:
+    """The parsed ``GET /health`` body, or ``None`` if nothing healthy answers.
+
+    A listener is not health. The backend can hold the port while its app is
+    still importing modules, its lifespan has not run, or a *different* process
+    (an old install, an unrelated service) is answering. Uses only the standard
+    library: this module is the desktop shell, whose bundle must not gain an
+    HTTP-client dependency for one GET request.
+    """
+    import json
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(f"http://{host}:{port}/health", timeout=timeout) as response:  # noqa: S310 - loopback from config
+            if response.status != 200:
+                return None
+            body = response.read(64 * 1024)
+        parsed = json.loads(body.decode("utf-8", "replace"))
+        return parsed if isinstance(parsed, dict) else {"status": "ok"}
+    except Exception:  # noqa: BLE001 - every failure class means "not healthy"
+        return None
+
+
+def _check_frontend_assets(dist, frozen: bool) -> tuple[str, str]:
+    """Check the production build, including that its own assets resolve.
+
+    An ``index.html`` whose ``src=/assets/app-abc.js`` is missing renders a
+    blank window with no error anywhere, so the referenced files are checked
+    too — not merely that ``index.html`` exists.
+    """
+    import re
+
+    if not dist:
+        return ("FAIL" if frozen else "WARN", "frontend dist: not configured")
+    dist = Path(dist)
+    if not dist.exists():
+        return ("FAIL" if frozen else "WARN",
+                f"frontend dist: not found at {dist} (run `npm run build` in frontend/)")
+    index = dist / "index.html"
+    if not index.exists():
+        return ("FAIL" if frozen else "WARN", f"frontend dist: no index.html at {dist}")
+    try:
+        text = index.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return "FAIL", f"frontend dist: index.html is unreadable ({exc})"
+    missing = []
+    for ref in re.findall(r'(?:src|href)=["\']([^"\']+)["\']', text):
+        if ref.startswith(("http://", "https://", "data:", "#", "mailto:")):
+            continue
+        if not (dist / ref.lstrip("/")).exists():
+            missing.append(ref)
+    if missing:
+        return ("FAIL" if frozen else "WARN",
+                f"frontend dist: {len(missing)} referenced file(s) missing, "
+                f"e.g. {missing[:3]} — this is a blank window")
+    size_kb = sum(f.stat().st_size for f in dist.rglob("*") if f.is_file()) // 1024
+    return "PASS", f"frontend dist: production build at {dist} ({size_kb} KB)"
+
+
+def _check_writable(path, label: str) -> tuple[str, str]:
+    """Report whether ``path`` could be created and written — without creating it.
+
+    The probe writes (and removes) a file in the nearest existing ancestor:
+    that is exactly the question ``mkdir -p`` asks a moment later, and answering
+    it here leaves no directory behind on a machine that only ran a diagnosis.
+    """
+    target = Path(path)
+    probe_in = target
+    while not probe_in.exists():
+        parent = probe_in.parent
+        if parent == probe_in:
+            return "FAIL", f"{label}: no existing parent for {target}"
+        probe_in = parent
+    if not probe_in.is_dir():
+        return "FAIL", f"{label}: {probe_in} exists but is not a directory"
+    probe = probe_in / f".zaytoon-write-probe-{os.getpid()}"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return "FAIL", f"{label}: not writable ({probe_in}): {exc}"
+    return "PASS", f"{label}: writable ({target})"
+
+
+def _diagnose(config: DesktopConfig, start_backend: bool = False) -> int:
+    """Print everything a first-run problem could be, then report a verdict.
+
+    Each section reports its own status and the verdict fails **only** when a
+    section actually failed: the previous version printed ``verdict: ready``
+    while the backend was DOWN and the production build was missing, because
+    two booleans were folded into one judgement.
+    """
+    frozen = is_frozen()
+    checks: list[tuple[str, str]] = []  # status, text; status in PASS/WARN/FAIL/INFO
+
     print(f"Zaytoon desktop {__version__}")
     print(f"  python     : {sys.version.split()[0]}  ({sys.executable})")
+    print(f"  platform   : {sys.platform}")
+    print(f"  frozen     : {frozen}")
     print(f"  repo root  : {config.repo_root}")
     print(f"  config     : {config.describe()}")
     print()
 
-    ok = True
+    # 1. bundled backend -------------------------------------------------
+    if frozen:
+        bdir = bundle_dir() or Path(sys.executable).resolve().parent
+        backend_main = bdir / "backend" / "main.py"
+        if backend_main.exists():
+            checks.append(("PASS", f"backend bundle: {backend_main}"))
+        else:
+            checks.append(("FAIL", "backend bundle: backend/main.py is missing from "
+                                   "this install — the app cannot start a backend"))
+        marker = bdir / "zaytoon_bundle.json"
+        if marker.exists():
+            try:
+                import json
 
-    # 1. backend
-    print("backend")
-    up = backend_is_up(config.host, config.port)
-    print(f"  {'UP  ' if up else 'DOWN'} {config.backend_addr}")
-    if not up:
+                meta = json.loads(marker.read_text(encoding="utf-8"))
+                checks.append(("INFO", f"bundle built: {meta.get('created', '?')} "
+                                       f"with {meta.get('python', '?')}"))
+            except (OSError, ValueError):
+                checks.append(("WARN", f"bundle marker unreadable: {marker}"))
+        else:
+            checks.append(("WARN", f"bundle marker missing: {marker}"))
+    else:
+        backend_main = config.repo_root / "backend" / "main.py"
+        checks.append(("PASS" if backend_main.exists() else "FAIL",
+                       f"backend source: {backend_main}"))
+
+    # 2. frontend assets -------------------------------------------------
+    checks.append(_check_frontend_assets(config.frontend_dist, frozen))
+
+    # 3. backend process and health --------------------------------------
+    listener = backend_is_up(config.host, config.port)
+    health = _probe_health(config.port, config.host)
+    if health:
+        checks.append(("PASS", f"backend: UP on {config.backend_addr}, /health answered "
+                               f"(status={health.get('status', 'ok')}, "
+                               f"tools={health.get('tools_loaded', '?')})"))
+    elif listener:
+        checks.append(("FAIL", f"backend: something answers TCP on {config.backend_addr} "
+                               "but /health does not — another application owns this "
+                               "port, or the backend is still starting"))
+    else:
         resolved = resolve_backend_command(config)
         if resolved is None:
-            ok = False
-            print("  FAIL no interpreter or backend/main.py found")
-            print(f"       expected {config.repo_root / 'backend' / 'main.py'}")
+            checks.append(("FAIL", f"backend: DOWN on {config.backend_addr}, and no "
+                                   "backend could be resolved to start"))
         else:
-            python_exe, main_script, cwd = resolved
-            print(f"  would run : {python_exe} {main_script}")
-            print(f"  cwd        : {cwd}")
-    print()
+            checks.append(("WARN", f"backend: DOWN on {config.backend_addr}; it would "
+                                   f"start as [{resolved.kind}]: {resolved.describe()}"))
 
-    # 2. dependencies
-    print("dependencies")
-    for module, why in (
-        ("webview", "the WebView runtime (pywebview)"),
-        ("websockets", "the backend connection"),
-    ):
-        try:
-            __import__(module)
-            print(f"  OK   {module}  ({why})")
-        except Exception as exc:
-            print(f"  FAIL {module}  ({why}) - {type(exc).__name__}: {exc}")
-    print()
+    # 4. windowing -------------------------------------------------------
+    try:
+        import webview  # noqa: F401
 
-    # 3. frontend build
-    print("frontend")
-    dist = config.frontend_dist
-    index = dist / "index.html"
-    if index.exists():
-        print(f"  OK   production build at {dist}")
-    else:
-        print(f"  WARN no production build at {dist}")
-        print(f"       run `npm run build` in frontend/ or use --dev mode")
-    print()
-
-    # 4. WebView2 (Windows)
+        checks.append(("PASS", "pywebview: importable"))
+    except Exception as exc:  # noqa: BLE001 - any import failure is fatal for the window
+        checks.append(("FAIL", f"pywebview: NOT importable ({type(exc).__name__}: {exc})"))
     if sys.platform == "win32":
-        print("webview2")
-        try:
-            import webview
-
-            # pywebview 6 no longer exposes __version__; do not let its
-            # absence be reported as a failed import.
-            version = getattr(webview, "__version__", None) or getattr(
-                webview, "VERSION", "unknown"
-            )
-            print(f"  OK   pywebview ({version})")
-        except Exception as exc:
-            ok = False
-            print(f"  FAIL pywebview - {type(exc).__name__}: {exc}")
         if webview2_runtime_present():
-            print("  OK   WebView2 runtime installed")
+            checks.append(("PASS", "WebView2 runtime: installed"))
         else:
-            ok = False
-            print("  FAIL WebView2 runtime missing - the window cannot open.")
-            print(f"       Install it once: {WEBVIEW2_DOWNLOAD_URL}")
-        print()
+            checks.append(("FAIL", "WebView2 runtime missing - the window cannot open. "
+                                   f"Install it once from {WEBVIEW2_DOWNLOAD_URL}"))
+    else:
+        checks.append(("INFO", "WebView2: not required on this platform"))
 
-    # 5. dev mode
-    if config.dev_mode:
-        print("dev mode")
-        dev_url = f"http://localhost:{config.dev_port}"
-        print(f"  URL        : {dev_url}")
-        print(f"  (ensure Vite dev server is running)")
-        print()
+    # 5. configuration ---------------------------------------------------
+    overrides = {
+        name: os.environ[name]
+        for name in (
+            "ZAYTOON_BACKEND_ADDR", "ZAYTOON_BACKEND_PYTHON", "ZAYTOON_BACKEND_MAIN",
+            "ZAYTOON_BACKEND_CWD", "ZAYTOON_DEV_MODE", "ZAYTOON_HOME",
+            "ZAYTOON_REPO_ROOT", "ZAYTOON_FRONTEND_DIST", "BACKEND_PORT",
+        )
+        if os.environ.get(name)
+    }
+    checks.append(("INFO", f"env overrides: {overrides or '(none)'}"))
 
-    print("verdict:", "ready" if ok else "problems above must be fixed first")
-    return 0 if ok else 1
+    # 6. writable state locations ----------------------------------------
+    checks.append(_check_writable(config.state_dir, "state dir"))
+    if frozen:
+        checks.append(_check_writable(Path(os.environ.get("ZAYTOON_HOME", default_state_dir())) / "Data",
+                                      "backend data dir"))
+    else:
+        checks.append(_check_writable(config.repo_root / "backend" / "data", "backend data dir"))
+    checks.append(_check_writable(Path(config.state_dir) / "logs", "log dir"))
+
+    # 7. optional integrations (never fatal) -----------------------------
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", 11434), timeout=0.25):
+            checks.append(("INFO", "ollama: reachable on 127.0.0.1:11434"))
+    except OSError:
+        checks.append(("INFO", "ollama: not reachable on 127.0.0.1:11434 (optional)"))
+    checks.append(("INFO", "openrouter key: "
+                           f"{'set' if os.environ.get('OPENROUTER_API_KEY') else 'not set'} (optional)"))
+
+    # 8. optional: actually bring the backend up --------------------------
+    if start_backend and not health:
+        print("starting the backend so /health can be answered for real…")
+        proc = BackendProcess(config)
+        status = proc.ensure_running()
+        try:
+            health = _probe_health(config.port, config.host)
+            if status.running and health:
+                checks = [c for c in checks if not c[1].startswith(
+                    ("backend: DOWN", "backend: something answers"))]
+                checks.append(("PASS", f"backend: started by this diagnose run "
+                                       f"(logs: {proc.log_path})"))
+            else:
+                checks = [c for c in checks if not c[1].startswith(
+                    ("backend: DOWN", "backend: something answers"))]
+                checks.append(("FAIL", f"backend: failed to start — {status.hint}"))
+        finally:
+            # Only ever stops what this run spawned (BackendProcess ownership).
+            proc.shutdown()
+
+    print()
+    for status, text in checks:
+        print(f"  [{status:4}] {text}")
+    print()
+
+    fails = [c for c in checks if c[0] == "FAIL"]
+    warns = [c for c in checks if c[0] == "WARN"]
+    if fails:
+        print(f"verdict: NOT READY — {len(fails)} failed check(s) above")
+        return 1
+    if warns:
+        print(f"verdict: ready with {len(warns)} warning(s)")
+        return 0
+    print("verdict: ready")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,13 +406,29 @@ def main(argv: list[str] | None = None) -> int:
         prog="zaytoon-desktop", description="Zaytoon AI desktop environment"
     )
     parser.add_argument("--diagnose", action="store_true", help="check the environment and exit")
+    parser.add_argument(
+        "--start-backend",
+        action="store_true",
+        help="with --diagnose: spawn the backend and wait for /health before judging",
+    )
     parser.add_argument("--no-backend", action="store_true", help="never spawn FastAPI")
     parser.add_argument("--dev", action="store_true", help="connect to Vite dev server")
     parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="run only the backend (backend-worker mode; the shell spawns this)",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
 
     _configure_logging(args.verbose)
+    # Per-user state layout first: everything below reads env, and the backend
+    # child inherits whatever this process sets.
+    _bootstrap_frozen_home()
+
+    if args.serve:
+        return _serve_backend()
 
     config = DesktopConfig()
     if args.no_backend:
@@ -146,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         config.dev_mode = True
 
     if args.diagnose:
-        return _diagnose(config)
+        return _diagnose(config, start_backend=args.start_backend)
 
     if not backend_is_up(config.host, config.port) and config.manage_backend:
         print("Starting the Zaytoon backend, this takes a few seconds…")

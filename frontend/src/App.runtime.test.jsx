@@ -83,7 +83,13 @@ async function renderAndOpen() {
   let view;
   await act(async () => { view = render(<App />); });
   // Wait for the home screen to render, then open a project via the path input
-  // (the desktop bridge is not available in jsdom, so the path input is used)
+  // (the desktop bridge is not available in jsdom, so the path input is used).
+  // The home screen is the Nexus dashboard, and its path input lives in the
+  // launchpad — which either the top bar or the dock opens.
+  await act(async () => {
+    const entries = screen.getAllByRole("button", { name: "All commands" });
+    fireEvent.click(entries[0]);
+  });
   await act(async () => {
     const pathInput = screen.getByLabelText(/path/i);
     fireEvent.change(pathInput, { target: { value: "C:/TestProject" } });
@@ -151,13 +157,15 @@ describe("App runtime", () => {
 
   it("mounts without throwing and renders the primary chrome", async () => {
     await renderAndOpen();
-    // The input and the mic are the two things the app is useless without.
-    expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/activate voice mode/i)).toBeInTheDocument();
-    // Dock buttons. The mic is no longer one of them -- see the
-    // "exactly one microphone" test.
-    expect(screen.getByTitle("CONF")).toBeInTheDocument();
-    expect(screen.getByTitle("STOP")).toBeInTheDocument();
+    // The composer and the mic are the two things the app is useless without —
+    // exactly one of each, on whatever screen the helper reached (the
+    // workspace, opened through home's launchpad).
+    expect(screen.getAllByLabelText(/your message/i)).toHaveLength(1);
+    expect(screen.getAllByLabelText(/voice mode/i)).toHaveLength(1);
+    // The shell chrome rode along: one navigation rail, named.
+    expect(
+      screen.getByRole("navigation", { name: /main navigation/i }),
+    ).toBeInTheDocument();
     // No React exception during mount.
     const fatal = consoleErrors.filter((e) => /Uncaught|Cannot read|is not a function|undefined is not/i.test(e));
     expect(fatal).toEqual([]);
@@ -167,7 +175,7 @@ describe("App runtime", () => {
     // InputBar and the dock each used to carry one, so there were two
     // controls for a single action and no way to tell which was live.
     await renderAndOpen();
-    expect(screen.getAllByLabelText(/activate voice mode/i)).toHaveLength(1);
+    expect(screen.getAllByLabelText(/voice mode/i)).toHaveLength(1);
     expect(screen.queryByTitle("MIC")).not.toBeInTheDocument();
   });
 
@@ -180,8 +188,17 @@ describe("App runtime", () => {
     await act(async () => {
       render(<App />);
     });
+    // Home is the Nexus dashboard: the sidebar stands aside there and the
+    // dock is its navigator, so leave home through the dock's Computer cell.
+    const dock = screen.getByRole("navigation", { name: /app dock/i });
+    expect(
+      within(dock).getByRole("button", { name: "Core" }),
+    ).toHaveAttribute("aria-current", "true");
+    await act(async () => {
+      fireEvent.click(within(dock).getByRole("button", { name: "Computer" }));
+    });
     const nav = screen.getByRole("navigation", { name: "Main navigation" });
-    expect(within(nav).getByRole("button", { name: "Home" })).toHaveAttribute(
+    expect(within(nav).getByRole("button", { name: "Computer" })).toHaveAttribute(
       "aria-current",
       "page",
     );
@@ -277,15 +294,17 @@ describe("App runtime", () => {
     expect(screen.getByLabelText(/your message/i)).toBeInTheDocument();
     expect(screen.queryByTestId("ai-floating-bar")).not.toBeInTheDocument();
 
-    const nav = screen.getByRole("navigation", { name: "Main navigation" });
+    // The dock carries the navigation on Home; from there on the sidebar owns
+    // it, as documented on the dashboard's own comment.
+    const dock = screen.getByRole("navigation", { name: /app dock/i });
     await act(async () => {
-      fireEvent.click(within(nav).getByRole("button", { name: "Computer" }));
+      fireEvent.click(within(dock).getByRole("button", { name: "Computer" }));
     });
     expect(screen.getByTestId("ai-floating-bar")).toBeInTheDocument();
     // Still exactly one composer and one microphone in the product — the
     // strip reuses InputBar instead of growing a second implementation.
     expect(screen.getAllByLabelText(/your message/i)).toHaveLength(1);
-    expect(screen.getAllByLabelText(/activate voice mode/i)).toHaveLength(1);
+    expect(screen.getAllByLabelText(/voice mode/i)).toHaveLength(1);
   });
 
   it("opens the command palette from Ctrl+K and Ctrl+Space", async () => {
@@ -698,7 +717,7 @@ describe("App runtime", () => {
     expect(confirmations[0].approved).toBe(true);
   });
 
-  it("manual microphone sends isManualVoice so the wake gate is skipped", async () => {
+  it("the microphone never sends isManualVoice and stamps every utterance", async () => {
     await renderAndOpen();
     await waitFor(() => expect(FakeSocket.last.readyState).toBe(1));
     const ws = FakeSocket.last;
@@ -715,14 +734,13 @@ describe("App runtime", () => {
         this.mimeType = opts?.mimeType || "audio/webm";
         this.state = "inactive";
         this.ondataavailable = null;
+        this.onstop = null;
         recorder = this;
       }
       start(timeslice) {
         this.state = "recording";
-        // The real recorder emits a slice every `timeslice` ms. stopVoiceMode
-        // deliberately nulls ondataavailable before calling stop(), so the
-        // chunks have to have arrived beforehand -- emitting only from stop()
-        // would test a path the app never takes.
+        // The real recorder emits a slice every `timeslice` ms; the VAD path
+        // needs the chunks to have arrived before the segment is finalized.
         this._emit = setInterval(() => {
           this.ondataavailable?.({ data: new Blob([new Uint8Array(9000)]) });
         }, 10);
@@ -730,18 +748,31 @@ describe("App runtime", () => {
       stop() {
         this.state = "inactive";
         clearInterval(this._emit);
+        // The real recorder flushes its final buffer and fires `onstop`, which
+        // is where `finalizeSegment` collects the utterance.
+        this.onstop?.();
       }
     };
 
-    // The VAD path needs an AudioContext; jsdom has none.
+    // The VAD path needs an AudioContext; jsdom has none. The analyser reports
+    // ~700 ms of speech (14 ticks at VAD_FRAME_MS = 50 ms) followed by silence,
+    // which is exactly what ends an utterance: >= VAD_MIN_SPEECH_MS of speech,
+    // then VAD_SILENCE_FRAMES silent frames.
+    let ticks = 0;
     global.AudioContext = class {
       constructor() { this.sampleRate = 48000; }
       createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
       createAnalyser() {
         return {
           fftSize: 2048,
+          // The VAD allocates its sample buffer from this and loops over it;
+          // without it the buffer is zero-length and every frame reads as
+          // silence, so no utterance is ever detected.
+          frequencyBinCount: 1024,
           connect() {}, disconnect() {},
-          getByteTimeDomainData(a) { a.fill(200); },  // loud -> counts as speech
+          getByteTimeDomainData(a) {
+            a.fill(ticks++ < 14 ? 200 : 128);
+          },
         };
       }
       close() { return Promise.resolve(); }
@@ -751,28 +782,29 @@ describe("App runtime", () => {
     const origSend = ws.send.bind(ws);
     ws.send = (d) => { sent.push(JSON.parse(d)); origSend(d); };
 
-    // Press the mic, let the recorder emit at least one slice, then stop.
-    await act(async () => { fireEvent.click(screen.getByLabelText(/activate voice mode/i)); });
+    // Press the mic to open the continuous listener.
+    await act(async () => { fireEvent.click(screen.getByLabelText(/voice mode/i)); });
     await waitFor(() => expect(global.navigator.mediaDevices.getUserMedia).toHaveBeenCalled());
     await waitFor(() => expect(recorder).not.toBeNull());
-    // A user always speaks for a moment before releasing. Without this the
-    // second click can land before the recorder's first 10ms slice, and
-    // stopVoiceMode correctly sends nothing because nothing was captured.
-    await waitFor(() => expect(sent.length).toBeGreaterThanOrEqual(0));
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 60));
-    });
-    // The mic lives in the console input, so that is what toggles it off.
-    await act(async () => { fireEvent.click(screen.getByLabelText(/activate voice mode/i)); });
-    await waitFor(() => expect(sent.filter((m) => m.type === "audio").length).toBe(1));
+    // Speak, then stop: the VAD ends the utterance and transmits it. Clicking
+    // the mic off would *not* — that is a mode toggle, and it deliberately
+    // discards a partial capture rather than turning half a sentence into a
+    // command.
+    await waitFor(
+      () => expect(sent.filter((m) => m.type === "audio").length).toBe(1),
+      { timeout: 8000 },
+    );
 
     const audio = sent.find((m) => m.type === "audio");
-    // The decisive assertion: the backend gates the wake word on this flag,
-    // so if it is absent or false, the user must say "Zaytoon" to be heard.
-    expect(audio.isManualVoice).toBe(true);
+    // The decisive assertion: the backend no longer reads `isManualVoice`
+    // (the frontend no longer sends it). The capture gate reads the server's
+    // `voice_state` frame instead, and every audio frame carries `utterance_id`
+    // for idempotency. The old `isManualVoice` flag must be absent.
+    expect(audio.isManualVoice).not.toBeDefined();
+    expect(audio.utterance_id).toBeDefined();
     expect(recorder).not.toBeNull();
     expect(audio.audio.length).toBeGreaterThan(100);
-  });
+  }, 15000);
 
   it("switches to Arabic and mirrors the document direction", async () => {
     await renderAndOpen();

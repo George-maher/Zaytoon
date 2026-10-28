@@ -337,6 +337,46 @@ class TestTransportFrames:
         assert len(sent[0]["sources"]) == 12, "the cap is the point of the frame"
         assert sent[0]["trace_id"] == "trace-9"
 
+    async def test_response_chunk_reaches_the_client_as_a_token(self):
+        """The tool turn's prose must stream, not just arrive in `message`.
+
+        The engine never uses `on_delta`; it emits `response_chunk`. And
+        `ToolAgent` only forwards that chunk to `stream_callback` when nothing
+        is subscribed to the bus — with this relay subscribed, that forwarding
+        is off. So if the relay did not relay the chunk, a tool turn's answer
+        would have no streamed bubble at all, only the final `message` frame.
+        """
+        from agents.events import AgentEvent, AgentEventType
+        from api.websocket import _ProgressRelay
+
+        sent = []
+
+        class Cm:
+            async def send(self, ws, payload):
+                sent.append(payload)
+
+        relay = _ProgressRelay(object(), Cm(), "r1", "trace-9")
+        await relay(AgentEvent(AgentEventType.RESPONSE_CHUNK, {"content": "Done."}))
+
+        assert [f["type"] for f in sent] == ["token"]
+        assert sent[0]["content"] == "Done."
+        assert sent[0]["response_id"] == "r1"
+        assert sent[0]["trace_id"] == "trace-9"
+
+    async def test_an_empty_response_chunk_sends_nothing(self):
+        from agents.events import AgentEvent, AgentEventType
+        from api.websocket import _ProgressRelay
+
+        sent = []
+
+        class Cm:
+            async def send(self, ws, payload):
+                sent.append(payload)
+
+        relay = _ProgressRelay(object(), Cm(), "r1", "trace-9")
+        await relay(AgentEvent(AgentEventType.RESPONSE_CHUNK, {"content": ""}))
+        assert sent == []
+
 
 def _engine_with_bus(replies, tool, bus):
     from agents.engine import AgentEngine
