@@ -312,6 +312,36 @@ class DesktopConfig:
     #: log line). The platform conventions below are writable by the user always.
     state_dir: Path = field(default_factory=lambda: default_state_dir())
 
+    #: When True, closing/minimizing the window keeps the backend running in
+    #: the background (tray icon remains) instead of shutting down.
+    background_mode: bool = field(
+        default_factory=lambda: _env_bool("ZAYTOON_BACKGROUND_MODE", True)
+    )
+
+    #: Extra roots the indexer should scan, in addition to the path-policy roots.
+    #: Semicolon-separated via ``ZAYTOON_INDEX_ROOTS``.
+    index_roots: list[str] = field(
+        default_factory=lambda: [
+            p for p in os.getenv("ZAYTOON_INDEX_ROOTS", "").split(";") if p.strip()
+        ]
+    )
+
+    #: Glob patterns excluded from indexing (hidden dirs, build caches, etc.).
+    index_exclusions: list[str] = field(
+        default_factory=lambda: [
+            ".*",              # hidden files/dirs
+            "__pycache__",
+            "node_modules",
+            ".git",
+            ".venv",
+            "*.pyc",
+            "*.db",
+            "*.sqlite",
+            "*.log",
+            "*.tmp",
+        ]
+    )
+
     #: Seconds between backend health samples. A knob rather than a
     #: ``"pytest" in sys.modules`` check, which made production code branch on the
     #: identity of whatever interpreter happened to import it.

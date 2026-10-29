@@ -25,6 +25,7 @@ from pathlib import Path
 from . import paths as path_policy
 from .backend import BackendProcess
 from .config import DesktopConfig
+from .indexer import Indexer
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +83,20 @@ class NativeBridge:
         self.config = config
         self.backend = backend
         self._window = None
+        self._host = None
+        self._indexer = Indexer(config)
 
     def set_window(self, window) -> None:
         """Set the window reference (called by the host after creation)."""
         self._window = window
+
+    def set_host(self, host) -> None:
+        """Set the host reference (called by the host after creation).
+
+        Lets the bridge read host state (backend health, visibility, tray)
+        for the HUD / Arc Reactor.
+        """
+        self._host = host
 
     # ------------------------------------------------------------------
     # Window controls
@@ -246,6 +257,85 @@ class NativeBridge:
         except Exception as exc:
             logger.warning("open_path failed for %s: %s", path, exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Local index (search + launch)
+    # ------------------------------------------------------------------
+
+    def search_items(self, query: str = "") -> list[dict]:
+        """Search the local index for files and applications.
+
+        ``query`` is a case-insensitive substring match against item names.
+        Returns an empty list when the indexer is unavailable.
+        """
+        try:
+            return self._indexer.search(query)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("search_items failed: %s", exc)
+            return []
+
+    def get_indexed_item(self, item_id: str) -> dict | None:
+        """Return one indexed item by id, or None."""
+        try:
+            return self._indexer.get(item_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("get_indexed_item failed: %s", exc)
+            return None
+
+    def get_indexed_roots(self) -> list[str]:
+        """Return the root directories the indexer scans."""
+        try:
+            return [str(r) for r in self._indexer._roots()]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("get_indexed_roots failed: %s", exc)
+            return []
+
+    def get_indexed_exclusions(self) -> list[str]:
+        """Return the exclusion patterns applied by the indexer."""
+        try:
+            return self._indexer._exclusions()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("get_indexed_exclusions failed: %s", exc)
+            return []
+
+    def launch_item(self, item_id: str) -> bool:
+        """Launch/open an indexed item through the gated path policy.
+
+        The item's path is validated by :meth:`open_path` before the OS is
+        asked to open it, so nothing outside the granted roots or of an
+        executable type can be launched.
+        """
+        item = self.get_indexed_item(item_id)
+        if item is None:
+            return False
+        return self.open_path(item["path"])
+
+    # ------------------------------------------------------------------
+    # Host state (for the HUD / Arc Reactor to reflect real shell state)
+    # ------------------------------------------------------------------
+
+    def get_host_state(self) -> dict:
+        """Return the desktop host's current state as a JSON-serialisable dict.
+
+        The frontend polls this so the Nexus Orb / HUD can show whether the
+        backend is reachable, whether the window is visible, and whether the
+        shell is running in background (tray) mode.
+        """
+        if self._host is None:
+            return {
+                "backend_up": False,
+                "window_visible": False,
+                "background_mode": False,
+                "tray_available": False,
+            }
+        return {
+            "backend_up": bool(getattr(self._host, "backend_up", False)),
+            "window_visible": bool(getattr(self._host, "_window_visible", True)),
+            "background_mode": bool(getattr(self._host, "_background_mode", False)),
+            "tray_available": bool(
+                self._host._tray is not None and self._host._tray.available
+            ),
+        }
 
     # ------------------------------------------------------------------
     # System information

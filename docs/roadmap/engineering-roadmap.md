@@ -113,6 +113,22 @@ All feasible workflows have an explicit result:
 
 **Phase 3.3 — Accessibility & UX Engineering (this pass).** WCAG 2.2 AA target. Fixed: ExecutionHistory loading/error/unavailable states now announce to screen readers via `role="status"`/`role="alert"` + `aria-live` (A1–A3); Sidebar collapsed nav items expose `aria-label` for icon-only buttons (A4); `EmptyState` renders as `role="region"` with accessible `aria-label` (A5–A6). Added 18 tests across `EmptyState.test.jsx`, `ExecutionHistory.test.jsx`, and `Sidebar.test.jsx`. Frontend: 774 passed / 0 failed (46 files); lint clean; build OK. Browser execution still BLOCKED (no display server or browser).
 
+**Phase 4.0 — Personal AI Assistant Foundation (current).** Windows-first persistent
+desktop AI assistant:
+
+- ✅ Desktop lifecycle: minimize-to-tray + background behavior
+  (`desktop/app/host.py`, `desktop/app/tray.py`, `ZAYTOON_BACKGROUND_MODE`)
+- ✅ Wake-word gate verified (`backend/services/wake_word_service.py` — 16 tests pass)
+- ✅ Local file/app indexing with roots/exclusions
+  (`desktop/app/indexer.py`, `search_items`/`launch_item` bridge methods)
+- ✅ Arc Reactor host state exposed via bridge (`get_host_state()`)
+- ✅ Desktop tests: 425 passed / 2 skipped; lint clean; frontend 773 passed
+- 📋 Google Drive / Gmail OAuth design documented
+  (`docs/security/google-drive-gmail-oauth-design.md`)
+- 📋 Audio wake-word detector: integration path documented (text gate exists;
+  detector is the missing piece — see design notes)
+- 📋 Local index + launch wired to frontend UI (bridge methods exist; consumer TBD)
+
 **Phase 9 — Engineering standards.** Adopt only tools that solve demonstrated problems:
 
 1. **Python:** Add `mypy` (type checking) and `ruff` (lint + format) to `backend/requirements-dev.txt`; add `mypy backend/` and `ruff check backend/` to CI. Do not add a formatter that churns existing code — `ruff format --check` first to gauge churn.

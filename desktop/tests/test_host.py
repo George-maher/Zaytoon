@@ -192,7 +192,12 @@ class TestBackendLifecycle:
         assert "developer.microsoft.com" in err
 
     def test_host_shutdown_stops_backend(self, host, monkeypatch):
-        """Shutting down should stop the backend."""
+        """Shutting down should stop the backend.
+
+        background_mode must be False so _on_closed takes the shutdown path
+        rather than minimizing to the tray.
+        """
+        host._background_mode = False
         mock_status = MagicMock()
         mock_status.running = True
 
