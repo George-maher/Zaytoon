@@ -771,7 +771,7 @@ def _when_speaking(ws: FakeWebSocket, producer, timeout: float = 5.0):
             state = session_states.get(session_id) if session_id else None
             if state is not None and state.voice.state is VoiceState.SPEAKING:
                 return producer() if callable(producer) else producer
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
         raise AssertionError("the turn never reached SPEAKING")
 
     return _wait

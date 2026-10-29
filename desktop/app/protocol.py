@@ -102,6 +102,10 @@ class EventType(str, Enum):
     AUDIO_START = "audio_start"
     AUDIO_CHUNK = "audio_chunk"
     AUDIO_END = "audio_end"
+    #: The backend's explicit voice lifecycle state (disabled | standby | ...
+    #: speaking | recovering). The shell mirrors this so the UI can show the
+    #: voice pipeline's actual state rather than inferring it from audio frames.
+    VOICE_STATE = "voice_state"
     #: The backend relays the core bus verbatim, so these arrive with dotted
     #: names. Listed because a frame the shell cannot name is a frame it renders
     #: as `unknown`, and an activity feed that drops task progress is the

@@ -168,25 +168,32 @@ class DeviceInventory:
 # ---------------------------------------------------------------------------
 
 class OperatingSystemProvider:
-    """Abstract base for OS-specific discovery adapters."""
+    """Abstract base for OS-specific discovery adapters.
+
+    Subclasses (e.g. ``WindowsProvider``) override these with real OS-specific
+    implementations. The base returns empty/safe defaults so discovery completes
+    on platforms without a dedicated provider instead of aborting with
+    ``NotImplementedError`` — matching the "continue with limited capabilities"
+    startup philosophy.
+    """
 
     def discover_hardware(self) -> HardwareInfo:
-        raise NotImplementedError
+        return HardwareInfo()
 
     def discover_installed_applications(self) -> List[ApplicationInfo]:
-        raise NotImplementedError
+        return []
 
     def discover_running_processes(self) -> List[ProcessInfo]:
-        raise NotImplementedError
+        return []
 
     def discover_development_environment(self) -> Dict[str, DevelopmentTool]:
-        raise NotImplementedError
+        return {}
 
     def discover_projects(self) -> List[ProjectInfo]:
-        raise NotImplementedError
+        return []
 
     def discover_local_ai(self) -> LocalAIModel:
-        raise NotImplementedError
+        return LocalAIModel(name="", endpoint="")
 
 
 class WindowsProvider(OperatingSystemProvider):

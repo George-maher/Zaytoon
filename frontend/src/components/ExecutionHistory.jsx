@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useState } from "react";
 import { getAudit, clearAudit, getProcesses, stopProcess } from "../lib/api";
 import { riskTone, riskPillClass } from "../lib/risk";
+import { translate } from "../i18n/strings";
+import EmptyState from "./EmptyState";
 
 /**
  * Execution history: what the assistant has actually been allowed to do.
@@ -260,7 +262,11 @@ export default memo(function ExecutionHistory({ language = "en" }) {
         )}
 
         {!auditError && !unavailable && audit !== null && entries.length === 0 && (
-          <Note>{ar ? "لا توجد عمليات مسجلة بعد" : "No executions recorded yet"}</Note>
+          <EmptyState
+            title={translate(language, "execution_history.no_records")}
+            description={translate(language, "execution_history.no_records_description")}
+            glyph="○"
+          />
         )}
 
         {entries.map((e) => (
@@ -304,7 +310,10 @@ export default memo(function ExecutionHistory({ language = "en" }) {
       {!proc?.unavailable && (
         <HistoryCard title={ar ? "العمليات" : "PROCESSES"}>
           {processes.length === 0 ? (
-            <Note>{ar ? "لا توجد عمليات نشطة" : "No processes"}</Note>
+            <EmptyState
+              title={translate(language, "execution_history.no_processes")}
+              glyph="○"
+            />
           ) : (
             processes.map((p) => {
               const id = p.id ?? p.pid ?? p.name;

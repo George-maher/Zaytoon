@@ -91,9 +91,16 @@ export const STRINGS = {
   en: {
     "common.retry": "Retry",
     "common.loading": "LOADING…",
+    "common.empty": "Empty",
+    "common.error": "Error",
     "common.language_en": "English",
     "common.language_ar": "العربية",
     "common.cancel": "CANCEL",
+
+    // Execution history panel.
+    "execution_history.no_records": "No executions recorded yet",
+    "execution_history.no_records_description": "Executions appear here when tools run.",
+    "execution_history.no_processes": "No processes",
 
     // The workspace panels' two-step approval row (GitPanel / TerminalPanel).
     "git.confirm_dialog": "Confirm the git action",
@@ -211,9 +218,16 @@ export const STRINGS = {
   ar: {
     "common.retry": "أعد المحاولة",
     "common.loading": "جارٍ التحميل…",
+    "common.empty": "فارغ",
+    "common.error": "خطأ",
     "common.language_en": "English",
     "common.language_ar": "العربية",
     "common.cancel": "إلغاء",
+
+    // Execution history panel.
+    "execution_history.no_records": "لا توجد عمليات مسجلة بعد",
+    "execution_history.no_records_description": "تظهر العمليات هنا عند تشغيل الأدوات.",
+    "execution_history.no_processes": "لا توجد عمليات نشطة",
 
     // The workspace panels' two-step approval row (GitPanel / TerminalPanel).
     "git.confirm_dialog": "تأكيد العملية",

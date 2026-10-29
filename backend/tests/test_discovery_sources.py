@@ -114,6 +114,7 @@ class TestNormalisation:
     def test_registry_paths_lose_quotes_and_icon_indexes(self, raw, expected):
         assert discovery._clean_registry_path(raw) == expected
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path semantics only")
     def test_registry_paths_expand_environment_variables(self, monkeypatch):
         monkeypatch.setenv("ZAYTOON_TEST_DIR", r"C:\Portable")
         assert (
@@ -121,6 +122,7 @@ class TestNormalisation:
             == r"C:\Portable\app.exe"
         )
 
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows path semantics only")
     def test_the_windows_directory_is_recognised(self, monkeypatch):
         monkeypatch.setenv("SystemRoot", r"C:\Windows")
         assert discovery._is_windows_dir(r"C:\Windows\System32") is True
