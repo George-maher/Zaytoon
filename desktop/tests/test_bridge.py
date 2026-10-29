@@ -341,6 +341,13 @@ class TestSecurity:
             "restart_backend",
             "get_clipboard",
             "set_clipboard",
+            "search_items",
+            "get_indexed_item",
+            "get_indexed_roots",
+            "get_indexed_exclusions",
+            "launch_item",
+            "set_host",
+            "get_host_state",
         }
         assert set(methods) == expected
 

@@ -95,6 +95,8 @@ HIDDEN_IMPORTS = [
     "app.instance",
     "app.paths",
     "app.protocol",
+    "app.tray",
+    "app.indexer",
     "webview",
 ]
 

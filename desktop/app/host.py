@@ -26,6 +26,7 @@ from pathlib import Path
 from .backend import BackendProcess, backend_is_up
 from .bridge import NativeBridge
 from .config import DesktopConfig
+from .tray import TrayIcon
 
 logger = logging.getLogger(__name__)
 
@@ -152,10 +153,121 @@ class WebViewHost:
         self._shutting_down = False
         self._started = False
         self._health_check_thread: threading.Thread | None = None
+        self._tray: TrayIcon | None = None
+        #: Whether the window is currently visible (tracked because pywebview
+        #: does not expose a visibility query).
+        self._window_visible: bool = True
+        #: When True, closing/minimizing the window keeps the backend running
+        #: in the background (tray icon remains) instead of shutting down.
+        self._background_mode: bool = getattr(config, "background_mode", False)
         #: The last sampled backend state. A bool assignment, so reading it from
         #: the UI thread needs no lock.
         self.backend_up: bool = False
         self._window_state = self._load_window_state()
+        self._setup_tray()
+
+    # ------------------------------------------------------------------
+    # Tray integration
+    # ------------------------------------------------------------------
+
+    def _setup_tray(self) -> None:
+        """Create the system tray icon with its menu.
+
+        The tray is how the shell stays reachable when the window is hidden.
+        Menu items call back directly into this host (no event queue here —
+        the tray runs on its own daemon thread via pystray).
+        """
+        try:
+            import pystray  # noqa: F401 - availability checked via TrayIcon
+
+            tray = TrayIcon("zaytoon")
+            if not tray.available:
+                self._tray = None
+                return
+
+            def show_window(_icon, _item):
+                self._show_window()
+
+            def hide_window(_icon, _item):
+                self._hide_window()
+
+            def restart_backend(_icon, _item):
+                self._restart_backend()
+
+            def quit_app(_icon, _item):
+                self._quit_application()
+
+            self._tray = tray
+            self._tray.start(
+                pystray.Menu(
+                    pystray.MenuItem("Show / hide", show_window, default=True),
+                    pystray.MenuItem("Open", show_window),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Restart backend", restart_backend),
+                    pystray.MenuItem("Quit", quit_app),
+                )
+            )
+        except Exception as exc:  # pragma: no cover - tray unavailable
+            logger.warning("tray setup failed: %s", exc)
+            self._tray = None
+
+    def _show_window(self) -> None:
+        """Show the window and bring it to the front."""
+        if self.window is None:
+            return
+        try:
+            self.window.show()
+            self.window.focus()
+            self._window_visible = True
+        except Exception as exc:  # pragma: no cover - platform-specific
+            logger.warning("could not show window: %s", exc)
+
+    def _hide_window(self) -> None:
+        """Hide the window (minimize to tray). The backend keeps running."""
+        if self.window is None:
+            return
+        try:
+            self.window.hide()
+            self._window_visible = False
+        except Exception as exc:  # pragma: no cover - platform-specific
+            logger.warning("could not hide window: %s", exc)
+
+    def _toggle_window(self) -> None:
+        """Toggle window visibility."""
+        if self.window is None:
+            return
+        try:
+            # pywebview doesn't expose a visibility query, so track it ourselves.
+            # Default to showing when in doubt.
+            self._show_window()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("could not toggle window: %s", exc)
+
+    def _restart_backend(self) -> None:
+        """Restart the backend process from the tray menu."""
+        try:
+            self.backend.shutdown()
+            status = self.backend.ensure_running()
+            if self._tray:
+                self._tray.notify(
+                    "Backend restarted" if status.running else "Backend failed to start",
+                    "Zaytoon",
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("restart backend failed: %s", exc)
+
+    def _quit_application(self) -> None:
+        """Full shutdown: stop the tray, teardown host, close the window."""
+        self._shutting_down = True
+        if self._tray is not None:
+            self._tray.stop()
+            self._tray = None
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:  # pragma: no cover
+                pass
+
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -217,8 +329,9 @@ class WebViewHost:
                 ),
             )
 
-            # Give the bridge a reference to the window
+            # Give the bridge references to the window and the host
             self.bridge.set_window(self.window)
+            self.bridge.set_host(self)
 
             # Set up event handlers
             self.window.events.closed += self._on_closed
@@ -284,28 +397,48 @@ class WebViewHost:
     # ------------------------------------------------------------------
 
     def _on_closed(self) -> None:
-        """Handle window close."""
+        """Handle window close.
+
+        In background mode the window is hidden to the tray and the backend
+        keeps running; only an explicit "Quit" from the tray shuts everything
+        down. Without background mode this is a full shutdown as before.
+        """
         self._save_window_state()
-        # `_teardown` is idempotent, and `run()`'s finally will call it again on
-        # the way out: the close handler is not the only path that ends a session.
-        self._teardown()
-        logger.info("window closed, shutting down")
+        self._window_visible = False
+        if self._background_mode:
+            self._hide_window()
+            self._ensure_tray_visible()
+            logger.info("window closed, running in background (tray)")
+        else:
+            # `_teardown` is idempotent, and `run()`'s finally will call it
+            # again on the way out: the close handler is not the only path
+            # that ends a session.
+            self._teardown()
+            logger.info("window closed, shutting down")
 
     def _on_loaded(self) -> None:
         """Handle page load complete."""
         logger.info("page loaded")
 
     def _on_minimized(self) -> None:
-        """Handle window minimize."""
-        pass
+        """Handle window minimize: hide to tray, keep backend running."""
+        self._window_visible = False
+        self._hide_window()
+        self._ensure_tray_visible()
+        logger.info("window minimized to tray")
+
+    def _ensure_tray_visible(self) -> None:
+        """Make sure the tray icon is running (starts it lazily if needed)."""
+        if self._tray is None:
+            self._setup_tray()
 
     def _on_maximized(self) -> None:
         """Handle window maximize."""
         pass
 
     def _on_restored(self) -> None:
-        """Handle window restore."""
-        pass
+        """Handle window restore from minimize."""
+        self._window_visible = True
 
     # ------------------------------------------------------------------
     # Window state persistence
