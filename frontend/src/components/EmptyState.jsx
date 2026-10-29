@@ -13,6 +13,7 @@ import { memo } from "react";
  * @param {string} [props.glyph] — single glyph shown left of the title, e.g. "○"
  * @param {string} [props._language] — "en" | "ar", reserved for call-site translation
  * @param {string} [props.className] — extra Tailwind classes
+ * @param {string} [props.ariaLabel] — accessible name for the region; defaults to `title`
  * @param {React.ReactNode} [props.action] — optional interactive child (a Retry button, a link)
  */
 function EmptyState({
@@ -21,10 +22,13 @@ function EmptyState({
   glyph,
   _language,
   className = "",
+  ariaLabel,
   action,
 }) {
   return (
     <div
+      role="region"
+      aria-label={ariaLabel ?? title}
       className={`flex flex-col items-center justify-center gap-2 text-center ${className}`}
       style={{
         padding: `var(--space-6) var(--space-4)`,

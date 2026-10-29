@@ -61,9 +61,9 @@ npm run build       # vite build
 
 ### Result
 ```
-Tests:  752 passed, 0 failed (44 files, ~49s)
+Tests:  774 passed, 0 failed (46 files, ~43s)
 Lint:   clean (0 warnings/errors)
-Build:  successful (~1.9s; one chunk-size warning >500 kB)
+Build:  successful (~1.5s; one chunk-size warning >500 kB)
 ```
 
 ### Test configuration
@@ -71,9 +71,10 @@ Build:  successful (~1.9s; one chunk-size warning >500 kB)
 - `eslint.config.js`: eslint 9 flat config with React plugins
 
 ### Coverage notes
-- No coverage tool configured. 752 tests across components, hooks, lib modules, and design tests.
+- No coverage tool configured. 774 tests across components, hooks, lib modules, and design tests (was 755 at Phase 3.2 baseline; +19 accessibility tests added in Phase 3.3).
 - Highest-value test: `useWebSocket.test.js` (protocol reducer shared by browser and desktop).
 - `imports.case.test.js` (120 tests) enforces exact import casing for Windows/Linux portability.
+- New accessibility test files: `src/components/EmptyState.test.jsx` (10 tests), `src/components/ExecutionHistory.test.jsx` (+5 tests), `src/components/Sidebar.test.jsx` (3 tests).
 
 ---
 
