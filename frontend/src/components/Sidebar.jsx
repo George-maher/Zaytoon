@@ -161,6 +161,7 @@ export default memo(function Sidebar({
                   type="button"
                   onClick={() => onNavigate(item.id)}
                   aria-current={active ? "page" : undefined}
+                  aria-label={collapsed ? item.label : undefined}
                   className="flex items-center w-full hud-glowable"
                   style={{
                     padding: collapsed ? "var(--space-3) 0" : "var(--space-2) var(--space-3)",

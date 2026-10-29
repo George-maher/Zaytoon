@@ -182,4 +182,67 @@ describe('ExecutionHistory', () => {
     expect(await screen.findByText('سجل العمليات غير متاح')).toBeInTheDocument()
     expect(screen.getByText('سجل التنفيذ')).toBeInTheDocument()
   })
+
+  it('announces the loading state to screen readers via role="status"', async () => {
+    let resolveAudit
+    const auditDeferred = new Promise((resolve) => { resolveAudit = resolve })
+    global.fetch = vi.fn(async (url) => {
+      const u = String(url)
+      if (u.includes('/audit')) {
+        await auditDeferred
+        return { ok: true, status: 200, json: async () => ({ entries: [], total: 0 }) }
+      }
+      if (u.includes('/processes')) {
+        return { ok: true, status: 200, json: async () => ({ processes: [] }) }
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    })
+
+    render(<ExecutionHistory language="en" />)
+
+    const loading = await screen.findByText('LOADING…')
+    expect(loading).toHaveAttribute('role', 'status')
+    expect(loading).toHaveAttribute('aria-live', 'polite')
+
+    resolveAudit()
+    await act(async () => {})
+  })
+
+  it('announces a fetch failure to screen readers via role="alert"', async () => {
+    mockFetch({ audit: { throw: true } })
+    render(<ExecutionHistory language="en" />)
+
+    const error = await screen.findByText(/Audit fetch failed:/)
+    expect(error).toHaveAttribute('role', 'alert')
+    expect(error).toHaveAttribute('aria-live', 'assertive')
+  })
+
+  it('announces the unavailable state to screen readers via role="alert"', async () => {
+    mockFetch({ audit: { status: 404 } })
+    render(<ExecutionHistory language="en" />)
+
+    const unavailable = await screen.findByText('Audit log unavailable')
+    expect(unavailable).toHaveAttribute('role', 'alert')
+    expect(unavailable).toHaveAttribute('aria-live', 'polite')
+  })
+
+  it('renders EmptyState as a region with an accessible name', async () => {
+    mockFetch({ audit: { entries: [], total: 0 } })
+    render(<ExecutionHistory language="en" />)
+
+    const region = await screen.findByRole('region', {
+      name: 'No executions recorded yet',
+    })
+    expect(region).toBeInTheDocument()
+  })
+
+  it('renders EmptyState as a region with an accessible name in Arabic', async () => {
+    mockFetch({ audit: { entries: [], total: 0 } })
+    render(<ExecutionHistory language="ar" />)
+
+    const region = await screen.findByRole('region', {
+      name: 'لا توجد عمليات مسجلة بعد',
+    })
+    expect(region).toBeInTheDocument()
+  })
 })

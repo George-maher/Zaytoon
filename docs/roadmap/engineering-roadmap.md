@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-28
 **Branch:** `arena/9219dec0-zaytoon` (HEAD `5bda335`)
-**Baseline:** All test suites green — Backend 3486 passed / 7 skipped / 0 failed; Frontend 755 passed / 0 failed / lint clean / build successful; Desktop 404 passed / 2 skipped / 0 failed.
+**Baseline:** All test suites green — Backend 3486 passed / 7 skipped / 0 failed; Frontend 756 passed / 0 failed / lint clean / build successful; Desktop 404 passed / 2 skipped / 0 failed.
 
 ## Execution order (adapted to findings)
 
@@ -82,7 +82,7 @@ P2-1, P2-2 are **DONE** (fixed in this pass). P2-7 is **DONE** (Phase 3). P2-6 i
 | Common empty/error i18n keys | `frontend/src/i18n/strings.js` | `common.empty` / `common.error` added (en + ar) for shared empty/error messaging |
 
 **Before:** Backend 3484 passed / 4 failed / 5 skipped; Frontend 752 passed / 0 failed; Desktop 403 passed / 1 failed / 2 skipped.
-**After:** Backend 3486 passed / 7 skipped / 0 failed; Frontend 755 passed / 0 failed; Desktop 404 passed / 2 skipped / 0 failed.
+**After:** Backend 3486 passed / 7 skipped / 0 failed; Frontend 756 passed / 0 failed; Desktop 404 passed / 2 skipped / 0 failed.
 
 ### Runtime verification summary (Phase 2)
 
@@ -109,13 +109,15 @@ All feasible workflows have an explicit result:
 
 ## Next development phase
 
-**Phase 3 — Design system audit & consistent interface (in progress).** D1 shared `EmptyState` component created; D2 token system resolved; D3 documented as intentional; D4 resolved. Remaining: pilot EmptyState on one data panel (ExecutionHistory), then gradual rollout to SecurityView/GitPanel/VirtualMachinesView; optional loading/error variants of EmptyState.
+**Phase 3 — Design system audit & consistent interface.** D1 shared `EmptyState` component created; D2 token system resolved; D3 documented as intentional; D4 resolved. Phase 3.1 pilot-adopted `EmptyState` in `ExecutionHistory`. Phase 3.2 visual QA pipeline audited and hardened: Playwright test setup (`frontend/tests/visual-qa.spec.js`) rewritten with proper language handling (localStorage), API mocking for ExecutionHistory states, and all required scenarios (desktop/mobile × en/ar × empty/loading/error/unavailable/accessibility). CI workflow (`.github/workflows/ci-visual-qa.yml`) audited — minimal permissions, no dependency drift, proper failure detection and artifact upload. Visual QA remains **BLOCKED for browser execution** — no display server or browser in this environment, and Playwright Chromium cannot be downloaded (outbound network restricted). The reproducible setup is ready for a browser-capable environment. Remaining: run visual QA in browser-capable environment, then gradual rollout to SecurityView/GitPanel/VirtualMachinesView where semantics fit; optional loading/error variants of EmptyState.
+
+**Phase 3.3 — Accessibility & UX Engineering (this pass).** WCAG 2.2 AA target. Fixed: ExecutionHistory loading/error/unavailable states now announce to screen readers via `role="status"`/`role="alert"` + `aria-live` (A1–A3); Sidebar collapsed nav items expose `aria-label` for icon-only buttons (A4); `EmptyState` renders as `role="region"` with accessible `aria-label` (A5–A6). Added 18 tests across `EmptyState.test.jsx`, `ExecutionHistory.test.jsx`, and `Sidebar.test.jsx`. Frontend: 774 passed / 0 failed (46 files); lint clean; build OK. Browser execution still BLOCKED (no display server or browser).
 
 **Phase 9 — Engineering standards.** Adopt only tools that solve demonstrated problems:
 
 1. **Python:** Add `mypy` (type checking) and `ruff` (lint + format) to `backend/requirements-dev.txt`; add `mypy backend/` and `ruff check backend/` to CI. Do not add a formatter that churns existing code — `ruff format --check` first to gauge churn.
 2. **Frontend:** ESLint is already clean. Consider `tsc --noEmit` on a subset of `frontend/src/` to evaluate TypeScript adoption cost before committing.
-3. **CI:** Add coverage reporting (`pytest-cov` backend, `vitest --coverage` frontend) as informational, not a gate.
+3. **CI:** Add coverage reporting (`pytest-cov` backend, `vitest --coverage` frontend) as informational, not a gate. Add the `ci-visual-qa.yml` workflow to run browser-based visual QA when a browser-capable runner is available.
 4. **Pre-commit:** Optional; CI gates are sufficient for this team size.
 
 **Do not:** full frontend redesign, TypeScript migration of the entire frontend, Python formatter that rewrites all files, database schema changes, or provider registry redesign — none are justified by current evidence.

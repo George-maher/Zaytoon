@@ -249,16 +249,39 @@ export default memo(function ExecutionHistory({ language = "en" }) {
           </div>
         )}
 
-        {auditError && <Note tone="error">{`${ar ? "تعذر جلب السجل" : "Audit fetch failed"}: ${auditError}`}</Note>}
+        {auditError && (
+  <p
+    role="alert"
+    aria-live="assertive"
+    className="font-mono"
+    style={{ fontSize: "var(--font-xs)", color: "var(--hud-red)" }}
+  >
+    {`${ar ? "تعذر جلب السجل" : "Audit fetch failed"}: ${auditError}`}
+  </p>
+)}
 
         {!auditError && audit === null && !unavailable && (
-          <Note>{ar ? "جارٍ التحميل…" : "LOADING…"}</Note>
+          <p
+            role="status"
+            aria-live="polite"
+            className="font-mono"
+            style={{ fontSize: "var(--font-xs)", color: "var(--hud-text-mute)" }}
+          >
+            {ar ? "جارٍ التحميل…" : "LOADING…"}
+          </p>
         )}
 
         {/* Optional endpoint: say so plainly instead of rendering an empty
             list that reads as "nothing has ever run". */}
         {unavailable && (
-          <Note tone="error">{ar ? "سجل العمليات غير متاح" : AUDIT_UNAVAILABLE_EN}</Note>
+          <p
+            role="alert"
+            aria-live="polite"
+            className="font-mono"
+            style={{ fontSize: "var(--font-xs)", color: "var(--hud-red)" }}
+          >
+            {ar ? "سجل العمليات غير متاح" : AUDIT_UNAVAILABLE_EN}
+          </p>
         )}
 
         {!auditError && !unavailable && audit !== null && entries.length === 0 && (
@@ -266,6 +289,7 @@ export default memo(function ExecutionHistory({ language = "en" }) {
             title={translate(language, "execution_history.no_records")}
             description={translate(language, "execution_history.no_records_description")}
             glyph="○"
+            ariaLabel={translate(language, "execution_history.no_records")}
           />
         )}
 
@@ -313,6 +337,7 @@ export default memo(function ExecutionHistory({ language = "en" }) {
             <EmptyState
               title={translate(language, "execution_history.no_processes")}
               glyph="○"
+              ariaLabel={translate(language, "execution_history.no_processes")}
             />
           ) : (
             processes.map((p) => {
