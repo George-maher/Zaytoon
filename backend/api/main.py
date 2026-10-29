@@ -309,29 +309,24 @@ async def lifespan(app):
         device_id = generate_device_identifier()
         pm = PermissionManager()
         repo = InventoryRepository()
-        
-        # Check if we have a saved inventory for this device
-        saved_inventory = asyncio.get_event_loop().run_until_complete(
-            repo.load(device_id)
-        )
-        
+
+        # Check if we have a saved inventory for this device.
+        # We are inside the async lifespan, so await directly rather than
+        # `asyncio.get_event_loop().run_until_complete(...)`, which raises
+        # `RuntimeError: this event loop is already running` under uvicorn.
+        saved_inventory = await repo.load(device_id)
+
         if saved_inventory is not None:
             logger.info("Loaded existing device inventory from %s", device_id)
             # Update last scan time
-            asyncio.get_event_loop().run_until_complete(
-                repo.save(saved_inventory, device_id)
-            )
+            await repo.save(saved_inventory, device_id)
         else:
             # First run: run onboarding to discover the device
             logger.info("First-run device onboarding for %s", device_id)
             onboarding = FirstRunOnboarding(pm, repo)
-            inventory = asyncio.get_event_loop().run_until_complete(
-                onboarding.run_onboarding()
-            )
+            inventory = await onboarding.run_onboarding()
             # Save the initial inventory
-            asyncio.get_event_loop().run_until_complete(
-                repo.save(inventory, device_id)
-            )
+            await repo.save(inventory, device_id)
             logger.info("Initial device inventory saved with %d applications, %d projects",
                        len(inventory.applications), len(inventory.projects))
     except Exception as e:

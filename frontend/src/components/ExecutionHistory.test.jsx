@@ -68,6 +68,35 @@ describe('ExecutionHistory', () => {
     expect(await screen.findByText('No executions recorded yet')).toBeInTheDocument()
   })
 
+  it('shows LOADING while the audit fetch is pending, not EmptyState', async () => {
+    let resolveAudit
+    const auditDeferred = new Promise((resolve) => { resolveAudit = resolve })
+    global.fetch = vi.fn(async (url) => {
+      const u = String(url)
+      if (u.includes('/audit')) {
+        await auditDeferred // block until the test resolves it
+        return { ok: true, status: 200, json: async () => ({ entries: [], total: 0 }) }
+      }
+      if (u.includes('/processes')) {
+        return { ok: true, status: 200, json: async () => ({ processes: [] }) }
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    })
+
+    render(<ExecutionHistory language="en" />)
+
+    // Loading state: LOADING… is shown, EmptyState is not.
+    expect(await screen.findByText('LOADING…')).toBeInTheDocument()
+    expect(screen.queryByText('No executions recorded yet')).not.toBeInTheDocument()
+    expect(screen.queryByText('Executions appear here when tools run.')).not.toBeInTheDocument()
+
+    // Resolve the fetch: now the empty state appears.
+    resolveAudit()
+    await act(async () => {})
+    expect(await screen.findByText('No executions recorded yet')).toBeInTheDocument()
+    expect(screen.queryByText('LOADING…')).not.toBeInTheDocument()
+  })
+
   it('reports a 404 as "Audit log unavailable" rather than an empty log', async () => {
     mockFetch({ audit: { status: 404 } })
     render(<ExecutionHistory language="en" />)
