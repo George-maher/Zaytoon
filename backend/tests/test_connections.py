@@ -32,6 +32,8 @@ from core.connections.connector_interface import (
     ConnectorDefinition,
 )
 from core.connections.connector_registry import RegisteredConnector, registry
+from core import grants
+from core import grants
 from core.permissions import Permission, required_for
 
 
@@ -478,6 +480,239 @@ async def test_execute_capability_confirm_requires_approval():
     result = await manager.execute_capability(conn.id, "fake.write", {}, approval=False)
     assert result.success is False
     assert result.cancelled is True
+
+
+# ---------------------------------------------------------------------------
+# Missing permissions — grants.denied blocks execution before approval gate
+# ---------------------------------------------------------------------------
+class _FakePermConnector(OAuth2Connector):
+    """Connector with a confirm capability requiring a permission."""
+
+    OAUTH_AUTHORIZATION_URL = "https://example.com/oauth/authorize"
+    OAUTH_TOKEN_URL = "https://example.com/oauth/token"
+    OAUTH_SCOPES = ["read"]
+    OAUTH_CLIENT_ID = "fake-client"
+
+    def __init__(self, definition):
+        super().__init__(definition)
+
+    @classmethod
+    def connector_id(cls) -> str:
+        return "perm-fake"
+
+    @classmethod
+    def definition_class(cls):
+        return ConnectorDefinition(
+            id="perm-fake",
+            name="Perm Fake",
+            description="Connector with permission-gated capability.",
+            icon="perm",
+            category="test",
+            auth_method="oauth2",
+            scopes=cls.OAUTH_SCOPES,
+            capabilities=[
+                ConnectorCapability(
+                    id="perm-fake.write",
+                    name="Write",
+                    type="create",
+                    description="Needs filesystem.write permission.",
+                    input_schema={"type": "object", "properties": {}},
+                    requires_permission="filesystem.write",
+                    risk_level="confirm",
+                ),
+            ],
+            version="1.0.0",
+        )
+
+    async def _token_exchange(self, client_id, code, code_verifier, redirect_uri):
+        return OAuthToken(
+            access_token="at_" + code,
+            refresh_token="rt_" + code,
+            expires_in=3600,
+            scope="read",
+        )
+
+    async def _refresh_exchange(self, refresh_token, redirect_uri):
+        return OAuthToken(
+            access_token="at_refreshed", refresh_token=refresh_token,
+            expires_in=3600, scope="read",
+        )
+
+    async def list_capabilities(self, connection_id: str):
+        return list(self.definition.capabilities)
+
+    async def execute_capability(self, connection_id, capability_id, params):
+        return CapabilityResult(
+            success=True, output="Executed", data={"capability": capability_id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_capability_denied_permission_blocks_before_approval():
+    """A denied permission blocks execution without ever asking for approval."""
+    registry.register(_FakePermConnector)
+    conn = await manager.create_connection("perm-fake")
+    await manager.start_auth(conn.id, "http://localhost/callback")
+    await manager.complete_auth(
+        conn.id, {"code": "code", "state": _AUTH_PENDING[conn.id]["state"]}
+    )
+
+    # Deny the permission required by the capability.
+    from core import db
+
+    # Insert a deny decision directly into the grants table.
+    await db.execute(
+        "INSERT OR REPLACE INTO permission_grants (permission, decision) VALUES (?, ?)",
+        ("filesystem.write", "deny"),
+    )
+    grants.invalidate()
+
+    result = await manager.execute_capability(
+        conn.id, "perm-fake.write", {}
+    )
+    assert result.success is False
+    assert result.permissions == ["filesystem.write"]
+    assert "filesystem.write" in (result.error or "")
+
+    # With approval=True it is still blocked: deny takes precedence over the gate.
+    result = await manager.execute_capability(
+        conn.id, "perm-fake.write", {}, approval=True
+    )
+    assert result.success is False
+    assert result.permissions == ["filesystem.write"]
+
+
+# ---------------------------------------------------------------------------
+# Expired / revoked connection — NEEDS_REAUTHORIZATION blocks execution
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_execute_capability_on_needs_reauthorization_is_refused():
+    """Executing on a connection that needs reauthorization raises NotConnected."""
+    registry.register(_FakeConnector)
+    conn = await manager.create_connection("fake")
+    await manager.start_auth(conn.id, "http://localhost/callback")
+    await manager.complete_auth(
+        conn.id, {"code": "code", "state": _AUTH_PENDING[conn.id]["state"]}
+    )
+
+    # Sanity: connected and executable.
+    result = await manager.execute_capability(conn.id, "fake.read", {})
+    assert result.success is True
+
+    # Force the connection into needs_reauthorization (simulating expired token).
+    stored = manager.get_connection(conn.id)
+    stored.state = ConnectionState.NEEDS_REAUTHORIZATION
+    stored.error = "Token expired"
+
+    from core.connections.connection_manager import NotConnected
+    with pytest.raises(NotConnected):
+        await manager.execute_capability(conn.id, "fake.read", {})
+
+    # Refresh restores connected state and re-enables execution.
+    await manager.refresh_credentials(conn.id)
+    stored = manager.get_connection(conn.id)
+    assert stored.state == ConnectionState.CONNECTED
+
+    result = await manager.execute_capability(conn.id, "fake.read", {})
+    assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Multiple connectors — discover across all connections
+# ---------------------------------------------------------------------------
+class _FakeSecondConnector(OAuth2Connector):
+    """A second, distinct connector for multi-connector discovery tests."""
+
+    OAUTH_AUTHORIZATION_URL = "https://example2.com/oauth/authorize"
+    OAUTH_TOKEN_URL = "https://example2.com/oauth/token"
+    OAUTH_SCOPES = ["read"]
+    OAUTH_CLIENT_ID = "fake-client-2"
+
+    def __init__(self, definition):
+        super().__init__(definition)
+
+    @classmethod
+    def connector_id(cls) -> str:
+        return "second-fake"
+
+    @classmethod
+    def definition_class(cls):
+        return ConnectorDefinition(
+            id="second-fake",
+            name="Second Fake",
+            description="A second test connector.",
+            icon="second",
+            category="test",
+            auth_method="oauth2",
+            scopes=cls.OAUTH_SCOPES,
+            capabilities=[
+                ConnectorCapability(
+                    id="second-fake.read",
+                    name="Read",
+                    type="read",
+                    description="Read from the second connector.",
+                    input_schema={"type": "object", "properties": {}},
+                    risk_level="safe",
+                ),
+            ],
+            version="1.0.0",
+        )
+
+    async def _token_exchange(self, client_id, code, code_verifier, redirect_uri):
+        return OAuthToken(
+            access_token="at_" + code, refresh_token="rt_" + code,
+            expires_in=3600, scope="read",
+        )
+
+    async def _refresh_exchange(self, refresh_token, redirect_uri):
+        return OAuthToken(
+            access_token="at_refreshed", refresh_token=refresh_token,
+            expires_in=3600, scope="read",
+        )
+
+    async def list_capabilities(self, connection_id: str):
+        return list(self.definition.capabilities)
+
+    async def execute_capability(self, connection_id, capability_id, params):
+        return CapabilityResult(
+            success=True, output="Executed", data={"capability": capability_id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_discover_all_scans_multiple_connections():
+    """connector_discover without connection_id lists capabilities across all connections."""
+    registry.register(_FakeConnector)
+    registry.register(_FakeSecondConnector)
+
+    # Connect both connectors.
+    conn1 = await manager.create_connection("fake")
+    await manager.start_auth(conn1.id, "http://localhost/callback")
+    await manager.complete_auth(
+        conn1.id, {"code": "code1", "state": _AUTH_PENDING[conn1.id]["state"]}
+    )
+
+    conn2 = await manager.create_connection("second-fake")
+    await manager.start_auth(conn2.id, "http://localhost/callback")
+    await manager.complete_auth(
+        conn2.id, {"code": "code2", "state": _AUTH_PENDING[conn2.id]["state"]}
+    )
+
+    found = discovery.discover_all()
+    ids = {c.capability.id for c in found}
+    assert "fake.read" in ids
+    assert "fake.write" in ids
+    assert "second-fake.read" in ids
+    assert len(found) == 3
+
+    # Per-connection discovery still works.
+    found_one = discovery.discover_all(connection_id=conn1.id)
+    ids_one = {c.capability.id for c in found_one}
+    assert ids_one == {"fake.read", "fake.write"}
+
+    found_two = discovery.discover_all(connection_id=conn2.id)
+    ids_two = {c.capability.id for c in found_two}
+    assert ids_two == {"second-fake.read"}
 
 
 # ---------------------------------------------------------------------------

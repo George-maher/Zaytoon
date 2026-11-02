@@ -77,6 +77,13 @@ EXPECTED = {
     "analyze this problem for me": "complex",
     "run python script.py": "action",
     "execute this command": "action",
+    # -- connectors / external services -------------------------------------
+    # Generic terms only: no service names, so the assistant never hardcodes
+    # routing around GitHub, Drive or any other provider.
+    "connect to github": "tools",
+    "list my connections": "tools",
+    "show me my connections": "tools",
+
     # -- virtual machine workflows (§6B) ------------------------------------
     # Each is a phrasing the VM adapter can serve with the tools in the
     # registry, and each must reach `tools` without the LLM: on an exhausted
