@@ -183,6 +183,9 @@ class CapabilityResult:
     requires_confirmation: bool = False
     confirmation_prompt: Optional[str] = None
     cancelled: bool = False
+    #: Permissions that were denied and blocked this call (populated only when
+    #: a grant decision forbids the capability before the approval gate).
+    permissions: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"success": self.success, "output": self.output}
@@ -195,6 +198,8 @@ class CapabilityResult:
             payload["confirmation_prompt"] = self.confirmation_prompt
         if self.cancelled:
             payload["cancelled"] = True
+        if self.permissions:
+            payload["permissions"] = self.permissions
         return payload
 
 

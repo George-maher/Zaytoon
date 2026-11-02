@@ -524,6 +524,142 @@ describe('inbound: confirmation flow', () => {
 })
 
 // ---------------------------------------------------------------------------
+describe('inbound: connector confirmation compatibility', () => {
+  // The connector execution flow (connector_execute → require_confirmation →
+  // tool_confirm) uses the exact same WebSocket frames as any other
+  // confirmation-required action. These tests pin that the client handles the
+  // connector-specific payload shape correctly, so a connector confirmation
+  // never gets lost or misrouted.
+  it('surfaces a connector_execute require_confirmation frame', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({
+        type: 'require_confirmation',
+        request_id: 'cfm_conn_1',
+        action: 'connector_execute',
+        params: {
+          connection_id: 'conn_abc',
+          capability_id: 'github.search_repositories',
+          params: { q: 'zaytoon' },
+        },
+        level: 'high',
+        permission: 'confirm',
+        reasons: ["'connector_execute' is a confirm-level action"],
+        summary: 'Run github.search_repositories on conn_abc',
+        text: 'Run github.search_repositories on conn_abc — network request',
+        session_id: 's1',
+      })
+    })
+
+    await waitFor(() =>
+      expect(result.current.pendingConfirmation?.request_id).toBe('cfm_conn_1')
+    )
+    expect(result.current.pendingConfirmation.action).toBe('connector_execute')
+    expect(result.current.pendingConfirmation.params.capability_id).toBe(
+      'github.search_repositories'
+    )
+    expect(result.current.status).toBe('awaiting_confirmation')
+  })
+
+  it('approving a connector confirmation sends tool_confirm with the request id', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({
+        type: 'require_confirmation',
+        request_id: 'cfm_conn_2',
+        action: 'connector_execute',
+        params: {
+          connection_id: 'conn_xyz',
+          capability_id: 'readonly-fake.read',
+          params: {},
+        },
+        level: 'high',
+        permission: 'confirm',
+        reasons: [],
+        summary: 'Run readonly-fake.read on conn_xyz',
+        text: 'Run readonly-fake.read on conn_xyz',
+        session_id: 's2',
+      })
+    })
+
+    await waitFor(() => expect(result.current.pendingConfirmation).toBeTruthy())
+
+    act(() => result.current.respondToConfirmation(true))
+
+    expect(socket.sentOfType('tool_confirm')).toEqual([
+      { type: 'tool_confirm', request_id: 'cfm_conn_2', approved: true },
+    ])
+  })
+
+  it('denying a connector confirmation sends tool_confirm approved:false', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({
+        type: 'require_confirmation',
+        request_id: 'cfm_conn_3',
+        action: 'connector_execute',
+        params: {
+          connection_id: 'conn_xyz',
+          capability_id: 'confirm-fake.write',
+          params: {},
+        },
+        level: 'high',
+        permission: 'confirm',
+        reasons: [],
+        summary: 'Run confirm-fake.write on conn_xyz',
+        text: 'Run confirm-fake.write on conn_xyz',
+        session_id: 's3',
+      })
+    })
+
+    await waitFor(() => expect(result.current.pendingConfirmation).toBeTruthy())
+
+    act(() => result.current.respondToConfirmation(false))
+
+    expect(socket.sentOfType('tool_confirm')).toEqual([
+      { type: 'tool_confirm', request_id: 'cfm_conn_3', approved: false },
+    ])
+  })
+
+  it('clears a connector confirmation once resolved', async () => {
+    const { result, socket } = await mount()
+
+    act(() => {
+      socket.emit({
+        type: 'require_confirmation',
+        request_id: 'cfm_conn_4',
+        action: 'connector_execute',
+        params: {
+          connection_id: 'conn_xyz',
+          capability_id: 'readonly-fake.read',
+          params: {},
+        },
+        level: 'high',
+        permission: 'confirm',
+        reasons: [],
+        summary: 's',
+        text: 't',
+        session_id: 's4',
+      })
+    })
+    await waitFor(() => expect(result.current.pendingConfirmation).toBeTruthy())
+
+    act(() => {
+      socket.emit({
+        type: 'confirmation_result',
+        request_id: 'cfm_conn_4',
+        approved: true,
+        resolved: true,
+      })
+    })
+    await waitFor(() => expect(result.current.pendingConfirmation).toBeNull())
+  })
+})
+
+// ---------------------------------------------------------------------------
 describe('inbound: voice', () => {
   it('adopts the language Whisper detected', async () => {
     const { result, socket } = await mount()
