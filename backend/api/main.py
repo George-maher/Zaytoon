@@ -57,6 +57,7 @@ from services.provider_health import provider_health
 # The Zaytoon core runtime: task system, projects, files, skills, providers,
 # permissions, terminal. Routers are mounted below; see `core/` for the design.
 from core.api.routers import (
+    connections_router,
     files_router,
     security_router,
     git_router,
@@ -543,6 +544,7 @@ async def unhandled_exception_handler(request, exc):
 # Mounted without a prefix, so the paths are exactly what the architecture
 # document specifies: /tasks, /projects, /files, /terminal, /skills, /providers,
 # /models, /permissions, /system.
+app.include_router(connections_router)
 app.include_router(tasks_router)
 app.include_router(projects_router)
 app.include_router(files_router)

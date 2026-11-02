@@ -55,6 +55,12 @@ class Permission(str, Enum):
     VM_DISCOVER = "vm.discover"
     VM_MANAGE = "vm.manage"
     VM_GUEST_EXECUTE = "vm.guest.exec"
+    # Connections platform — scoped permissions for connected services.
+    # Derived per-tool by `required_for`; a connector capability declares the
+    # permission it needs in `requires_permission`, and the gate enforces it.
+    GOOGLE_DRIVE_ACCESS = "google_drive.access"
+    GMAIL_ACCESS = "gmail.access"
+    GMAIL_SEND = "gmail.send"
 
     @property
     def label(self) -> str:
@@ -75,6 +81,9 @@ _PERMISSION_LABELS: Dict[Permission, str] = {
     Permission.VM_DISCOVER: "List virtual machines",
     Permission.VM_MANAGE: "Start, stop and suspend virtual machines",
     Permission.VM_GUEST_EXECUTE: "Run commands inside a virtual machine",
+    Permission.GOOGLE_DRIVE_ACCESS: "Read and write Google Drive files",
+    Permission.GMAIL_ACCESS: "Read Gmail messages",
+    Permission.GMAIL_SEND: "Send Gmail messages",
 }
 
 ALL_PERMISSIONS: FrozenSet[Permission] = frozenset(Permission)
@@ -263,6 +272,18 @@ def _capabilities_for(name: str) -> FrozenSet[Permission]:
             Permission.VM_GUEST_EXECUTE,
             Permission.NETWORK_REQUEST,
         })
+
+    # -- Connections platform ---------------------------------------------
+    # Connector capabilities declare their own permission in
+    # `ConnectorCapability.requires_permission`; this table maps Google action
+    # names so `required_for` derives the right permission (see the OAuth
+    # design doc: google_drive.access / gmail.access).
+    if name.startswith("google_drive_"):
+        return frozenset({Permission.GOOGLE_DRIVE_ACCESS})
+    if name.startswith("gmail_"):
+        if name in ("gmail_send", "gmail_send_message"):
+            return frozenset({Permission.GMAIL_ACCESS, Permission.GMAIL_SEND})
+        return frozenset({Permission.GMAIL_ACCESS})
 
     return frozenset()
 

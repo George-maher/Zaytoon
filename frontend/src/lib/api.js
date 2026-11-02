@@ -1335,3 +1335,139 @@ export async function confirmGuestExec(token, command) {
   if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
   return data;
 }
+
+// ---------------------------------------------------------------------------
+// Connections platform — connectors, connections and capabilities
+// ---------------------------------------------------------------------------
+// No credential values ever cross this boundary: the backend never returns one
+// (see `core/secrets.py`), so every API function here reports `has_credentials`
+// at most.
+
+/** List available connector kinds. */
+export async function getConnectors() {
+  const res = await fetch(`${API_BASE}/connectors`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { connectors: [], error: data.error || `HTTP ${res.status}` };
+  return { connectors: Array.isArray(data.connectors) ? data.connectors : [], error: null };
+}
+
+/** List all connections with status (no credentials). */
+export async function getConnections() {
+  const res = await fetch(`${API_BASE}/connections`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { connections: [], error: data.error || `HTTP ${res.status}` };
+  return {
+    connections: Array.isArray(data.connections) ? data.connections : [],
+    error: null,
+  };
+}
+
+/** Create a connection to a connector. */
+export async function createConnection(connectorId, config = {}) {
+  const res = await fetch(`${API_BASE}/connections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ connector_id: connectorId, config }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || data.detail || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Start the auth flow for a connection. Returns auth_url (OAuth) or fields (API key). */
+export async function startAuth(connectionId, redirectUri) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/auth/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ redirect_uri: redirectUri }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Complete the auth flow (OAuth callback or API-key submission). */
+export async function completeAuth(connectionId, authResponse) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/auth/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(authResponse),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Test a connection (lightweight check). */
+export async function testConnection(connectionId) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/test`, {
+    method: "POST",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Refresh expired credentials. */
+export async function refreshConnection(connectionId) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/refresh`, {
+    method: "POST",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Disconnect (revoke credentials, keep the record). */
+export async function disconnectConnection(connectionId) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/disconnect`, {
+    method: "POST",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Permanently delete a connection and its credentials. */
+export async function deleteConnection(connectionId) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}`, {
+    method: "DELETE",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** List capabilities for a connected connection. */
+export async function getConnectionCapabilities(connectionId) {
+  const res = await fetch(`${API_BASE}/connections/${encodeURIComponent(connectionId)}/capabilities`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { capabilities: [], error: data.error || `HTTP ${res.status}` };
+  return { capabilities: Array.isArray(data.capabilities) ? data.capabilities : [], error: null };
+}
+
+/** Execute one capability through the unified gate. */
+export async function executeCapability(connectionId, capabilityId, params = {}, approval = null) {
+  const body = { params };
+  if (approval !== null) body.approval = approval;
+  const res = await fetch(
+    `${API_BASE}/connections/${encodeURIComponent(connectionId)}/capabilities/${encodeURIComponent(capabilityId)}/execute`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { success: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+/** Discover capabilities across all connected connections. */
+export async function discoverCapabilities(connectionId = null) {
+  const params = connectionId ? `?connection_id=${encodeURIComponent(connectionId)}` : "";
+  const res = await fetch(`${API_BASE}/connections/discover${params}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { capabilities: [], error: data.error || `HTTP ${res.status}` };
+  return {
+    capabilities: Array.isArray(data.capabilities) ? data.capabilities : [],
+    total: typeof data.total === "number" ? data.total : 0,
+    error: null,
+  };
+}

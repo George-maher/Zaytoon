@@ -40,6 +40,7 @@ export const VIEWS = Object.freeze({
   MACHINES: "machines",
   MODELS: "models",
   SETTINGS: "settings",
+  CONNECTIONS: "connections",
 });
 
 /** Product order — top to bottom in the sidebar nav, conceptually. */
@@ -54,6 +55,7 @@ export const VIEW_LIST = Object.freeze([
   VIEWS.MACHINES,
   VIEWS.MODELS,
   VIEWS.SETTINGS,
+  VIEWS.CONNECTIONS,
 ]);
 
 /**
@@ -138,6 +140,13 @@ const META = Object.freeze({
     en: "Models",
     ar: "النماذج",
     glyph: "◉",
+  }),
+  [VIEWS.CONNECTIONS]: Object.freeze({
+    kind: "screen",
+    ready: true, // ConnectionsView: browse connectors, connect, manage connections.
+    en: "Connections",
+    ar: "الاتصالات",
+    glyph: "◊",
   }),
   [VIEWS.SETTINGS]: Object.freeze({
     kind: "overlay",

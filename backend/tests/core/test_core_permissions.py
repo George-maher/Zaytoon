@@ -19,16 +19,16 @@ from tools.safety import PERMISSION_CONFIRM, PERMISSION_DANGEROUS, PERMISSION_SA
 
 class TestVocabulary:
     def test_the_vocabulary_is_pinned(self):
-        """Thirteen names, and the count is deliberate.
+        """Sixteen names, and the count is deliberate.
 
-        It was ten until virtualization was added, which contributed three
-        rather than one: `vm.discover`, `vm.manage` and `vm.guest.exec` are
-        separate grants because listing VMs, powering one on, and running a
-        command *inside* one have different blast radii. A single `vm.manage`
-        would let consent for the first authorise the second. Updating this
-        number is the reminder to ask whether the new grant is really distinct.
+        It was ten until virtualization was added (vm.discover, vm.manage,
+        vm.guest.exec), then the Connections platform added three more for
+        connected services: google_drive.access, gmail.access and gmail.send.
+        Each is a distinct grant because Drive access, Gmail read and Gmail
+        send have different blast radii. Updating this number is the reminder
+        to ask whether the new grant is really distinct.
         """
-        assert len(ALL_PERMISSIONS) == 13
+        assert len(ALL_PERMISSIONS) == 16
 
     def test_the_vm_grants_do_not_imply_each_other(self):
         from core.permissions import Permission, required_for

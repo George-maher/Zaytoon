@@ -85,6 +85,9 @@ class CoreEventType(str, Enum):
     # -- terminal ---------------------------------------------------------
     TERMINAL_OUTPUT = "terminal.output"
 
+    # -- connections ------------------------------------------------------
+    CONNECTION_EVENT = "connection.event"
+
     #: Something failed. The catch-all for a client that only shows a banner.
     ERROR = "error"
 
@@ -109,6 +112,7 @@ STATUS_EVENTS = frozenset({
     CoreEventType.MODEL_FAILED,
     CoreEventType.PERMISSION_REQUESTED,
     CoreEventType.PERMISSION_RESOLVED,
+    CoreEventType.CONNECTION_EVENT,
     CoreEventType.ERROR,
 })
 
