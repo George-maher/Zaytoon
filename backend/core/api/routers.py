@@ -1,5 +1,6 @@
 """The core API routers, mounted by ``api/main.py``."""
 
+from core.api.connections_api import router as connections_router
 from core.api.files_api import router as files_router
 from core.api.git_api import router as git_router
 from core.api.projects_api import router as projects_router
@@ -14,6 +15,7 @@ from core.api.tasks_api import router as tasks_router
 from core.api.virtualization_api import router as virtualization_router
 
 __all__ = [
+    "connections_router",
     "files_router",
     "git_router",
     "projects_router",

@@ -72,6 +72,13 @@ KEYWORD_ROUTES: list[tuple[re.Pattern, str, float]] = [
     (re.compile(r"(analyze|حلل|plan|خطط|compare|قارن)"), "complex", 0.8),
     (re.compile(r"(date|time|الوقت|الساعة|التاريخ|اليوم)"), "tools", 0.85),
 
+    # -- connectors / external services -------------------------------------
+    # Generic terms only: no service names, so the assistant never hardcodes
+    # routing around GitHub, Drive or any other provider. The LLM and the
+    # connector tools decide which service; the router just knows this turn
+    # wants to reach a tool.
+    (re.compile(r"\b(connect|connection|connector|connections)\b"), "tools", 0.78),
+
     # -- greetings ---------------------------------------------------------
     (re.compile(r"^\s*(hello|hi|hey|مرحبا|السلام|أهلا|ازيك)[\s!.,?]*$"), "chat", 0.95),
 

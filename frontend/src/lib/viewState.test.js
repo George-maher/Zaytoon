@@ -33,6 +33,7 @@ describe("view vocabulary", () => {
         "home",
         "chat",
         "computer",
+        "connections",
         "workspace",
         "tasks",
         "skills",
@@ -53,6 +54,7 @@ describe("view vocabulary", () => {
       VIEWS.MACHINES,
       VIEWS.MODELS,
       VIEWS.SETTINGS,
+      VIEWS.CONNECTIONS,
     ]);
   });
 

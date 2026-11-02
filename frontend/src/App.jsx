@@ -30,6 +30,7 @@ import SkillsView from "./components/SkillsView";
 import SecurityView from "./components/SecurityView";
 import VirtualMachinesView from "./components/VirtualMachinesView";
 import ModelsView from "./components/ModelsView";
+import ConnectionsView from "./components/connections/ConnectionsView";
 import { VIEWS, resolveScreen } from "./lib/viewState";
 
 /**
@@ -669,6 +670,8 @@ export default memo(function App() {
         <VirtualMachinesView language={language} />
       ) : screen === VIEWS.MODELS ? (
         <ModelsView language={language} />
+      ) : screen === VIEWS.CONNECTIONS ? (
+        <ConnectionsView language={language} />
       ) : (
         <NexusDashboard
           language={language}

@@ -551,6 +551,7 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
     from tools import (
         applications,
         coding,
+        connections,
         fetch,
         filesystem,
         git,
@@ -569,6 +570,7 @@ def build_default_registry(assessor: Optional[RiskAssessor] = None) -> ToolRegis
     for module in (
         filesystem, terminal, local_exec, processes, applications, system,
         web, fetch, git, coding, media, security, virtualization, launcher,
+        connections,
     ):
         registry.register_all(module.build_tools())
     logger.info("Tool registry ready with %d tools: %s", len(registry), registry.list())

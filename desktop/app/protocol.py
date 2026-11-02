@@ -134,6 +134,7 @@ class EventType(str, Enum):
     MODEL_FAILED = "model.failed"
     PERMISSION_REQUESTED = "permission.requested"
     PERMISSION_RESOLVED = "permission.resolved"
+    CONNECTION_EVENT = "connection.event"
     FILE_CHANGED = "file.changed"
     PROJECT_CHANGED = "project.changed"
     SKILL_CHANGED = "skill.changed"
