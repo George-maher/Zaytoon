@@ -40,23 +40,47 @@ class TextToSpeech:
         # notice. Only the exception's class name is kept — the detail belongs
         # in the redacted log line `safe_error` already wrote, never on the wire.
         self.last_stream_error: Optional[str] = None
+        #: Whether synthesis is known to work right now. Starts False; flips to
+        #: True only after a successful synthesis, and back to False after a
+        #: failure. The health endpoint reads this — a UI can trust it rather
+        #: than showing a microphone button that looks identical whether the
+        #: speech service is reachable or not.
+        self._synthesis_ever_succeeded: bool = False
+        #: None = never attempted; True = last synthesis succeeded; False = last
+        #: synthesis failed. Drives the public `available` property.
+        self._last_synthesis_succeeded: Optional[bool] = None
         self._check_available()
         self._cache = _TTS_CACHE
 
     def _check_available(self):
         try:
             import edge_tts
+            # edge_tts is installed. `_available` stays True so synthesis is
+            # actually attempted; whether it *works* is tracked separately by
+            # `_last_synthesis_succeeded` / `_synthesis_ever_succeeded`, which
+            # the public `available` property reads. We do not probe the network
+            # here — a health poll must not block for thirty seconds.
             self._available = True
+            self._edge_tts_installed = True
         except ImportError:
             logger.warning("edge-tts not installed. Install with: pip install edge-tts")
             self._available = False
+            self._edge_tts_installed = False
 
     # ------------------------------------------------------------------
     # Availability
     # ------------------------------------------------------------------
     @property
     def available(self) -> bool:
-        return self._available
+        #: edge-tts not installed → never available.
+        if not self._edge_tts_installed:
+            return False
+        #: Never attempted synthesis → unknown; be honest and say not ready.
+        #: The health endpoint's `tts.reason` explains why.
+        if self._last_synthesis_succeeded is None:
+            return False
+        #: Available iff the most recent synthesis succeeded.
+        return self._last_synthesis_succeeded
 
     async def probe_voices(self) -> set:
         """Best-effort fetch of the voices edge-tts actually offers.
@@ -176,9 +200,13 @@ class TextToSpeech:
                 if chunk["type"] == "audio":
                     audio_data.extend(chunk["data"])
             if not audio_data:
+                self._last_synthesis_succeeded = False
                 return None
             result = bytes(audio_data)
             self._cache_put(cache_key, result)
+            self._last_synthesis_succeeded = True
+            self._synthesis_ever_succeeded = True
+            self.last_stream_error = None
             logger.info(
                 "TTS: %d bytes with voice '%s'", len(audio_data), resolved_voice
             )
@@ -186,6 +214,8 @@ class TextToSpeech:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            self._last_synthesis_succeeded = False
+            self.last_stream_error = type(e).__name__
             safe_error(e, operation="tts.synthesize", component="voice.tts")
             return None
 
@@ -206,6 +236,7 @@ class TextToSpeech:
         if not self._available:
             logger.error("TTS unavailable: edge-tts not installed")
             self.last_stream_error = "edge-tts is not installed"
+            self._last_synthesis_succeeded = False
             return
 
         if voice:
@@ -225,6 +256,7 @@ class TextToSpeech:
         resolved_rate = rate or app_config.TTS_RATE or routing.rate_for(language)
         resolved_volume = volume or app_config.TTS_VOLUME or routing.volume_for(language)
 
+        had_chunk = False
         try:
             import edge_tts
 
@@ -233,12 +265,24 @@ class TextToSpeech:
             )
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
+                    had_chunk = True
                     yield chunk["data"]
         except asyncio.CancelledError:
             raise
         except Exception as e:
             safe_error(e, operation="tts.stream", component="voice.tts")
             self.last_stream_error = type(e).__name__
+            self._last_synthesis_succeeded = False
+            return
+        # A generator that ran to completion without yielding any audio is a
+        # failure, not a success.
+        if not had_chunk:
+            self.last_stream_error = "No audio was received"
+            self._last_synthesis_succeeded = False
+            return
+        self._last_synthesis_succeeded = True
+        self._synthesis_ever_succeeded = True
+        self.last_stream_error = None
 
     async def synthesize_ssml(
         self,
@@ -267,10 +311,17 @@ class TextToSpeech:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
                     audio_data.extend(chunk["data"])
+            if audio_data:
+                self._last_synthesis_succeeded = True
+                self._synthesis_ever_succeeded = True
+                self.last_stream_error = None
+            else:
+                self._last_synthesis_succeeded = False
             return bytes(audio_data) if audio_data else None
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            self._last_synthesis_succeeded = False
             safe_error(e, operation="tts.ssml", component="voice.tts")
             return None
 

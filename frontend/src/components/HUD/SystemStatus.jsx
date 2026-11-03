@@ -242,7 +242,18 @@ function SystemStatus({ language = "en", pollMs = 20000 }) {
       />
       <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow label="STT" value={voice.stt ? (ar ? "جاهز" : "READY") : (ar ? "غير متاح" : "N/A")} tone={voice.stt ? "ok" : "warn"} />
-      <TelemetryRow label="TTS" value={voice.tts ? (ar ? "جاهز" : "READY") : (ar ? "غير متاح" : "N/A")} tone={voice.tts ? "ok" : "warn"} />
+      <TelemetryRow
+        label="TTS"
+        value={voice.tts ? (ar ? "جاهز" : "READY") : (ar ? "غير متاح" : "N/A")}
+        tone={voice.tts ? "ok" : "warn"}
+        title={
+          voice.tts
+            ? ""
+            : ar
+            ? voice.tts_reason || "خدمة الأصوات غير متاحة"
+            : voice.tts_reason || "TTS unavailable"
+        }
+      />
       <div className="hud-rule" style={{ margin: "var(--space-2) 0" }} />
       <TelemetryRow
         label={ar ? "الصندوق" : "SANDBOX"}

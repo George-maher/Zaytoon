@@ -148,3 +148,119 @@ async def test_empty_text_is_nothing_to_say_not_a_failure():
     tts._available = True
     [c async for c in tts.stream_synthesize("   ")]
     assert tts.last_stream_error is None
+
+
+# -- Availability tracking --------------------------------------------------
+
+async def test_available_is_false_until_first_synthesis(monkeypatch):
+    """A fresh TTS instance reports not-available until synthesis is tried.
+
+    edge-tts is installed but the speech service has never been reached.
+    The UI must not show a microphone button that looks ready when it isn't.
+    """
+    import edge_tts
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"\x00\x01"}
+
+    monkeypatch.setattr(edge_tts, "Communicate", Worker)
+    tts = TextToSpeech()
+    tts._available = True
+
+    # Never attempted → not ready.
+    assert tts.available is False
+
+    # One success → ready.
+    chunks = [c async for c in tts.stream_synthesize("hello")]
+    assert chunks == [b"\x00\x01"]
+    assert tts.available is True
+
+
+async def test_available_flips_to_false_after_failure(monkeypatch):
+    """A failed synthesis marks TTS unavailable until the next success."""
+    import edge_tts
+
+    class Refuser:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            raise RuntimeError("refused")
+            yield b""  # pragma: no cover
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"\x00\x01"}
+
+    monkeypatch.setattr(edge_tts, "Communicate", Refuser)
+    tts = TextToSpeech()
+    tts._available = True
+
+    [c async for c in tts.stream_synthesize("hello")]
+    assert tts.available is False
+    assert tts.last_stream_error == "RuntimeError"
+
+    # A later success restores availability.
+    monkeypatch.setattr(edge_tts, "Communicate", Worker)
+    chunks = [c async for c in tts.stream_synthesize("hello again")]
+    assert chunks == [b"\x00\x01"]
+    assert tts.available is True
+
+
+async def test_synthesize_failure_marks_unavailable(monkeypatch):
+    """`synthesize` returning None marks TTS unavailable too."""
+    import edge_tts
+
+    class Refuser:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            return  # pragma: no cover - makes this an async generator
+            yield b""
+
+    monkeypatch.setattr(edge_tts, "Communicate", Refuser)
+    tts = TextToSpeech()
+    tts._available = True
+
+    result = await tts.synthesize("hello")
+    assert result is None
+    assert tts.available is False
+
+
+async def test_synthesize_success_marks_available(monkeypatch):
+    """A successful `synthesize` marks TTS available."""
+    import edge_tts
+
+    class Worker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def stream(self):
+            yield {"type": "audio", "data": b"\x00\x01"}
+
+    monkeypatch.setattr(edge_tts, "Communicate", Worker)
+    tts = TextToSpeech()
+    tts._available = True
+
+    # First attempt (never tried before) → not available yet.
+    assert tts.available is False
+
+    result = await tts.synthesize("hello")
+    assert result == b"\x00\x01"
+    assert tts.available is True
+
+
+def test_available_false_when_edge_tts_not_installed():
+    """Without the package, `available` is always False."""
+    tts = TextToSpeech()
+    tts._edge_tts_installed = False
+    tts._last_synthesis_succeeded = True
+    assert tts.available is False
