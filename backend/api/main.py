@@ -743,6 +743,7 @@ async def health():
             "stt_error": stt.load_error,
             "tts": tts.available,
             "tts_error": getattr(tts, "last_stream_error", None),
+            "tts_reason": _tts_reason(tts),
         },
         "workspace": config.describe_workspace(),
         "tools_loaded": len(tool_executor.list_tools()),
@@ -962,6 +963,46 @@ async def text_to_speech_endpoint(data: dict):
     if not audio:
         return Response(content=b"", status_code=503)
     return Response(content=audio, media_type="audio/mpeg")
+
+
+@app.post("/tts/retry")
+async def tts_retry():
+    """Probe whether speech synthesis works right now.
+
+    A single short synthesis attempt. If it succeeds, ``tts.available`` flips
+    back to True and the UI can re-enable voice output. If it fails, the
+    recorded error explains why. Safe to poll — the attempt is bounded by
+    ``TTS_TIMEOUT_S`` and never blocks the event loop beyond one request.
+    """
+    from config import config as app_config
+
+    try:
+        audio = await asyncio.wait_for(
+            tts.synthesize(
+                "Voice check.",
+                voice=tts.resolve_voice("en"),
+                rate=app_config.TTS_RATE,
+                volume=app_config.TTS_VOLUME,
+            ),
+            timeout=TTS_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "ready": False,
+            "reason": f"synthesis did not finish within {int(TTS_TIMEOUT_S)}s",
+            "last_stream_error": getattr(tts, "last_stream_error", None),
+        }
+    if audio:
+        return {
+            "ready": True,
+            "reason": "",
+            "last_stream_error": None,
+        }
+    return {
+        "ready": False,
+        "reason": "synthesis returned no audio",
+        "last_stream_error": getattr(tts, "last_stream_error", None),
+    }
 
 
 @app.get("/preferences")
@@ -1913,12 +1954,16 @@ async def stop_process(process_id: str):
 
 def _tts_reason(tts) -> str:
     """Why speech is (or is not) usable, in one sentence a UI can show."""
-    if not tts.available:
+    if not tts._edge_tts_installed:
         return "edge-tts is not installed"
+    if tts._last_synthesis_succeeded is None:
+        return "speech service untested — synthesis not yet attempted"
+    if tts._last_synthesis_succeeded:
+        return ""
     last = getattr(tts, "last_stream_error", None)
     if isinstance(last, str) and last:
         return f"the last synthesis failed: {last}"
-    return ""
+    return "synthesis returned no audio"
 
 
 @app.get("/voice/status")
